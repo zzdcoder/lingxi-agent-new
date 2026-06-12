@@ -1,0 +1,158 @@
+"""
+FastAPI 应用入口
+
+组装应用、注册路由、挂载全局异常处理与生命周期事件
+"""
+
+import asyncio
+import logging
+import os
+import socket
+import subprocess
+import sys
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from sqlalchemy import select
+
+from core.config import settings
+from core.database import async_engine, Base, AsyncSessionLocal
+from core.exceptions import RAGException
+from api.routes import attachments
+from api.routes import auth
+from api.routes import metadata
+from api.routes import file_process
+from models.metadata_model import MetadataDefinition
+from utils.captcha import cleanup_expired_captchas
+
+# 配置全局日志：输出到控制台，级别 INFO，带时间戳和模块名
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+logger = logging.getLogger(__name__)
+load_dotenv(".env.dev")
+
+# 配置 ChromaDB 日志级别
+logging.getLogger("chromadb").setLevel(logging.INFO)
+
+# 服务端口配置（集中管理，避免冲突）
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8345"))  # ChromaDB 端口
+
+
+def _check_port_available(port: int) -> bool:
+    """检测端口是否可用"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("127.0.0.1", port)) != 0
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理：启动时建表并初始化内置元数据"""
+    try:
+        async with async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as exc:
+        logger.warning(f"数据库初始化失败，应用将以降级模式运行: {exc}")
+
+    # 启动验证码过期清理后台任务
+    async def captcha_cleanup_loop():
+        while True:
+            await asyncio.sleep(60)
+            removed = cleanup_expired_captchas()
+            if removed > 0:
+                logger.info(f"清理了 {removed} 条过期验证码记录")
+
+    cleanup_task = asyncio.create_task(captcha_cleanup_loop())
+
+    # 启动 Chroma 服务前检测端口是否被占用
+    if not _check_port_available(CHROMA_PORT):
+        logger.error(f"端口 {CHROMA_PORT} 已被占用，请检查是否有残留进程或修改 CHROMA_PORT 环境变量")
+        raise RuntimeError(f"ChromaDB 端口 {CHROMA_PORT} 被占用")
+
+    # 启动 Chroma 服务（使用 Popen 避免 Windows 下 asyncio subprocess 的 NotImplementedError）
+    # stdout/stderr 重定向到 DEVNULL，避免 PIPE 缓冲区满导致子进程死锁
+    chroma_proc = subprocess.Popen(
+        ["chroma", "run",
+         "--path", "./chroma_data",
+         "--host", "localhost",
+         "--port", str(CHROMA_PORT)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    logger.info(f"Chroma 服务已启动，PID={chroma_proc.pid}, 端口={CHROMA_PORT}")
+    await asyncio.sleep(2)  # 等待服务就绪
+
+    yield
+
+    # 关闭 Chroma 服务
+    if chroma_proc.poll() is None:
+        chroma_proc.terminate()
+        chroma_proc.wait()
+        logger.info("Chroma 服务已停止")
+
+    # 取消验证码清理后台任务
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(
+    title="lingxi-agent",
+    debug=os.getenv("DEBUG", "").lower() in ("true", "1", "yes"),
+    lifespan=lifespan
+)
+
+# CORS 中间件（允许前端开发环境跨域）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# 全局异常处理器
+@app.exception_handler(RAGException)
+async def rag_exception_handler(request: Request, exc: RAGException):
+    return JSONResponse(
+        status_code=exc.code,
+        content={"detail": exc.message},
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("未捕获的异常")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "服务器内部错误"},
+    )
+
+
+# 挂载本地上传文件静态资源
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# 注册路由
+app.include_router(attachments.router, prefix="/api")
+app.include_router(auth.router, prefix="/api")
+app.include_router(metadata.router, prefix="/api")
+app.include_router(file_process.router, prefix="/api")
+
+
+@app.get("/health", tags=["健康检查"])
+async def health_check():
+    return {"status": "ok"}
+
+
