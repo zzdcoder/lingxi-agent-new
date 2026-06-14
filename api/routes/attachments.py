@@ -23,7 +23,7 @@ router = APIRouter(prefix="/attachments", tags=["附件管理"])
 
 
 @router.post(
-    "",
+    "/upload_attachment",
     response_model=AttachmentOut,
     status_code=status.HTTP_201_CREATED,
     summary="上传附件",

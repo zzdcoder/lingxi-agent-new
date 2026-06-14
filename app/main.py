@@ -27,6 +27,7 @@ from api.routes import attachments
 from api.routes import auth
 from api.routes import metadata
 from api.routes import file_process
+from api.routes import conversation
 from models.metadata_model import MetadataDefinition
 from utils.captcha import cleanup_expired_captchas
 
@@ -44,7 +45,7 @@ load_dotenv(".env.dev")
 logging.getLogger("chromadb").setLevel(logging.INFO)
 
 # 服务端口配置（集中管理，避免冲突）
-CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8345"))  # ChromaDB 端口
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8878"))  # ChromaDB 端口
 
 
 def _check_port_available(port: int) -> bool:
@@ -149,10 +150,9 @@ app.include_router(attachments.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(metadata.router, prefix="/api")
 app.include_router(file_process.router, prefix="/api")
+app.include_router(conversation.router, prefix="/api")
 
 
 @app.get("/health", tags=["健康检查"])
 async def health_check():
     return {"status": "ok"}
-
-

@@ -3,6 +3,8 @@
 # ============================================
 # LangChain 核心库，提供 Chain、Prompt、OutputParser、消息类型等基础抽象与编排能力
 langchain-core
+# LangChain 主包，提供 ConversationChain、ConversationBufferMemory 等高级组件
+langchain
 # LangChain 社区组件库，集成大量第三方工具、向量库、文档加载器等扩展组件
 langchain-community
 # LangChain 对 OpenAI 的官方适配，支持 GPT 系列模型调用、Embedding 生成、流式输出

@@ -73,14 +73,16 @@ class  DashScopeEmbedding(Embeddings):
 
 class EmbeddingHandler():
 
-    def __init__(self, documents: list[ChunkResult], api_key: str):
-        self.documents = documents
+    def __init__(self,api_key: str):
         self.api_key = api_key
+
+
+    def init_vectorstore(self):
         logger.info("EmbeddingHandler 初始化: 开始创建 DashScopeEmbedding")
-        self.embeddings = DashScopeEmbedding(api_key=api_key)
+        embeddings = DashScopeEmbedding(api_key=self.api_key)
         logger.info(f"EmbeddingHandler 初始化: 开始连接 ChromaDB (localhost:{CHROMA_PORT})")
         _check_chroma_port("localhost", CHROMA_PORT)
-        self.client = chromadb.HttpClient(
+        client = chromadb.HttpClient(
             host="localhost",
             port=CHROMA_PORT,
             settings=chromadb.config.Settings(
@@ -90,27 +92,26 @@ class EmbeddingHandler():
             )
         )
         logger.info("EmbeddingHandler 初始化: ChromaDB 连接成功")
-        self.vectorstore = Chroma(
-            client=self.client,
+        return Chroma(
+            client=client,
             collection_name="lingxi-agent-collection",  # 进行分组，组名称，数据隔离
-            embedding_function=self.embeddings
+            embedding_function=embeddings
         )
-        logger.info("EmbeddingHandler 初始化: Chroma vectorstore 就绪")
 
 
-    async def save_to_vectors(self):
-        logger.info(f"开始向量存储，文档块数: {len(self.documents)}")
+    async def save_to_vectors(self, documents: list[ChunkResult], ):
+        logger.info(f"开始向量存储，文档块数: {len(documents)}")
 
         # 将 ChunkResult 转成 Document 对象
         docs = [
             Document(page_content=doc.page_content, metadata=doc.metadata)
-            for doc in self.documents
+            for doc in documents
         ]
         logger.info(f"文档转换完成，共 {len(docs)} 个 Document 对象")
 
         # 向量化写入
         import asyncio
-        await asyncio.to_thread(self.vectorstore.add_documents, docs)
+        await asyncio.to_thread(self.init_vectorstore().add_documents, docs)
         logger.info("向量存储完成，数据已写入 ChromaDB")
 
 if __name__ == '__main__':

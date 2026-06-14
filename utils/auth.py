@@ -86,3 +86,32 @@ async def get_current_user(
         raise credentials_exception
 
     return user
+
+
+async def get_current_user_id(
+    token: str = Depends(oauth2_scheme)
+) -> Optional[str]:
+    """
+    FastAPI 依赖：从请求 Token 中解析当前用户ID
+    
+    与 get_current_user 不同，这个函数：
+    1. 不需要数据库查询，性能更好
+    2. 返回用户ID字符串，而不是 User 对象
+    3. 如果 Token 无效，返回 None（不抛异常）
+    
+    适用于不需要完整用户信息，只需要用户ID的场景
+    
+    :param token: JWT Token
+    :return: 用户ID字符串，如果 Token 无效返回 None
+    """
+    try:
+        payload = decode_access_token(token)
+        if payload is None:
+            return None
+        
+        user_id = payload.get("sub")
+        return str(user_id) if user_id else None
+        
+    except Exception:
+        # Token 解析失败，返回 None
+        return None

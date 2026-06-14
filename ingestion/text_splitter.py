@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters.base import TextSplitter
 
 from core.exceptions import FileSplitException
 
@@ -39,6 +40,7 @@ class TextSplitterFactory:
         "？",    # 中文问号
         "；",    # 中文分号
         ",",     # 英文逗号
+        "，",    # 中文逗号
         ".",     # 英文句号
         " ",     # 空格
         "",      # 字符级分割
@@ -66,7 +68,13 @@ class TextSplitterFactory:
             # 外部传入会导致 "multiple values for keyword argument 'separators'" 错误
             splitter = RecursiveCharacterTextSplitter(
                 separators=separators,
-                **TextSplitterFactory._get_chunk_params(config)
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
+                length_function=config.length_function or len,
+                # 关键修复：强制遵守 chunk_size 限制
+                keep_separator=False,
+                add_start_index=False,
+                strip_whitespace=True,
             )
 
             logger.info(f"创建分割器成功: {file_type}, chunk_size={config.chunk_size}")
@@ -114,7 +122,18 @@ class TextSplitterFactory:
         separators = [s.strip() for s in separators_str.split(',') if s.strip()]
 
         # 处理转义序列（如 \n、\t 等），将字面量转义转换为实际控制字符
-        return [codecs.decode(s, 'unicode_escape') for s in separators]
+        decoded_separators = []
+        for s in separators:
+            try:
+                # 使用 unicode_escape 解码转义字符
+                decoded = codecs.decode(s, 'unicode_escape')
+                decoded_separators.append(decoded)
+            except Exception as e:
+                logger.warning(f"分隔符解码失败: {s}, 使用原始值. 错误: {e}")
+                decoded_separators.append(s)
+        
+        logger.info(f"分隔符解析: 原始={separators}, 解码后={decoded_separators}")
+        return decoded_separators
 
 
 class IntelligentTextSplitter:

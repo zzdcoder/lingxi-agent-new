@@ -47,3 +47,8 @@ class FileSplitException(RAGException):
     """文件分割相关异常"""
     def __init__(self, message: str = "文件分割失败", code: int = 400):
         super().__init__(message, code)
+
+class ConversationException(RAGException):
+    """对话相关异常"""
+    def __init__(self, message: str = "对话处理失败", code: int = 400):
+        super().__init__(message, code)

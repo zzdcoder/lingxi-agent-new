@@ -41,8 +41,8 @@ async def process_file(
         if input_data.save_embedding:
             logger.info(f"开始向量存储: file_id={input_data.file_id}, 块数={len(result.deal_result)}")
             try:
-                handler = embedding_deal.EmbeddingHandler(result.deal_result, settings.api_key)
-                await handler.save_to_vectors()
+                handler = embedding_deal.EmbeddingHandler(settings.api_key)
+                await handler.save_to_vectors(result.deal_result)
                 logger.info(f"向量存储成功: file_id={input_data.file_id}")
             except Exception as e:
                 logger.error(f"向量存储失败: file_id={input_data.file_id}, 错误: {e}")
