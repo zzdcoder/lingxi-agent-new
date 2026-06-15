@@ -306,7 +306,6 @@ class ConversationService:
         :param model: 模型名称
         :return: LangChain LLM 对象
         """
-        # TODO: 根据实际 LLM 提供商配置调整
         # 这里使用 OpenAI 兼容接口（支持通义千问等）
         return ChatOpenAI(
             model=model,
