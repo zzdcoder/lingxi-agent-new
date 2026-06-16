@@ -32,7 +32,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logging.getLogger("chromadb").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -96,14 +95,19 @@ def main():
             reload=True,
             reload_dirs=["app", "api", "rag", "models", "core", "utils", "embeddings", "ingestion", "prompt"],
             reload_excludes=[
-                "chroma_data/*",
-                "uploads/*",
-                "temp/*",
-                ".venv/*",
-                ".idea/*",
+                "qdrant_data",
+                "qdrant_data_backup",
+                "uploads",
+                "temp",
+                ".venv",
+                ".idea",
                 "*.pyc",
-                "__pycache__/*",
+                "__pycache__",
                 "*.log",
+                "*.sqlite3",
+                "*.db",
+                "*.tmp",
+                "*.bak",
             ],
             log_level="debug",
             access_log=True,

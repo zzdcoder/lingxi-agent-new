@@ -1,36 +1,27 @@
 import logging
 import os
-import socket
 
-import chromadb
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_qdrant import QdrantVectorStore
 from openai import OpenAI
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
 
 from core import settings
 from models.file_schema import ChunkResult
 
 logger = logging.getLogger(__name__)
 
-# ChromaDB 端口（与 app/main.py 保持一致）
-CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8001"))
+load_dotenv(".env.dev")
 
-
-def _check_chroma_port(host: str = "localhost", port: int = 8000, timeout: float = 3.0):
-    """快速检测 ChromaDB 端口是否开放，避免 HttpClient 无限等待"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    try:
-        result = sock.connect_ex((host, port))
-        if result != 0:
-            raise ConnectionError(
-                f"ChromaDB 服务未启动或无法连接: {host}:{port} "
-                f"(socket error code: {result})"
-            )
-    finally:
-        sock.close()
+# Qdrant 本地磁盘存储路径
+QDRANT_PATH = os.getenv("QDRANT_PATH", "./qdrant_data")
+# 集合名称
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "lingxi-agent-collection")
+# 向量维度（与 DashScope text-embedding-v3 一致）
+VECTOR_SIZE = int(os.getenv("VECTOR_SIZE", "1024"))
 
 
 class  DashScopeEmbedding(Embeddings):
@@ -80,27 +71,41 @@ class EmbeddingHandler():
     def init_vectorstore(self):
         logger.info("EmbeddingHandler 初始化: 开始创建 DashScopeEmbedding")
         embeddings = DashScopeEmbedding(api_key=self.api_key)
-        logger.info(f"EmbeddingHandler 初始化: 开始连接 ChromaDB (localhost:{CHROMA_PORT})")
-        _check_chroma_port("localhost", CHROMA_PORT)
-        client = chromadb.HttpClient(
-            host="localhost",
-            port=CHROMA_PORT,
-            settings=chromadb.config.Settings(
-                chroma_server_host="localhost",
-                chroma_server_http_port=CHROMA_PORT,
-                anonymized_telemetry=False,
+        logger.info(f"EmbeddingHandler 初始化: 开始连接 Qdrant (路径: {QDRANT_PATH})")
+
+        # 使用本地磁盘模式，无需独立服务进程
+        client = QdrantClient(path=QDRANT_PATH)
+
+        # 检查集合并创建（如果不存在）
+        collections = client.get_collections().collections
+        collection_names = [c.name for c in collections]
+        if QDRANT_COLLECTION not in collection_names:
+            logger.info(f"Qdrant 集合不存在，创建新集合: {QDRANT_COLLECTION}")
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(
+                    size=VECTOR_SIZE,
+                    distance=Distance.COSINE,  # DashScope 嵌入已归一化，余弦相似度最合适
+                ),
             )
-        )
-        logger.info("EmbeddingHandler 初始化: ChromaDB 连接成功")
-        return Chroma(
+            logger.info(f"Qdrant 集合创建成功: {QDRANT_COLLECTION}")
+        else:
+            logger.info(f"Qdrant 集合已存在: {QDRANT_COLLECTION}")
+
+        logger.info("EmbeddingHandler 初始化: Qdrant 连接成功")
+        return QdrantVectorStore(
             client=client,
-            collection_name="lingxi-agent-collection",  # 进行分组，组名称，数据隔离
-            embedding_function=embeddings
+            collection_name=QDRANT_COLLECTION,
+            embedding=embeddings,
         )
 
 
-    async def save_to_vectors(self, documents: list[ChunkResult], ):
+    async def save_to_vectors(self, documents: list[ChunkResult]):
         logger.info(f"开始向量存储，文档块数: {len(documents)}")
+
+        if not documents:
+            logger.warning("文档列表为空，跳过向量存储")
+            return
 
         # 将 ChunkResult 转成 Document 对象
         docs = [
@@ -109,19 +114,7 @@ class EmbeddingHandler():
         ]
         logger.info(f"文档转换完成，共 {len(docs)} 个 Document 对象")
 
-        # 向量化写入
-        import asyncio
-        await asyncio.to_thread(self.init_vectorstore().add_documents, docs)
-        logger.info("向量存储完成，数据已写入 ChromaDB")
-
-if __name__ == '__main__':
-        embeddings = DashScopeEmbedding(api_key=settings.api_key)
-        client = chromadb.HttpClient(host="localhost", port=8345)
-        vectorstore = Chroma(
-             client=client,
-             collection_name="lingxi-agent-collection",  # 进行分组，组名称，数据隔离
-             embedding_function=embeddings
-         )
-        retrieve_result= vectorstore.similarity_search("group_IRuleCheckCSV_groupRuleCheck",k=2)
-        for e in retrieve_result:
-            print(e)
+        # 向量化写入 Qdrant
+        vectorstore = self.init_vectorstore()
+        vectorstore.add_documents(docs)
+        logger.info(f"向量存储完成，数据已写入 Qdrant 集合: {QDRANT_COLLECTION}")

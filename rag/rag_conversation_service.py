@@ -17,7 +17,6 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from rag.memory_mysql import MySQLChatMessageHistory
-from langchain_chroma import Chroma
 from embeddings.embedding_deal import DashScopeEmbedding
 from core.config import settings
 from embeddings.embedding_deal import EmbeddingHandler
@@ -68,7 +67,7 @@ class RAGConversationService:
         try:
             # 1. 提取用户问题
             user_input = messages[-1].get("content", "")
-            logger.debug(f"用户输入: {user_input[:100]}...")
+            logger.info(f"【用户问题】{user_input}")
             
             # 2. 检索相关知识
             context_docs = await self._retrieve_context(user_input)
@@ -76,6 +75,11 @@ class RAGConversationService:
             
             if context_docs:
                 logger.info(f"检索到 {len(context_docs)} 个相关文档")
+                for idx, doc in enumerate(context_docs, 1):
+                    content_preview = doc.page_content[:300].replace('\n', ' ')
+                    logger.info(f"  [文档{idx}] {content_preview}{'...' if len(doc.page_content) > 300 else ''}")
+                    if doc.metadata:
+                        logger.info(f"  [文档{idx}元数据] {doc.metadata}")
             else:
                 logger.info("未检索到相关文档，使用纯对话模式")
             
@@ -114,14 +118,17 @@ class RAGConversationService:
         
         try:
             # 使用异步线程执行同步检索
-            import asyncio
-            docs = await asyncio.to_thread(
-                self.vectorstore.similarity_search,
-                query,
-                k=k
-            )
-            
-            logger.debug(f"检索完成: 找到 {len(docs)} 个文档")
+            # import asyncio
+            # docs = await asyncio.to_thread(
+            #
+            #     query,
+            #     k=k
+            # )
+            docs = self.vectorstore.similarity_search(query, k=k)
+            logger.info(f"向量检索完成: 查询='{query}', 找到 {len(docs)} 个文档")
+            for idx, doc in enumerate(docs, 1):
+                content_preview = doc.page_content[:200].replace('\n', ' ')
+                logger.info(f"  [检索结果{idx}] {content_preview}{'...' if len(doc.page_content) > 200 else ''}")
             return docs
             
         except Exception as e:

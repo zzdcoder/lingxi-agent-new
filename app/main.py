@@ -7,8 +7,6 @@ FastAPI 应用入口
 import asyncio
 import logging
 import os
-import socket
-import subprocess
 import sys
 from contextlib import asynccontextmanager
 
@@ -41,19 +39,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 load_dotenv(".env.dev")
 
-# 配置 ChromaDB 日志级别
-logging.getLogger("chromadb").setLevel(logging.INFO)
-
-# 服务端口配置（集中管理，避免冲突）
-CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8878"))  # ChromaDB 端口
-
-
-def _check_port_available(port: int) -> bool:
-    """检测端口是否可用"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(1)
-        return sock.connect_ex(("127.0.0.1", port)) != 0
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理：启动时建表并初始化内置元数据"""
@@ -73,31 +58,7 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(captcha_cleanup_loop())
 
-    # 启动 Chroma 服务前检测端口是否被占用
-    if not _check_port_available(CHROMA_PORT):
-        logger.error(f"端口 {CHROMA_PORT} 已被占用，请检查是否有残留进程或修改 CHROMA_PORT 环境变量")
-        raise RuntimeError(f"ChromaDB 端口 {CHROMA_PORT} 被占用")
-
-    # 启动 Chroma 服务（使用 Popen 避免 Windows 下 asyncio subprocess 的 NotImplementedError）
-    # stdout/stderr 重定向到 DEVNULL，避免 PIPE 缓冲区满导致子进程死锁
-    chroma_proc = subprocess.Popen(
-        ["chroma", "run",
-         "--path", "./chroma_data",
-         "--host", "localhost",
-         "--port", str(CHROMA_PORT)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    logger.info(f"Chroma 服务已启动，PID={chroma_proc.pid}, 端口={CHROMA_PORT}")
-    await asyncio.sleep(2)  # 等待服务就绪
-
     yield
-
-    # 关闭 Chroma 服务
-    if chroma_proc.poll() is None:
-        chroma_proc.terminate()
-        chroma_proc.wait()
-        logger.info("Chroma 服务已停止")
 
     # 取消验证码清理后台任务
     cleanup_task.cancel()

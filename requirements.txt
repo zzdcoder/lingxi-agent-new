@@ -9,8 +9,8 @@ langchain
 langchain-community
 # LangChain 对 OpenAI 的官方适配，支持 GPT 系列模型调用、Embedding 生成、流式输出
 langchain-openai
-# LangChain 对 Chroma 向量数据库的集成封装，支持向量检索与存储的链式调用
-langchain-chroma
+# LangChain 对 Qdrant 向量数据库的集成封装，支持向量检索与存储的链式调用
+langchain-qdrant
 
 # ============================================
 # 2. 文档解析与文本处理
@@ -27,8 +27,8 @@ jieba
 sentence-transformers
 # 经典稀疏检索算法实现，基于词频统计对文档进行相关性排序，常与向量检索混合使用（Hybrid RAG）
 rank-bm25
-# 轻量级开源向量数据库，支持向量存储、相似度检索、元数据过滤，是本地 RAG 的常用选择
-chromadb
+# Qdrant 向量数据库 Python 客户端，支持本地磁盘模式和远程服务模式
+qdrant-client>=1.9.0
 
 # ============================================
 # 4. Web 框架与服务器
