@@ -19,6 +19,7 @@ from langchain_core.documents import Document
 from core import get_db
 from core.config import settings
 from core.exceptions import FileProcessingException, FileDownloadException
+from models import User, UserOut
 from models.file_schema import FileDDLAndSplitInput, FileDDLAndSplitOutput, ChunkResult
 
 # 导入相关模块
@@ -26,6 +27,7 @@ from ingestion.cos_service import get_cos_service, FileStorageService
 from ingestion.file_parser import get_file_parser, FileParserRegistry
 from ingestion.text_cleaner import TextCleaner, TextCleanOptions, create_cleaner_from_options
 from ingestion.text_splitter import get_text_splitter, IntelligentTextSplitter, create_split_config_from_input
+from utils import get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,8 @@ class FileDDLSplitService:
     async def process(
         self,
         input_data: FileDDLAndSplitInput,
-        db: AsyncSession
+        db: AsyncSession,
+        user_name: str=''
     ) -> FileDDLAndSplitOutput:
         """
         处理文件清洗和分割
@@ -117,6 +120,7 @@ class FileDDLSplitService:
                 input_data.chunk_size,
                 input_data.chunk_overlap,
                 merged_meta|{
+                    "create_username":user_name,
                     'file_id': input_data.file_id,
                     'original_name': original_name,
                     'auth_option': input_data.auth_option,

@@ -10,7 +10,9 @@ RAG 对话服务
 import logging
 import time
 from typing import List, Optional, Dict, Any, AsyncGenerator
+import asyncio
 
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -45,7 +47,8 @@ class RAGConversationService:
         self,
         conversation_id: str,
         messages: List[Dict[str, Any]],
-        model: str = "qwen-turbo"
+        model: str = "qwen-turbo",
+        login_username: Optional[str] = None
     ) -> AsyncGenerator[bytes, None]:
         """
         带 RAG 检索的对话（流式响应）
@@ -70,7 +73,7 @@ class RAGConversationService:
             logger.info(f"【用户问题】{user_input}")
             
             # 2. 检索相关知识
-            context_docs = await self._retrieve_context(user_input)
+            context_docs = await self._retrieve_context(user_input, k=4, login_username=login_username)
             context_text = self._format_context(context_docs)
             
             if context_docs:
@@ -104,10 +107,15 @@ class RAGConversationService:
             error_data = f'data: {{"content": "对话失败：{str(e)}", "done": true}}\n\n'
             yield error_data.encode('utf-8')
 
-    async def _retrieve_context(self, query: str, k: int = 3) -> List[Any]:
+    async def _retrieve_context(
+            self,
+            query: str,
+            k: int = 3,
+            login_username: str = None
+    ) -> List[Any]:
         """
         检索相关知识
-        
+
         :param query: 查询文本
         :param k: 返回文档数量
         :return: 相关文档列表
@@ -115,26 +123,46 @@ class RAGConversationService:
         if not self.vectorstore:
             logger.warning("向量数据库未初始化，跳过检索")
             return []
-        
+
         try:
+            filter_obj = None
+            if login_username:
+                filter_obj = Filter(
+                    should=[
+                        FieldCondition(
+                            key="auth_option",
+                            match=MatchValue(value="public")
+                        ),
+                        Filter(
+                            must=[
+                                FieldCondition(
+                                    key="auth_option",
+                                    match=MatchValue(value="private")
+                                ),
+                                FieldCondition(
+                                    key="create_username",
+                                    match=MatchValue(value=login_username)
+                                ),
+                            ]
+                        ),
+                    ]
+                )
             # 使用异步线程执行同步检索
-            # import asyncio
-            # docs = await asyncio.to_thread(
-            #
-            #     query,
-            #     k=k
-            # )
-            docs = self.vectorstore.similarity_search(query, k=k)
+            docs = await asyncio.to_thread(
+                self.vectorstore.similarity_search,
+                query,
+                k=k,
+                filter=filter_obj
+            )
             logger.info(f"向量检索完成: 查询='{query}', 找到 {len(docs)} 个文档")
             for idx, doc in enumerate(docs, 1):
                 content_preview = doc.page_content[:200].replace('\n', ' ')
                 logger.info(f"  [检索结果{idx}] {content_preview}{'...' if len(doc.page_content) > 200 else ''}")
             return docs
-            
+
         except Exception as e:
             logger.error(f"检索失败: {e}")
             return []
-
     def _format_context(self, docs: List[Any]) -> str:
         """
         格式化检索结果为上下文文本
@@ -248,6 +276,9 @@ class RAGConversationService:
             
             # 保存 AI 消息
             await mysql_history.add_message(AIMessage(content=full_response))
+            
+            # 显式提交事务，确保消息持久化（StreamingResponse 场景下 get_db 的自动 commit 可能不生效）
+            await self.db.commit()
             
             # 发送完成标记
             yield b'data: {"done": true}\n\n'

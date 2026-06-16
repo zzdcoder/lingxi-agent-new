@@ -7,6 +7,7 @@ FastAPI 应用入口
 import asyncio
 import logging
 import os
+import socket
 import sys
 from contextlib import asynccontextmanager
 
@@ -38,6 +39,19 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 load_dotenv(".env.dev")
+
+# 配置 ChromaDB 日志级别
+logging.getLogger("chromadb").setLevel(logging.INFO)
+
+# 服务端口配置（集中管理，避免冲突）
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8878"))  # ChromaDB 端口
+
+
+def _check_port_available(port: int) -> bool:
+    """检测端口是否可用"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("127.0.0.1", port)) != 0
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

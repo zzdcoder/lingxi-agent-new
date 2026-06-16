@@ -42,7 +42,9 @@ async def get_db() -> AsyncSession:
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
+            # 仅在会话仍处于活动事务中时才提交，避免重复 commit
+            if session.is_active:
+                await session.commit()
         except Exception:
             await session.rollback()
             raise

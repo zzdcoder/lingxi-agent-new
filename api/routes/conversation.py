@@ -18,9 +18,11 @@ from models.conversation_schema import (
     MessageOut,
     ChatRequest,
 )
+from models.user_model import User
 from rag.conversation_service import ConversationService, get_conversation_service
 from rag.rag_conversation_service import RAGConversationService, get_rag_conversation_service
 from utils.auth import get_current_user_id
+from utils.auth import get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +204,8 @@ async def list_messages(
 async def chat(
     chat_request: ChatRequest,
     db: AsyncSession = Depends(get_db),
-    current_user_id: Optional[str] = Depends(get_current_user_id)
+    current_user_id: Optional[str] = Depends(get_current_user_id),
+    current_user: User = Depends(get_current_user)
 ):
     """
     流式对话接口
@@ -232,7 +235,8 @@ async def chat(
                 async for chunk in service.chat_with_rag(
                     conversation_id=chat_request.conversation_id,
                     messages=chat_request.messages,
-                    model=chat_request.model
+                    model=chat_request.model,
+                    login_username=current_user.username
                 ):
                     yield chunk
         else:

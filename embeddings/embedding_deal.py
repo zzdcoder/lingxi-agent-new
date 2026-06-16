@@ -1,5 +1,6 @@
 import logging
 import os
+import socket
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document

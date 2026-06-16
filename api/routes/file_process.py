@@ -10,9 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core import get_db, settings
 from core.exceptions import FileProcessingException
+from models import User
 from models.file_schema import FileDDLAndSplitInput, FileDDLAndSplitOutput
 from ingestion.fileddl_service import get_file_ddl_split_service
 from embeddings import embedding_deal
+from utils import get_current_user
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/file", tags=["文件处理"])
@@ -21,7 +24,8 @@ router = APIRouter(prefix="/file", tags=["文件处理"])
 @router.post("/process", response_model=FileDDLAndSplitOutput)
 async def process_file(
     input_data: FileDDLAndSplitInput,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     预览文件清洗和分块结果
@@ -34,7 +38,7 @@ async def process_file(
         logger.info(f"开始处理文件: {input_data.file_id}, 类型: {input_data.file_type}")
 
         service = get_file_ddl_split_service()
-        result = await service.process(input_data, db)
+        result = await service.process(input_data, db,current_user.username)
 
         logger.info(f"文件处理完成: {input_data.file_id}, 生成 {len(result.deal_result)} 个块")
 

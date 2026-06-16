@@ -288,6 +288,9 @@ class ConversationService:
             await mysql_history.add_message(HumanMessage(content=user_input))
             await mysql_history.add_message(AIMessage(content=full_response))
             
+            # 显式提交事务，确保消息持久化（StreamingResponse 场景下 get_db 的自动 commit 可能不生效）
+            await self.db.commit()
+            
             # 发送完成标记
             yield b'data: {"done": true}\n\n'
             
