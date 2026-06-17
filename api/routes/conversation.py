@@ -204,7 +204,6 @@ async def list_messages(
 async def chat(
     chat_request: ChatRequest,
     db: AsyncSession = Depends(get_db),
-    current_user_id: Optional[str] = Depends(get_current_user_id),
     current_user: User = Depends(get_current_user)
 ):
     """

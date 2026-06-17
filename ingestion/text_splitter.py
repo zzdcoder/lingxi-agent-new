@@ -5,6 +5,7 @@
 """
 
 import codecs
+import datetime
 import logging
 from typing import List, Optional, Dict, Any, Callable
 from dataclasses import dataclass
@@ -197,6 +198,7 @@ class IntelligentTextSplitter:
             result = []
             for idx, doc in enumerate(documents):
                 doc.metadata['chunk_index'] = idx
+                doc.metadata['create_time']= datetime.datetime
                 doc.metadata['total_chunks'] = len(documents)
                 doc.metadata['chunk_size'] = len(doc.page_content)
                 result.append(doc)

@@ -6,7 +6,7 @@ RAG 对话服务
 2. 上下文增强
 3. 带 Memory 的对话
 """
-
+import json
 import logging
 import time
 from typing import List, Optional, Dict, Any, AsyncGenerator
@@ -76,16 +76,6 @@ class RAGConversationService:
             context_docs = await self._retrieve_context(user_input, k=4, login_username=login_username)
             context_text = self._format_context(context_docs)
             
-            if context_docs:
-                logger.info(f"检索到 {len(context_docs)} 个相关文档")
-                for idx, doc in enumerate(context_docs, 1):
-                    content_preview = doc.page_content[:300].replace('\n', ' ')
-                    logger.info(f"  [文档{idx}] {content_preview}{'...' if len(doc.page_content) > 300 else ''}")
-                    if doc.metadata:
-                        logger.info(f"  [文档{idx}元数据] {doc.metadata}")
-            else:
-                logger.info("未检索到相关文档，使用纯对话模式")
-            
             # 3. 创建 MySQL Memory
             mysql_history = MySQLChatMessageHistory(
                 session=self.db,
@@ -130,23 +120,27 @@ class RAGConversationService:
                 filter_obj = Filter(
                     should=[
                         FieldCondition(
-                            key="auth_option",
+                            key="metadata.auth_option",
                             match=MatchValue(value="public")
                         ),
                         Filter(
                             must=[
                                 FieldCondition(
-                                    key="auth_option",
+                                    key="metadata.auth_option",
                                     match=MatchValue(value="private")
                                 ),
                                 FieldCondition(
-                                    key="create_username",
+                                    key="metadata.create_username",
                                     match=MatchValue(value=login_username)
                                 ),
                             ]
                         ),
                     ]
                 )
+            if filter_obj:
+                logger.info(f"构建的过滤条件为: {filter_obj.model_dump(exclude_none=True)}")
+            else:
+                logger.info("未构建过滤条件，执行无过滤检索")
             # 使用异步线程执行同步检索
             docs = await asyncio.to_thread(
                 self.vectorstore.similarity_search,

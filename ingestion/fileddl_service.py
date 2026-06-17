@@ -4,7 +4,7 @@
 企业级文件清洗和分割服务，支持多种文件格式的解析、
 文本清洗和智能分块处理。
 """
-
+import json
 import os
 import asyncio
 import logging
@@ -225,6 +225,7 @@ class FileDDLSplitService:
         :param metadata: 元数据
         :return: Document列表
         """
+        logger.info("元数据信息为："+json.dumps(metadata,ensure_ascii=False))
         # 处理默认分隔符
         if not separators or separators.strip() == "":
             separators = settings.file_default_separators
