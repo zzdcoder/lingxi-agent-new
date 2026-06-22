@@ -63,8 +63,7 @@ DEFAULT_BM25_TOPK: int = 50
 DEFAULT_VECTOR_TOPK: int = 50
 """向量检索单路召回数量，理由同上。"""
 
-BM25_INDEX_CACHE_FILE: str = "./data/bm25_index.pkl"
-"""BM25 索引默认持久化路径。生产环境建议改为共享存储或对象存储路径。"""
+
 
 
 # =============================================================================
@@ -452,6 +451,162 @@ class BM25Indexer:
 
 
 # =============================================================================
+# Cross-Encoder 重排序器
+# =============================================================================
+
+class CrossEncoderReranker:
+    """
+    基于 Cross-Encoder 的重排序器（使用 sentence-transformers）。
+
+    设计目标：
+        在 BM25 + 向量检索完成初筛后，使用精度更高的 Cross-Encoder 模型
+        对候选文档进行精细重排，显著提升 Top-K 结果的相关性。
+
+    为什么需要重排序？
+        - BM25 和向量检索都是"双塔"架构：查询和文档分别编码，相似度计算
+          发生在向量空间，会损失细粒度交互信息；
+        - Cross-Encoder 将查询和文档拼接后一起输入 Transformer，通过
+          self-attention 捕捉词级别交互，相关性判断更精准；
+        - 业界实践（如 Bing、Google）普遍采用"召回 + 重排"的两阶段架构。
+
+    模型推荐：
+        - BAAI/bge-reranker-large（默认）：中文英文均衡，企业知识库场景表现优秀
+        - BAAI/bge-reranker-base：速度更快，精度略低，适合延迟敏感场景
+
+    性能边界：
+        - 重排序是计算密集型操作，耗时与候选文档数成正比；
+        - 建议在 RRF 融合后只对 top 50~100 个候选做重排，而非全量；
+        - 首次加载模型时会有显存/内存占用（bge-reranker-large 约 1.3GB）。
+    """
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-reranker-base",
+        device: Optional[str] = None,
+        max_length: int = 512,
+        batch_size: int = 8,
+    ):
+        """
+        初始化 Cross-Encoder 重排序器。
+
+        Args:
+            model_name: HuggingFace 模型名称或本地路径。
+                        默认 "BAAI/bge-reranker-base"。
+            device: 运行设备，None 时自动选择（cuda > mps > cpu）。
+            max_length: 输入最大 token 长度，超过会被截断。
+            batch_size: 推理批大小，根据 GPU 显存调整。
+        """
+        self.model_name = model_name
+        self.device = device
+        self.max_length = max_length
+        self.batch_size = batch_size
+
+        self._model = None
+
+    def _lazy_load(self) -> None:
+        """惰性加载 CrossEncoder 模型（首次调用 rerank 时触发）。"""
+        if self._model is not None:
+            return
+
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError as exc:
+            raise ImportError(
+                f"CrossEncoderReranker 导入 sentence_transformers 失败。"
+                f"原始错误: {exc}"
+            ) from exc
+
+        logger.info(
+            f"正在加载 Cross-Encoder 重排序模型: {self.model_name}"
+        )
+        start_time = time.time()
+
+        # device 为空字符串/None 时，让 CrossEncoder 自动选择
+        kwargs = {"max_length": self.max_length}
+        if self.device:
+            kwargs["device"] = self.device
+
+        self._model = CrossEncoder(
+            self.model_name,
+            **kwargs,
+        )
+
+        elapsed = time.time() - start_time
+        logger.info(f"Cross-Encoder 模型加载完成，耗时: {elapsed:.2f}s")
+
+    def rerank(
+        self,
+        query: str,
+        documents: List[Document],
+        top_k: Optional[int] = None,
+    ) -> List[Document]:
+        """
+        对候选文档执行 Cross-Encoder 重排序。
+
+        Args:
+            query: 用户查询字符串。
+            documents: 候选 Document 列表。
+            top_k: 重排序后返回的文档数量。None 表示返回全部。
+
+        Returns:
+            按 Cross-Encoder 相关性分数降序排列的 Document 列表。
+        """
+        if not documents:
+            return []
+
+        self._lazy_load()
+        top_k = top_k or len(documents)
+
+        start_time = time.time()
+        logger.info(
+            f"Cross-Encoder 重排序开始，候选文档: {len(documents)}, "
+            f"batch_size={self.batch_size}"
+        )
+
+        # 构建 (query, doc) 对并批量推理
+        pairs = [[query, doc.page_content] for doc in documents]
+        scores = self._model.predict(
+            pairs,
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+        )
+
+        # 按分数降序排列
+        scored = list(zip(documents, scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        elapsed = time.time() - start_time
+        if scored:
+            logger.info(
+                f"Cross-Encoder 重排序完成，耗时: {elapsed:.3f}s, "
+                f"top1_score={scored[0][1]:.4f}"
+            )
+        else:
+            logger.info(f"Cross-Encoder 重排序完成，耗时: {elapsed:.3f}s")
+
+        # 记录前几条结果的分数（方便调试）
+        for idx, (doc, score) in enumerate(scored[:5], 1):
+            preview = doc.page_content[:60].replace("\n", " ")
+            logger.debug(f"  [重排结果 {idx}] score={score:.4f}, text={preview}...")
+
+        return [doc for doc, _ in scored[:top_k]]
+
+    async def arerank(
+        self,
+        query: str,
+        documents: List[Document],
+        top_k: Optional[int] = None,
+    ) -> List[Document]:
+        """
+        异步版本的 Cross-Encoder 重排序。
+
+        将同步推理放入线程池执行，避免阻塞事件循环。
+        """
+        import asyncio
+        return await asyncio.to_thread(self.rerank, query, documents, top_k)
+
+
+# =============================================================================
 # 混合检索器 (Hybrid Retriever)
 # =============================================================================
 
@@ -491,6 +646,8 @@ class HybridRetriever:
         rrf_k: int = DEFAULT_RRF_K,
         bm25_weight: float = 1.0,
         vector_weight: float = 1.0,
+        reranker: Optional[CrossEncoderReranker] = None,
+        rerank_top_k: Optional[int] = None,
     ):
         """
         初始化混合检索器。
@@ -504,12 +661,17 @@ class HybridRetriever:
                          如果你发现业务中关键词匹配更重要，可提高到 1.2~1.5；
                          如果语义理解更重要，可降低到 0.8。
             vector_weight: 向量路得分的权重乘数（默认 1.0）。与 bm25_weight 配合使用。
+            reranker: Cross-Encoder 重排序器实例。为 None 时不启用重排序。
+            rerank_top_k: 送入重排序器的候选文档数量。
+                          默认为 None（取最终 top_k 的 5 倍，或至少 50）。
         """
         self._vectorstore: QdrantVectorStore = vectorstore
         self._bm25_indexer: Optional[BM25Indexer] = bm25_indexer
         self._rrf_k: int = rrf_k
         self._bm25_weight: float = bm25_weight
         self._vector_weight: float = vector_weight
+        self._reranker: Optional[CrossEncoderReranker] = reranker
+        self._rerank_top_k: Optional[int] = rerank_top_k
 
     # -------------------------------------------------------------------------
     # 索引管理
@@ -533,7 +695,7 @@ class HybridRetriever:
             - 批量导入文档后；
             - 定时任务（如每天凌晨 3 点）。
         """
-        indexer = BM25Indexer.from_qdrant(
+        indexer =  BM25Indexer.from_qdrant(
             client=client,
             collection_name=collection_name,
             filter_obj=filter_obj,
@@ -601,8 +763,21 @@ class HybridRetriever:
         # 步骤 2: RRF 融合
         fused_results = self._rrf_fusion(bm25_results, vector_results)
 
-        # 步骤 3: 截断到 top_k
-        final_results = fused_results[:top_k]
+        # 步骤 3: Cross-Encoder 重排序（若启用）
+        if self._reranker and fused_results:
+            rerank_candidates = self._rerank_top_k or max(top_k * 5, 50)
+            candidates = fused_results[:rerank_candidates]
+            fused_results = self._reranker.rerank(
+                query=query,
+                documents=candidates,
+                top_k=top_k,
+            )
+            logger.info(f"重排序后返回 {len(fused_results)} 个结果")
+        else:
+            # 未启用重排序时直接截断
+            fused_results = fused_results[:top_k]
+
+        final_results = fused_results
 
         elapsed = time.time() - start_time
         logger.info(
@@ -736,70 +911,24 @@ class HybridRetriever:
         )
 
         fused_results = self._rrf_fusion(bm25_results, vector_results)
-        final_results = fused_results[:top_k]
+
+        # Cross-Encoder 重排序（若启用）
+        if self._reranker and fused_results:
+            rerank_candidates = self._rerank_top_k or max(top_k * 5, 50)
+            candidates = fused_results[:rerank_candidates]
+            fused_results = await self._reranker.arerank(
+                query=query,
+                documents=candidates,
+                top_k=top_k,
+            )
+            logger.info(f"异步重排序后返回 {len(fused_results)} 个结果")
+        else:
+            fused_results = fused_results[:top_k]
+
+        final_results = fused_results
 
         elapsed = time.time() - start_time
         logger.info(f"异步混合检索完成，返回 {len(final_results)} 个，耗时: {elapsed:.3f}s")
         return final_results
 
 
-# =============================================================================
-# 使用示例与最佳实践（仅供参考，不要直接用于生产）
-# =============================================================================
-
-USAGE_EXAMPLE = """
-# ------------------- 初始化阶段（应用启动时执行一次）-------------------
-
-from qdrant_client import QdrantClient
-from langchain_qdrant import QdrantVectorStore
-from embeddings.embedding_deal import DashScopeEmbedding, QDRANT_PATH, QDRANT_COLLECTION
-from rag.hybrid_retriever import HybridRetriever, BM25Indexer
-
-# 1. 构建向量存储（复用你现有的逻辑）
-embeddings = DashScopeEmbedding(api_key="your-api-key")
-client = QdrantClient(path=QDRANT_PATH)
-vectorstore = QdrantVectorStore(
-    client=client,
-    collection_name=QDRANT_COLLECTION,
-    embedding=embeddings,
-)
-
-# 2. 方式 A: 从 Qdrant 同步构建 BM25 索引（首次启动）
-hybrid = HybridRetriever(vectorstore=vectorstore)
-hybrid.sync_bm25_from_qdrant(
-    client=client,
-    collection_name=QDRANT_COLLECTION,
-)
-
-# 3. 方式 B: 从本地缓存加载 BM25 索引（日常重启）
-#    首次同步后建议保存索引，下次直接加载，省去几秒构建时间
-# hybrid.bm25_indexer.save("./data/bm25_index.pkl")
-# indexer = BM25Indexer.load("./data/bm25_index.pkl")
-# hybrid.set_bm25_indexer(indexer)
-
-# ------------------- 检索阶段（每次查询调用）-------------------
-
-# 同步调用
-results = hybrid.retrieve(
-    query="如何申请退款？",
-    top_k=5,
-    bm25_top_k=30,
-    vector_top_k=30,
-)
-
-# 异步调用（FastAPI 场景推荐）
-# results = await hybrid.aretrieve(
-#     query="如何申请退款？",
-#     top_k=5,
-# )
-
-for doc in results:
-    print(doc.page_content[:200])
-
-# ------------------- 索引更新阶段（文档变更后）-------------------
-
-# 当有新增文档时，重建 BM25 索引并保存
-# new_docs = [Document(page_content="...", metadata={...}), ...]
-# hybrid.bm25_indexer.add_documents(new_docs)
-# hybrid.bm25_indexer.save("./data/bm25_index.pkl")
-"""

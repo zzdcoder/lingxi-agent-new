@@ -62,6 +62,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"数据库初始化失败，应用将以降级模式运行: {exc}")
 
+    # 初始化混合检索器（启动时预热 BM25 索引）
+    try:
+        from rag.rag_conversation_service import init_hybrid_retriever
+        init_hybrid_retriever()
+        logger.info("BM25 索引启动预热完成")
+    except Exception as e:
+        logger.error(f"BM25 索引启动预热失败: {e}")
+
     # 启动验证码过期清理后台任务
     async def captcha_cleanup_loop():
         while True:

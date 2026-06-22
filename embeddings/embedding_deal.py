@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import os
 import socket
+from typing import Optional
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -8,6 +10,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_qdrant import QdrantVectorStore
 from openai import OpenAI
 from qdrant_client import QdrantClient
+from qdrant_client.http.models import Filter as QdrantFilter, FieldCondition, MatchValue
 from qdrant_client.models import Distance, VectorParams
 
 from core import settings
@@ -23,6 +26,18 @@ QDRANT_PATH = os.getenv("QDRANT_PATH", "./qdrant_data")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "lingxi-agent-collection")
 # 向量维度（与 DashScope text-embedding-v3 一致）
 VECTOR_SIZE = int(os.getenv("VECTOR_SIZE", "1024"))
+
+# 全局 QdrantClient 单例（本地磁盘模式不支持多实例并发访问同一存储目录）
+_qdrant_client: Optional[QdrantClient] = None
+
+
+def get_qdrant_client() -> QdrantClient:
+    """获取全局 QdrantClient 单例。"""
+    global _qdrant_client
+    if _qdrant_client is None:
+        logger.info(f"创建 QdrantClient 单例 (路径: {QDRANT_PATH})")
+        _qdrant_client = QdrantClient(path=QDRANT_PATH)
+    return _qdrant_client
 
 
 class  DashScopeEmbedding(Embeddings):
@@ -74,8 +89,8 @@ class EmbeddingHandler():
         embeddings = DashScopeEmbedding(api_key=self.api_key)
         logger.info(f"EmbeddingHandler 初始化: 开始连接 Qdrant (路径: {QDRANT_PATH})")
 
-        # 使用本地磁盘模式，无需独立服务进程
-        client = QdrantClient(path=QDRANT_PATH)
+        # 使用本地磁盘模式，复用全局单例避免并发访问冲突
+        client = get_qdrant_client()
 
         # 检查集合并创建（如果不存在）
         collections = client.get_collections().collections
@@ -101,21 +116,67 @@ class EmbeddingHandler():
         )
 
 
-    async def save_to_vectors(self, documents: list[ChunkResult]):
+    def delete_by_doc_id(self, doc_id: str) -> None:
+        """
+        根据 doc_id 删除向量库中该文档的所有旧 chunk。
+
+        在文档更新场景中，需要先删除旧版本再写入新版本，
+        避免向量库中同时存在同一文档的新旧内容导致检索混淆。
+
+        Args:
+            doc_id: 文档唯一标识。
+        """
+        if not doc_id:
+            logger.warning("doc_id 为空，跳过删除")
+            return
+
+        try:
+            client = get_qdrant_client()
+            filter_obj = QdrantFilter(
+                must=[
+                    FieldCondition(
+                        key="metadata.doc_id",
+                        match=MatchValue(value=doc_id)
+                    )
+                ]
+            )
+            client.delete(
+                collection_name=QDRANT_COLLECTION,
+                points_selector=filter_obj,
+            )
+            logger.info(f"已删除 doc_id={doc_id} 在向量库中的旧 chunk")
+        except Exception as e:
+            logger.error(f"删除 doc_id={doc_id} 的旧 chunk 失败: {e}")
+            raise
+
+    async def save_to_vectors(self, documents: list[ChunkResult], doc_id: str = None):
+        """
+        将文档块存入向量数据库。
+
+        Args:
+            documents: 文档块列表
+            doc_id: 可选的文档 ID。如果提供，会先删除该 doc_id 的所有旧 chunk，
+                    再写入新 chunk，实现"覆盖更新"语义。
+        """
         logger.info(f"开始向量存储，文档块数: {len(documents)}")
 
         if not documents:
             logger.warning("文档列表为空，跳过向量存储")
             return
 
-        # 将 ChunkResult 转成 Document 对象
+        # 步骤 1: 如果提供了 doc_id，先删除该文档的旧 chunk
+        if doc_id:
+            logger.info(f"检测到 doc_id={doc_id}，先清理向量库中的旧内容")
+            await asyncio.to_thread(self.delete_by_doc_id, doc_id)
+
+        # 步骤 2: 将 ChunkResult 转成 Document 对象
         docs = [
             Document(page_content=doc.page_content, metadata=doc.metadata)
             for doc in documents
         ]
         logger.info(f"文档转换完成，共 {len(docs)} 个 Document 对象")
 
-        # 向量化写入 Qdrant
+        # 步骤 3: 向量化写入 Qdrant
         vectorstore = self.init_vectorstore()
         vectorstore.add_documents(docs)
         logger.info(f"向量存储完成，数据已写入 Qdrant 集合: {QDRANT_COLLECTION}")

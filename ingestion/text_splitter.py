@@ -198,7 +198,7 @@ class IntelligentTextSplitter:
             result = []
             for idx, doc in enumerate(documents):
                 doc.metadata['chunk_index'] = idx
-                doc.metadata['create_time']= datetime.datetime
+                doc.metadata['create_time'] = datetime.datetime.now().isoformat()
                 doc.metadata['total_chunks'] = len(documents)
                 doc.metadata['chunk_size'] = len(doc.page_content)
                 result.append(doc)

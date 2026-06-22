@@ -48,6 +48,12 @@ class Settings(BaseSettings):
 
     api_key :str ="***REMOVED***"
 
+    # Cross-Encoder 重排序配置
+    reranker_model: str = "./bge-reranker-base"  # 本地路径
+    reranker_device: str = ""  # 运行设备: cuda / mps / cpu，空字符串自动选择
+    reranker_max_length: int = 512  # 输入最大 token 长度
+    reranker_batch_size: int = 8  # 推理批大小
+
     # 应用配置
     debug: bool = False
 

@@ -89,3 +89,5 @@ pillow==11.2.1
 cos-python-sdk-v5==1.9.33
 
 python-docx
+
+modelscope

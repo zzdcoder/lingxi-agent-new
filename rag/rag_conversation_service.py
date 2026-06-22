@@ -6,8 +6,8 @@ RAG 对话服务
 2. 上下文增强
 3. 带 Memory 的对话
 """
-import json
 import logging
+import os
 import time
 from typing import List, Optional, Dict, Any, AsyncGenerator
 import asyncio
@@ -18,12 +18,147 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
+from rag.hybrid_retriever import HybridRetriever, CrossEncoderReranker
+from rag.bm25_index_manager import BM25IndexManager
 from rag.memory_mysql import MySQLChatMessageHistory
-from embeddings.embedding_deal import DashScopeEmbedding
+from embeddings.embedding_deal import DashScopeEmbedding, QDRANT_PATH, QDRANT_COLLECTION
 from core.config import settings
 from embeddings.embedding_deal import EmbeddingHandler
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# 全局混合检索器与 BM25 管理器（由 app/main.py lifespan 在启动时注入）
+# =============================================================================
+
+_hybrid_retriever: Optional[HybridRetriever] = None
+_bm25_manager: Optional[BM25IndexManager] = None
+"""
+全局混合检索器单例与 BM25 索引管理器。
+
+为什么使用模块级全局变量而非依赖注入？
+    1. RAGConversationService 通过 get_rag_conversation_service 创建，该函数
+       作为 FastAPI 依赖，只能接收 db: AsyncSession 一个参数；
+    2. 若要通过 Request 获取 app.state，需要修改所有路由的依赖签名，改动面广；
+    3. 混合检索器本身是无状态的纯检索组件，适合作为全局单例共享；
+    4. 启动时 lifespan 注入一次，所有请求复用，无需每次重建连接。
+"""
+
+
+def set_hybrid_retriever(retriever: HybridRetriever) -> None:
+    """
+    设置全局混合检索器实例。
+
+    由外部模块（如 file_process）在索引重建成功后调用。
+    """
+    global _hybrid_retriever
+    _hybrid_retriever = retriever
+    logger.info("全局混合检索器已注入 RAGConversationService")
+
+
+def get_hybrid_retriever() -> Optional[HybridRetriever]:
+    """获取全局混合检索器实例。"""
+    return _hybrid_retriever
+
+
+def get_bm25_manager() -> Optional[BM25IndexManager]:
+    """获取全局 BM25 索引管理器。"""
+    return _bm25_manager
+
+
+def init_hybrid_retriever() -> HybridRetriever:
+    """
+    惰性初始化全局混合检索器。
+
+    首次调用时创建 HybridRetriever 实例，并通过 BM25IndexManager 加载/重建索引。
+    后续调用直接返回已有实例，避免重复初始化。
+
+    Returns:
+        全局 HybridRetriever 实例。
+    """
+    global _hybrid_retriever, _bm25_manager
+    if _hybrid_retriever is not None:
+        return _hybrid_retriever
+
+    logger.info("首次初始化混合检索器...")
+    vectorstore = EmbeddingHandler(api_key=settings.api_key).init_vectorstore()
+
+    # 初始化 Cross-Encoder 重排序器（若配置了模型路径）
+    reranker = None
+    if getattr(settings, "reranker_model", None):
+        reranker = CrossEncoderReranker(
+            model_name=settings.reranker_model,
+            device=getattr(settings, "reranker_device", None),
+            max_length=getattr(settings, "reranker_max_length", 512),
+            batch_size=getattr(settings, "reranker_batch_size", 8),
+        )
+        logger.info(f"Cross-Encoder 重排序器已启用: {settings.reranker_model}")
+
+    _hybrid_retriever = HybridRetriever(
+        vectorstore=vectorstore,
+        reranker=reranker,
+    )
+
+    # ── 创建 BM25 索引管理器并启动加载 ──
+    from embeddings.embedding_deal import get_qdrant_client
+    _bm25_manager = BM25IndexManager(
+        persist_path="./data/bm25_index.pkl",
+        qdrant_client=get_qdrant_client(),
+        collection_name=QDRANT_COLLECTION,
+    )
+
+    # 尝试从磁盘加载缓存
+    indexer = _bm25_manager.load_sync()
+    if indexer:
+        _hybrid_retriever.set_bm25_indexer(indexer)
+    else:
+        # 缓存不存在或损坏，从 Qdrant 全量重建
+        indexer = _bm25_manager.build_sync()
+        if indexer:
+            _hybrid_retriever.set_bm25_indexer(indexer)
+        else:
+            logger.warning(
+                "BM25 索引初始化失败，检索将降级为纯向量模式。"
+                "请检查 Qdrant 连接并调用 rebuild_hybrid_index()"
+            )
+
+    logger.info("混合检索器初始化完成")
+    return _hybrid_retriever
+
+
+async def rebuild_hybrid_index() -> None:
+    """
+    从 Qdrant 全量同步数据，重建 BM25 索引并原子替换。
+
+    本函数为异步接口，内部通过 BM25IndexManager 实现：
+        - 获取锁防止并发重建
+        - 在线程池中执行重建和持久化（避免阻塞事件循环）
+        - 使用临时文件 + 原子替换保证持久化安全
+        - 重建失败保留旧索引
+
+    应在以下场景调用：
+        - 向量存储完成新文档写入后（file_process 接口）；
+        - 文档被删除或更新后；
+        - 定时全量重建（可选）。
+    """
+    global _hybrid_retriever, _bm25_manager
+
+    # 确保混合检索器壳子已存在
+    if _hybrid_retriever is None:
+        init_hybrid_retriever()
+
+    if _bm25_manager is None:
+        logger.warning("BM25 管理器未初始化，跳过重建")
+        return
+
+    try:
+        doc_count = await _bm25_manager.rebuild_and_swap()
+        # 原子替换 HybridRetriever 中的 indexer 引用
+        _hybrid_retriever.set_bm25_indexer(_bm25_manager.indexer)
+        logger.info(f"BM25 索引重建完成，当前文档数: {doc_count}")
+    except Exception as e:
+        logger.error(f"BM25 索引重建失败: {e}，保留旧索引")
+        raise
 
 
 class RAGConversationService:
@@ -33,15 +168,27 @@ class RAGConversationService:
     结合向量数据库检索和对话记忆，提供知识增强的对话能力
     """
 
-    def __init__(self, db_session: AsyncSession):
+    def __init__(
+        self,
+        db_session: AsyncSession,
+        hybrid_retriever: Optional[HybridRetriever] = None,
+    ):
         """
         初始化 RAG 对话服务
-        
+
         :param db_session: SQLAlchemy 异步会话
+        :param hybrid_retriever: 混合检索器实例。若为 None，则回退到模块级
+                                 全局变量 _hybrid_retriever（由 lifespan 注入）。
         """
         self.db = db_session
         self.embeddings = DashScopeEmbedding(api_key=settings.api_key)
-        self.vectorstore = EmbeddingHandler(api_key=settings.api_key).init_vectorstore()
+        self.hybrid_retriever = hybrid_retriever or _hybrid_retriever
+
+        # 复用 hybrid_retriever 内部的 vectorstore，避免重复创建 QdrantClient
+        if self.hybrid_retriever:
+            self.vectorstore = self.hybrid_retriever._vectorstore
+        else:
+            self.vectorstore = EmbeddingHandler(api_key=settings.api_key).init_vectorstore()
 
     async def chat_with_rag(
         self,
@@ -98,16 +245,23 @@ class RAGConversationService:
             yield error_data.encode('utf-8')
 
     async def _retrieve_context(
-            self,
-            query: str,
-            k: int = 3,
-            login_username: str = None
+        self,
+        query: str,
+        k: int = 3,
+        login_username: str = None
     ) -> List[Any]:
         """
-        检索相关知识
+        检索相关知识（混合检索模式）。
+
+        检索策略优先级：
+            1. 若 hybrid_retriever 已初始化，执行 BM25 + 向量混合检索，
+               经 RRF 融合后按 created_at 倒序排列（新知识优先）；
+            2. 若 hybrid_retriever 未初始化（如启动失败或依赖未安装），
+               自动降级为纯向量检索，保证服务可用性。
 
         :param query: 查询文本
         :param k: 返回文档数量
+        :param login_username: 当前登录用户名，用于权限过滤
         :return: 相关文档列表
         """
         if not self.vectorstore:
@@ -115,6 +269,9 @@ class RAGConversationService:
             return []
 
         try:
+            # -----------------------------------------------------------------
+            # 步骤 1: 构建权限过滤条件（与原有逻辑保持一致）
+            # -----------------------------------------------------------------
             filter_obj = None
             if login_username:
                 filter_obj = Filter(
@@ -141,22 +298,57 @@ class RAGConversationService:
                 logger.info(f"构建的过滤条件为: {filter_obj.model_dump(exclude_none=True)}")
             else:
                 logger.info("未构建过滤条件，执行无过滤检索")
-            # 使用异步线程执行同步检索
-            docs = await asyncio.to_thread(
-                self.vectorstore.similarity_search,
-                query,
-                k=k,
-                filter=filter_obj
-            )
-            logger.info(f"向量检索完成: 查询='{query}', 找到 {len(docs)} 个文档")
+
+            # -----------------------------------------------------------------
+            # 步骤 2: 执行检索（混合检索优先，降级到纯向量检索）
+            # -----------------------------------------------------------------
+            if self.hybrid_retriever:
+                logger.info(f"【混合检索】查询='{query[:60]}...', top_k={k}")
+                docs = await self.hybrid_retriever.aretrieve(
+                    query=query,
+                    top_k=k,
+                    bm25_top_k=k * 5,      # 单路召回数取最终需求的 5 倍，为 RRF 预留候选池
+                    vector_top_k=k * 5,
+                    filter_obj=filter_obj,
+                )
+            else:
+                logger.info(f"【纯向量检索-降级模式】查询='{query[:60]}...', top_k={k}")
+                docs = await asyncio.to_thread(
+                    self.vectorstore.similarity_search,
+                    query,
+                    k=k,
+                    filter=filter_obj
+                )
+
+            # -----------------------------------------------------------------
+            # 步骤 3: 按 created_at 倒序排列（新知识优先策略）
+            # -----------------------------------------------------------------
+            # 如果未启用 Cross-Encoder 重排序，则在 RRF 融合结果内部按 created_at
+            # 微调顺序。若已启用重排序，则不再调整顺序，以保留 Cross-Encoder
+            # 的精细相关性排名。
+            if not (self.hybrid_retriever and self.hybrid_retriever._reranker):
+                docs.sort(
+                    key=lambda d: d.metadata.get("created_at", ""),
+                    reverse=True
+                )
+
+            logger.info(f"检索完成: 查询='{query}', 找到 {len(docs)} 个文档")
             for idx, doc in enumerate(docs, 1):
                 content_preview = doc.page_content[:200].replace('\n', ' ')
-                logger.info(f"  [检索结果{idx}] {content_preview}{'...' if len(doc.page_content) > 200 else ''}")
+                created_at = doc.metadata.get("created_at", "N/A")
+                logger.info(
+                    f"  [检索结果{idx}] created_at={created_at} "
+                    f"{content_preview}{'...' if len(doc.page_content) > 200 else ''}"
+                )
             return docs
 
         except Exception as e:
             logger.error(f"检索失败: {e}")
             return []
+
+
+
+
     def _format_context(self, docs: List[Any]) -> str:
         """
         格式化检索结果为上下文文本
@@ -288,9 +480,15 @@ class RAGConversationService:
 
 def get_rag_conversation_service(db: AsyncSession) -> RAGConversationService:
     """
-    获取 RAG 对话服务实例（FastAPI 依赖注入）
-    
+    获取 RAG 对话服务实例（FastAPI 依赖注入）。
+
+    自动将 lifespan 阶段注入的全局混合检索器传入服务实例，
+    无需修改路由层的依赖签名。
+
     :param db: 数据库会话
     :return: RAG 对话服务实例
     """
-    return RAGConversationService(db_session=db)
+    return RAGConversationService(
+        db_session=db,
+        hybrid_retriever=_hybrid_retriever,
+    )
