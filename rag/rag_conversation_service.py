@@ -14,13 +14,21 @@ import asyncio
 
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from sqlalchemy.ext.asyncio import AsyncSession
+from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from rag.hybrid_retriever import HybridRetriever, CrossEncoderReranker
 from rag.bm25_index_manager import BM25IndexManager
-from rag.memory_mysql import MySQLChatMessageHistory
+from rag.memory_mysql import MySQLChatMessageHistory, MySQLConversationSummaryMemory
+from prompt.prompt_storage import (
+    RAG_SYSTEM_PROMPT_WITH_CONTEXT,
+    RAG_SYSTEM_PROMPT_WITHOUT_CONTEXT,
+    SUMMARY_GENERATION_PROMPT,
+    CONVERSATION_SUMMARY_PREFIX,
+    INCREMENTAL_SUMMARY_PROMPT,
+)
 from embeddings.embedding_deal import DashScopeEmbedding, QDRANT_PATH, QDRANT_COLLECTION
 from core.config import settings
 from embeddings.embedding_deal import EmbeddingHandler
@@ -299,6 +307,19 @@ class RAGConversationService:
             else:
                 logger.info("未构建过滤条件，执行无过滤检索")
 
+            # 构建与 Qdrant filter_obj 逻辑等价的 BM25 元数据过滤函数
+            metadata_filter = None
+            if login_username:
+                def _bm25_auth_filter(doc: Document) -> bool:
+                    metadata = doc.metadata or {}
+                    auth = metadata.get("auth_option")
+                    if auth == "public":
+                        return True
+                    if auth == "private" and metadata.get("create_username") == login_username:
+                        return True
+                    return False
+                metadata_filter = _bm25_auth_filter
+
             # -----------------------------------------------------------------
             # 步骤 2: 执行检索（混合检索优先，降级到纯向量检索）
             # -----------------------------------------------------------------
@@ -310,6 +331,7 @@ class RAGConversationService:
                     bm25_top_k=k * 5,      # 单路召回数取最终需求的 5 倍，为 RRF 预留候选池
                     vector_top_k=k * 5,
                     filter_obj=filter_obj,
+                    metadata_filter=metadata_filter,
                 )
             else:
                 logger.info(f"【纯向量检索-降级模式】查询='{query[:60]}...', top_k={k}")
@@ -320,24 +342,12 @@ class RAGConversationService:
                     filter=filter_obj
                 )
 
-            # -----------------------------------------------------------------
-            # 步骤 3: 按 created_at 倒序排列（新知识优先策略）
-            # -----------------------------------------------------------------
-            # 如果未启用 Cross-Encoder 重排序，则在 RRF 融合结果内部按 created_at
-            # 微调顺序。若已启用重排序，则不再调整顺序，以保留 Cross-Encoder
-            # 的精细相关性排名。
-            if not (self.hybrid_retriever and self.hybrid_retriever._reranker):
-                docs.sort(
-                    key=lambda d: d.metadata.get("created_at", ""),
-                    reverse=True
-                )
 
             logger.info(f"检索完成: 查询='{query}', 找到 {len(docs)} 个文档")
             for idx, doc in enumerate(docs, 1):
                 content_preview = doc.page_content[:200].replace('\n', ' ')
-                created_at = doc.metadata.get("created_at", "N/A")
                 logger.info(
-                    f"  [检索结果{idx}] created_at={created_at} "
+                    f"  [检索结果{idx}] "
                     f"{content_preview}{'...' if len(doc.page_content) > 200 else ''}"
                 )
             return docs
@@ -365,6 +375,224 @@ class RAGConversationService:
         
         return "\n\n".join(context_parts)
 
+    # -----------------------------------------------------------------
+    # 上下文压缩相关方法
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """
+        粗略估算 Token 数量。
+
+        策略：中文字符按 1.5 倍估算，英文单词按 1.2 倍估算，
+        其余字符按 0.1 倍估算。此估算偏保守，实际值通常更小。
+        """
+        import re
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+        english_words = len(re.findall(r'[a-zA-Z]+', text))
+        other_chars = len(text) - chinese_chars - len(re.findall(r'[a-zA-Z]', text))
+        return int(chinese_chars * 1.5 + english_words * 1.2 + other_chars * 0.1)
+
+    async def _build_compressed_history(
+        self,
+        mysql_history: MySQLChatMessageHistory,
+    ) -> List[Any]:
+        """
+        构建压缩后的对话历史。
+
+        压缩策略（两阶段）：
+            阶段一（硬截断）：消息数 <= 20 时，若超过 10 条则只保留最近 10 条。
+            阶段二（摘要压缩）：消息数 > 20 时，生成或复用对话摘要，
+                              用 "摘要 + 最近 6 条原始消息" 替代全量历史。
+
+        为什么保留 6 条而非更少？
+            长对话中，用户可能正在追问某个细节，只保留 2~3 条可能丢失
+            指代消解所需的上下文（如"那它的价格呢？"）。6 条约等于 3 轮
+            对话，能覆盖大多数指代场景。
+        """
+        # 获取全量历史（不包含当前用户输入，因为尚未写入）
+        history = await mysql_history.aget_messages()
+        total_messages = len(history)
+
+        if total_messages <= 10:
+            logger.info(f"历史消息 {total_messages} 条，无需压缩")
+            return history
+
+        # 阶段一：硬截断（10 < 消息数 <= 20）
+        if total_messages <= 20:
+            logger.info(
+                f"历史消息 {total_messages} 条，执行硬截断保留最近 10 条"
+            )
+            return history[-10:]
+
+        # 阶段二：摘要压缩（消息数 > 20）
+        logger.info(
+            f"历史消息 {total_messages} 条，超过阈值，启用摘要压缩"
+        )
+        summary_memory = MySQLConversationSummaryMemory(session=self.db)
+        summary_record = await self._get_summary_record(
+            mysql_history.conversation_id
+        )
+
+        if summary_record:
+            # 已有摘要，判断是否需要增量更新
+            previously_summarized = summary_record.message_count
+            new_message_count = total_messages - previously_summarized - 6
+
+            if new_message_count > 10:
+                # 新增消息超过阈值，执行增量更新
+                logger.info(
+                    f"新增消息 {new_message_count} 条，触发增量摘要更新"
+                )
+                new_messages = history[previously_summarized:-6]
+                try:
+                    updated_summary = await self._generate_incremental_summary(
+                        old_summary=summary_record.summary,
+                        new_messages=new_messages,
+                    )
+                    await summary_memory.save_summary(
+                        conversation_id=mysql_history.conversation_id,
+                        summary=updated_summary,
+                        message_count=total_messages - 6,
+                    )
+                    logger.info("增量摘要更新完成")
+                    summary_msg = SystemMessage(
+                        content=f"{CONVERSATION_SUMMARY_PREFIX}\n{updated_summary}"
+                    )
+                    return [summary_msg] + history[-6:]
+                except Exception as e:
+                    logger.error(f"增量摘要更新失败: {e}，复用旧摘要")
+                    summary_msg = SystemMessage(
+                        content=f"{CONVERSATION_SUMMARY_PREFIX}\n{summary_record.summary}"
+                    )
+                    return [summary_msg] + history[-6:]
+            else:
+                # 新增消息不多，直接复用旧摘要
+                logger.info(
+                    f"复用已有对话摘要（已总结 {previously_summarized} 条，"
+                    f"新增 {new_message_count} 条未达更新阈值）"
+                )
+                summary_msg = SystemMessage(
+                    content=f"{CONVERSATION_SUMMARY_PREFIX}\n{summary_record.summary}"
+                )
+                return [summary_msg] + history[-6:]
+
+        # 首次超过阈值，需要生成摘要
+        messages_to_summarize = history[:-6]
+        recent_messages = history[-6:]
+
+        try:
+            summary_text = await self._generate_summary(messages_to_summarize)
+            await summary_memory.save_summary(
+                conversation_id=mysql_history.conversation_id,
+                summary=summary_text,
+                message_count=len(messages_to_summarize),
+            )
+            logger.info(
+                f"对话摘要生成完成，已总结 {len(messages_to_summarize)} 条消息"
+            )
+            summary_msg = SystemMessage(
+                content=f"{CONVERSATION_SUMMARY_PREFIX}\n{summary_text}"
+            )
+            return [summary_msg] + recent_messages
+        except Exception as e:
+            logger.error(f"摘要生成失败: {e}，降级为硬截断")
+            # 降级策略：生成失败时保留最近 10 条
+            return history[-10:]
+
+    async def _get_summary_record(
+        self,
+        conversation_id: str,
+    ) -> Optional[Any]:
+        """
+        获取会话摘要的完整数据库记录。
+
+        用于增量摘要更新时读取 message_count 等元数据。
+        """
+        from models.conversation_model import ConversationSummary
+        from sqlalchemy import select
+
+        try:
+            stmt = select(ConversationSummary).where(
+                ConversationSummary.conversation_id == conversation_id
+            )
+            result = await self.db.execute(stmt)
+            return result.scalars().first()
+        except Exception as e:
+            logger.error(f"获取摘要记录失败: {e}")
+            return None
+
+    @staticmethod
+    def _messages_to_conversation_text(messages: List[Any]) -> str:
+        """
+        将消息列表转换为对话文本格式。
+        """
+        lines = []
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                lines.append(f"用户: {msg.content}")
+            elif isinstance(msg, AIMessage):
+                lines.append(f"助手: {msg.content}")
+            elif isinstance(msg, SystemMessage):
+                lines.append(f"系统: {msg.content}")
+        return "\n".join(lines)
+
+    async def _generate_summary(
+        self,
+        messages: List[Any],
+    ) -> str:
+        """
+        调用 LLM 生成对话摘要。
+
+        使用轻量级模型（qwen-turbo）快速生成，控制温度使输出稳定。
+        摘要将用于替换被总结的历史消息，因此需要保留：
+            - 用户的核心需求和意图
+            - 已确认的关键事实和数据
+            - 未解决或待跟进的问题
+        """
+        summary_llm = ChatOpenAI(
+            model="qwen-turbo",
+            openai_api_key=settings.api_key,
+            openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            temperature=0.3,
+            max_tokens=500,
+        )
+
+        conversation_text = self._messages_to_conversation_text(messages)
+        summary_prompt = SUMMARY_GENERATION_PROMPT.format(
+            conversation_text=conversation_text
+        )
+
+        response = await summary_llm.ainvoke(summary_prompt)
+        return response.content.strip()
+
+    async def _generate_incremental_summary(
+        self,
+        old_summary: str,
+        new_messages: List[Any],
+    ) -> str:
+        """
+        调用 LLM 生成增量对话摘要。
+
+        基于原有摘要和新增消息，生成更新后的摘要。
+        """
+        summary_llm = ChatOpenAI(
+            model="qwen-turbo",
+            openai_api_key=settings.api_key,
+            openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            temperature=0.3,
+            max_tokens=500,
+        )
+
+        new_conversation_text = self._messages_to_conversation_text(new_messages)
+        prompt = INCREMENTAL_SUMMARY_PROMPT.format(
+            old_summary=old_summary,
+            new_conversation_text=new_conversation_text,
+        )
+
+        response = await summary_llm.ainvoke(prompt)
+        return response.content.strip()
+
     def _build_rag_chain(
         self,
         model: str,
@@ -390,28 +618,14 @@ class RAGConversationService:
         if context:
             # 有检索上下文：使用 RAG Prompt
             prompt_template = ChatPromptTemplate.from_messages([
-                ("system", """你是一个专业的智能助手。基于以下检索到的知识库内容回答用户问题。
-
-检索到的相关知识：
-{context}
-
-回答要求：
-1. 优先基于检索到的内容回答
-2. 如果检索内容不足以回答问题，可以补充你的知识
-3. 回答要准确、简洁、有条理
-4. 如果不确定，请诚实地告诉用户"""),
+                ("system", RAG_SYSTEM_PROMPT_WITH_CONTEXT),
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "{input}"),
             ])
         else:
             # 无检索上下文：使用普通对话 Prompt
             prompt_template = ChatPromptTemplate.from_messages([
-                ("system", """你是一个专业的智能助手。请根据用户的提问提供准确、有帮助的回答。
-
-回答要求：
-1. 回答要准确、简洁、有条理
-2. 如果不确定，请诚实地告诉用户
-3. 必要时可以举例说明"""),
+                ("system", RAG_SYSTEM_PROMPT_WITHOUT_CONTEXT),
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "{input}"),
             ])
@@ -438,12 +652,25 @@ class RAGConversationService:
         :yield: SSE 格式的数据
         """
         try:
-            # 构建输入
-            history = await mysql_history.aget_messages()
+            # 构建压缩后的对话历史（阶段一 + 阶段二）
+            compressed_history = await self._build_compressed_history(
+                mysql_history
+            )
+
+            # Token 预估日志
+            history_text = "\n".join(
+                [m.content for m in compressed_history if hasattr(m, "content")]
+            )
+            est_tokens = self._estimate_tokens(user_input + context + history_text)
+            logger.info(
+                f"预估上下文 Token 数: {est_tokens}, "
+                f"压缩后历史消息数: {len(compressed_history)}"
+            )
+
             inputs = {
                 "input": user_input,
                 "context": context,
-                "history": history,
+                "history": compressed_history,
             }
             
             # 使用 astream 获取流式响应

@@ -17,6 +17,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from models.conversation_model import ConversationDefinition, ConversationMessage
 from rag.memory_mysql import MySQLChatMessageHistory
+from prompt.prompt_storage import CHAT_SYSTEM_PROMPT
 from core.exceptions import ConversationException
 from core.config import settings
 
@@ -258,7 +259,7 @@ class ConversationService:
             
             # 5. 构建 Prompt（包含系统提示和历史消息）
             prompt_messages = [
-                ("system", "你是一个专业的智能助手。请根据用户的提问提供准确、有帮助的回答。"),
+                ("system", CHAT_SYSTEM_PROMPT),
             ]
             
             # 添加历史消息

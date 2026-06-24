@@ -251,18 +251,26 @@ class BM25Indexer:
     # 检索接口
     # -------------------------------------------------------------------------
 
-    def retrieve(self, query: str, top_k: int = DEFAULT_BM25_TOPK) -> List[Document]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = DEFAULT_BM25_TOPK,
+        metadata_filter: Optional[Callable[[Document], bool]] = None,
+    ) -> List[Document]:
         """
         执行 BM25 关键词检索。
 
         流程：
             1. 对查询串分词；
-            2. 调用 BM25Okapi.get_top_n 获取得分最高的文档索引；
-            3. 将索引映射回 Document 对象返回。
+            2. 如有 metadata_filter，先筛选符合条件的文档索引；
+            3. 调用 BM25Okapi.get_top_n 在候选文档中获取得分最高的索引；
+            4. 将索引映射回 Document 对象返回。
 
         Args:
             query: 用户查询字符串。
             top_k: 返回文档数量。建议取最终需求 top_k 的 3~5 倍，为 RRF 融合留出候选空间。
+            metadata_filter: 可选的元数据过滤函数，接收 Document 返回 bool。
+                             仅对符合条件的文档执行 BM25 排名。
 
         Returns:
             按 BM25 得分降序排列的 Document 列表。
@@ -281,18 +289,30 @@ class BM25Indexer:
             logger.warning("BM25 查询分词结果为空，返回空结果")
             return []
 
+        # 构建候选文档索引列表，支持元数据预过滤
+        candidate_indices = list(range(len(self._documents)))
+        if metadata_filter:
+            candidate_indices = [
+                idx for idx in candidate_indices
+                if metadata_filter(self._documents[idx])
+            ]
+            if not candidate_indices:
+                logger.info("BM25 元数据过滤后无候选文档，返回空结果")
+                return []
+
         # get_top_n 返回的是 top_k 个文档在 corpus 中的索引位置
         top_indices = self._bm25.get_top_n(
             tokenized_query,
-            list(range(len(self._documents))),  # 传入索引列表作为文档标识
-            n=min(top_k, len(self._documents)),
+            candidate_indices,
+            n=min(top_k, len(candidate_indices)),
         )
 
         results = [self._documents[idx] for idx in top_indices]
 
         elapsed = time.time() - start_time
+        filter_info = "(已过滤)" if metadata_filter else ""
         logger.info(
-            f"BM25 检索完成，查询='{query[:50]}...', "
+            f"BM25 检索完成{filter_info}，查询='{query[:50]}...', "
             f"召回 {len(results)} 个，耗时: {elapsed:.3f}s"
         )
         return results
@@ -713,6 +733,7 @@ class HybridRetriever:
         bm25_top_k: int = DEFAULT_BM25_TOPK,
         vector_top_k: int = DEFAULT_VECTOR_TOPK,
         filter_obj: Optional[Filter] = None,
+        metadata_filter: Optional[Callable[[Document], bool]] = None,
     ) -> List[Document]:
         """
         执行混合检索并返回融合后的结果。
@@ -724,10 +745,10 @@ class HybridRetriever:
             top_k: 最终返回的文档数量。
             bm25_top_k: BM25 单路召回数量。建议 >= top_k * 3。
             vector_top_k: 向量检索单路召回数量。建议 >= top_k * 3。
-            filter_obj: Qdrant 过滤条件（权限、状态等），会同时传递给向量检索。
-                        注意：BM25 检索**不**支持此过滤，因为它基于内存索引，
-                        没有元数据过滤能力。若业务需要严格过滤，建议在 RRF 融合后
-                        对结果做二次过滤，或仅使用向量检索一路。
+            filter_obj: Qdrant 过滤条件（权限、状态等），仅传递给向量检索。
+            metadata_filter: BM25 元数据过滤函数，接收 Document 返回 bool。
+                             仅对符合条件的文档执行 BM25 排名，使 BM25 与向量检索
+                             在过滤逻辑上保持一致。
 
         Returns:
             按 RRF 得分降序排列的 Document 列表，长度 <= top_k。
@@ -751,7 +772,9 @@ class HybridRetriever:
         # 注：BM25 检索是纯 CPU 计算，向量检索涉及网络 IO +  embedding API 调用。
         # 在 asyncio 环境下，BM25 会阻塞事件循环，但由于其耗时极短（< 50ms），
         # 对整体延迟影响可忽略。若严格要求异步，可将 BM25 检索也包进 asyncio.to_thread。
-        bm25_results = self._bm25_indexer.retrieve(query, top_k=bm25_top_k)
+        bm25_results = self._bm25_indexer.retrieve(
+            query, top_k=bm25_top_k, metadata_filter=metadata_filter
+        )
         vector_results = self._vectorstore.similarity_search(
             query, k=vector_top_k, filter=filter_obj
         )
@@ -871,6 +894,7 @@ class HybridRetriever:
         bm25_top_k: int = DEFAULT_BM25_TOPK,
         vector_top_k: int = DEFAULT_VECTOR_TOPK,
         filter_obj: Optional[Filter] = None,
+        metadata_filter: Optional[Callable[[Document], bool]] = None,
     ) -> List[Document]:
         """
         异步版本的混合检索。
@@ -891,9 +915,9 @@ class HybridRetriever:
 
         # BM25 放入线程池执行（避免阻塞主事件循环）
         bm25_task = asyncio.to_thread(
-            self._bm25_indexer.retrieve, query, bm25_top_k
+            self._bm25_indexer.retrieve, query, bm25_top_k, metadata_filter
         )
-        # 向量检索（同步调用，但通常网络 IO 不会阻塞太久）
+        # 向量检索
         vector_task = asyncio.to_thread(
             self._vectorstore.similarity_search,
             query,
