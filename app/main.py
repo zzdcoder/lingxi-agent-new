@@ -27,6 +27,7 @@ from api.routes import auth
 from api.routes import metadata
 from api.routes import file_process
 from api.routes import conversation
+from api.routes import cache as cache_routes
 from models.metadata_model import MetadataDefinition
 from utils.captcha import cleanup_expired_captchas
 
@@ -70,6 +71,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"BM25 索引启动预热失败: {e}")
 
+    # 初始化语义缓存（基于 Qdrant，降级为无缓存模式）
+    try:
+        from rag.semantic_cache import init_semantic_cache
+        init_semantic_cache()
+        logger.info("语义缓存初始化完成")
+    except Exception as e:
+        logger.warning(f"语义缓存初始化失败（降级为无缓存模式）: {e}")
+
     # 启动验证码过期清理后台任务
     async def captcha_cleanup_loop():
         while True:
@@ -80,10 +89,27 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(captcha_cleanup_loop())
 
+    # 启动语义缓存过期清理后台任务（每小时执行一次）
+    async def cache_cleanup_loop():
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                from rag.semantic_cache import get_semantic_cache
+                cache = get_semantic_cache()
+                if cache:
+                    removed = await cache.cleanup_expired()
+                    if removed > 0:
+                        logger.info(f"清理了 {removed} 条过期语义缓存")
+            except Exception as e:
+                logger.debug(f"语义缓存清理任务异常: {e}")
+
+    cache_task = asyncio.create_task(cache_cleanup_loop())
+
     yield
 
-    # 取消验证码清理后台任务
+    # 取消后台任务
     cleanup_task.cancel()
+    cache_task.cancel()
     try:
         await cleanup_task
     except asyncio.CancelledError:
@@ -134,6 +160,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(metadata.router, prefix="/api")
 app.include_router(file_process.router, prefix="/api")
 app.include_router(conversation.router, prefix="/api")
+app.include_router(cache_routes.router, prefix="/api")
 
 
 @app.get("/health", tags=["健康检查"])

@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     reranker_max_length: int = 512  # 输入最大 token 长度
     reranker_batch_size: int = 8  # 推理批大小
 
+    # 语义缓存配置（基于 Qdrant）
+    cache_enabled: bool = True
+    cache_collection_name: str = "lingxi-cache"  # Qdrant 缓存集合名
+    cache_similarity_threshold: float = 0.92  # 余弦相似度阈值（越高越严格）
+    cache_ttl_seconds: int = 86400  # 缓存过期时间 24h
+    cache_max_entries: int = 10000  # 最大缓存条目数
+
     # 应用配置
     debug: bool = False
 

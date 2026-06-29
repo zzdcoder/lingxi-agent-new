@@ -22,6 +22,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from rag.hybrid_retriever import HybridRetriever, CrossEncoderReranker
 from rag.bm25_index_manager import BM25IndexManager
 from rag.memory_mysql import MySQLChatMessageHistory, MySQLConversationSummaryMemory
+from rag.semantic_cache import SemanticCache, get_semantic_cache
 from prompt.prompt_storage import (
     RAG_SYSTEM_PROMPT_WITH_CONTEXT,
     RAG_SYSTEM_PROMPT_WITHOUT_CONTEXT,
@@ -164,6 +165,12 @@ async def rebuild_hybrid_index() -> None:
         # 原子替换 HybridRetriever 中的 indexer 引用
         _hybrid_retriever.set_bm25_indexer(_bm25_manager.indexer)
         logger.info(f"BM25 索引重建完成，当前文档数: {doc_count}")
+
+        # 知识库变更，全量清除语义缓存（保证回答一致性）
+        semantic_cache = get_semantic_cache()
+        if semantic_cache:
+            cleared = await semantic_cache.invalidate_all()
+            logger.info(f"知识库变更，语义缓存已全量清除: {cleared} 条")
     except Exception as e:
         logger.error(f"BM25 索引重建失败: {e}，保留旧索引")
         raise
@@ -209,10 +216,11 @@ class RAGConversationService:
         带 RAG 检索的对话（流式响应）
         
         流程：
-        1. 检索相关知识
-        2. 构建增强 Prompt
-        3. 调用 LLM 生成回答
-        4. 保存到 Memory
+        1. 语义缓存检查（命中则直接返回缓存回答）
+        2. 检索相关知识
+        3. 构建增强 Prompt
+        4. 调用 LLM 生成回答
+        5. 保存到 Memory + 写入缓存
         
         :param conversation_id: 会话ID
         :param messages: 消息列表
@@ -227,22 +235,72 @@ class RAGConversationService:
             user_input = messages[-1].get("content", "")
             logger.info(f"【用户问题】{user_input}")
             
-            # 2. 检索相关知识
-            context_docs = await self._retrieve_context(user_input, k=4, login_username=login_username)
+            # 2. 语义缓存检查（新增）
+            semantic_cache = get_semantic_cache()
+            if semantic_cache:
+                cached = await semantic_cache.get(user_input, login_username)
+                if cached:
+                    logger.info(
+                        f"语义缓存命中: score={cached.score:.4f}, "
+                        f"cached_query='{cached.query_text[:40]}...'"
+                    )
+                    async for chunk in self._stream_cached_response(
+                        cached.answer, conversation_id, user_input
+                    ):
+                        yield chunk
+                    elapsed = time.time() - start_time
+                    logger.info(f"RAG 对话完成（缓存命中）: 耗时={elapsed:.2f}s")
+                    return
+            
+            # 3. 预计算 query embedding（供检索和缓存复用）
+            query_embedding = None
+            if semantic_cache:
+                try:
+                    query_embedding = await asyncio.to_thread(
+                        self.embeddings.embed_query, user_input
+                    )
+                except Exception as e:
+                    logger.warning(f"预计算 query embedding 失败（缓存将跳过）: {e}")
+
+            # 4. 检索相关知识
+            context_docs = await self._retrieve_context(
+                user_input, k=4, login_username=login_username,
+                precomputed_embedding=query_embedding,
+            )
             context_text = self._format_context(context_docs)
             
-            # 3. 创建 MySQL Memory
+            # 5. 创建 MySQL Memory
             mysql_history = MySQLChatMessageHistory(
                 session=self.db,
                 conversation_id=conversation_id
             )
             
-            # 4. 构建 RAG 链
+            # 6. 构建 RAG 链
             rag_chain = self._build_rag_chain(model, context_text)
             
-            # 5. 执行对话（流式）
-            async for chunk in self._stream_rag_response(rag_chain, user_input, context_text, mysql_history):
+            # 7. 执行对话（流式），收集完整回答用于缓存写入
+            # 使用共享容器收集完整回答（由 _stream_rag_response 内部填充）
+            response_collector = [""]
+            async for chunk in self._stream_rag_response(
+                rag_chain, user_input, context_text, mysql_history,
+                response_collector=response_collector,
+            ):
                 yield chunk
+            
+            full_response = response_collector[0]
+            
+            # 8. 写入语义缓存（新增）
+            if semantic_cache and full_response and query_embedding:
+                try:
+                    await semantic_cache.put(
+                        query=user_input,
+                        query_embedding=query_embedding,
+                        answer=full_response,
+                        context_docs=context_docs,
+                        login_username=login_username,
+                    )
+                except Exception as e:
+                    logger.warning(f"写入语义缓存失败（非致命）: {e}")
             
             elapsed = time.time() - start_time
             logger.info(f"RAG 对话完成: 耗时={elapsed:.2f}s")
@@ -256,7 +314,8 @@ class RAGConversationService:
         self,
         query: str,
         k: int = 3,
-        login_username: str = None
+        login_username: str = None,
+        precomputed_embedding: Optional[List[float]] = None,
     ) -> List[Any]:
         """
         检索相关知识（混合检索模式）。
@@ -270,6 +329,7 @@ class RAGConversationService:
         :param query: 查询文本
         :param k: 返回文档数量
         :param login_username: 当前登录用户名，用于权限过滤
+        :param precomputed_embedding: 预计算的 query embedding（供缓存复用）
         :return: 相关文档列表
         """
         if not self.vectorstore:
@@ -640,7 +700,8 @@ class RAGConversationService:
         chain: Any,
         user_input: str,
         context: str,
-        mysql_history: MySQLChatMessageHistory
+        mysql_history: MySQLChatMessageHistory,
+        response_collector: Optional[list] = None,
     ) -> AsyncGenerator[bytes, None]:
         """
         流式执行 RAG 对话
@@ -649,6 +710,7 @@ class RAGConversationService:
         :param user_input: 用户输入
         :param context: 检索到的上下文
         :param mysql_history: MySQL 历史存储
+        :param response_collector: 可选的共享容器 [str]，用于向调用方传递完整回答
         :yield: SSE 格式的数据
         """
         try:
@@ -690,6 +752,10 @@ class RAGConversationService:
             # 保存 AI 消息
             await mysql_history.add_message(AIMessage(content=full_response))
             
+            # 将完整回答写入共享容器，供 chat_with_rag 缓存写入使用
+            if response_collector is not None:
+                response_collector[0] = full_response
+            
             # 显式提交事务，确保消息持久化（StreamingResponse 场景下 get_db 的自动 commit 可能不生效）
             await self.db.commit()
             
@@ -703,6 +769,47 @@ class RAGConversationService:
     def _escape_json(self, text: str) -> str:
         """转义 JSON 特殊字符"""
         return text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+
+    async def _stream_cached_response(
+        self,
+        cached_answer: str,
+        conversation_id: str,
+        user_input: str,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        将缓存的回答以 SSE 流式格式输出。
+
+        模拟流式输出效果：按句子/固定长度分块发送，
+        同时保存到对话历史以保持完整性。
+
+        :param cached_answer: 缓存的完整回答文本
+        :param conversation_id: 会话 ID
+        :param user_input: 用户原始问题
+        :yield: SSE 格式的数据块
+        """
+        try:
+            # 按固定长度分块模拟流式输出（每块约 20 个字符）
+            chunk_size = 20
+            for i in range(0, len(cached_answer), chunk_size):
+                chunk = cached_answer[i:i + chunk_size]
+                yield f'data: {{"content": "{self._escape_json(chunk)}"}}\n\n'.encode('utf-8')
+                await asyncio.sleep(0.01)  # 微小延迟模拟流式效果
+
+            # 保存到对话历史
+            mysql_history = MySQLChatMessageHistory(
+                session=self.db,
+                conversation_id=conversation_id
+            )
+            await mysql_history.add_message(HumanMessage(content=user_input))
+            await mysql_history.add_message(AIMessage(content=cached_answer))
+            await self.db.commit()
+
+            # 发送完成标记
+            yield b'data: {"done": true}\n\n'
+
+        except Exception as e:
+            logger.error(f"缓存流式输出失败: {e}")
+            yield f'data: {{"content": "缓存输出失败：{str(e)}", "done": true}}\n\n'.encode('utf-8')
 
 
 def get_rag_conversation_service(db: AsyncSession) -> RAGConversationService:
