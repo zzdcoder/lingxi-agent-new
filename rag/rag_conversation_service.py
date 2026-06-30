@@ -99,13 +99,16 @@ def init_hybrid_retriever() -> HybridRetriever:
             model_name=settings.reranker_model,
             device=getattr(settings, "reranker_device", None),
             max_length=getattr(settings, "reranker_max_length", 512),
-            batch_size=getattr(settings, "reranker_batch_size", 8),
+            batch_size=getattr(settings, "reranker_batch_size", 16),
         )
-        logger.info(f"Cross-Encoder 重排序器已启用: {settings.reranker_model}")
+        # 启动时立即加载模型，避免首次请求额外耗时 ~1.8s
+        reranker._lazy_load()
+        logger.info(f"Cross-Encoder 重排序器已启用并加载完成: {settings.reranker_model}")
 
     _hybrid_retriever = HybridRetriever(
         vectorstore=vectorstore,
         reranker=reranker,
+        rerank_top_k=12,  # 减少送入重排序器的候选数，大幅降低推理耗时
     )
 
     # ── 创建 BM25 索引管理器并启动加载 ──
@@ -234,11 +237,23 @@ class RAGConversationService:
             # 1. 提取用户问题
             user_input = messages[-1].get("content", "")
             logger.info(f"【用户问题】{user_input}")
-            
-            # 2. 语义缓存检查（新增）
+
+            # 2. 预计算 query embedding（只算一次，全链路复用）
+            query_embedding = None
+            try:
+                query_embedding = await asyncio.to_thread(
+                    self.embeddings.embed_query, user_input
+                )
+            except Exception as e:
+                logger.warning(f"预计算 query embedding 失败: {e}")
+
+            # 3. 语义缓存检查（复用已计算的 embedding）
             semantic_cache = get_semantic_cache()
             if semantic_cache:
-                cached = await semantic_cache.get(user_input, login_username)
+                cached = await semantic_cache.get(
+                    user_input, login_username,
+                    precomputed_embedding=query_embedding,
+                )
                 if cached:
                     logger.info(
                         f"语义缓存命中: score={cached.score:.4f}, "
@@ -251,16 +266,6 @@ class RAGConversationService:
                     elapsed = time.time() - start_time
                     logger.info(f"RAG 对话完成（缓存命中）: 耗时={elapsed:.2f}s")
                     return
-            
-            # 3. 预计算 query embedding（供检索和缓存复用）
-            query_embedding = None
-            if semantic_cache:
-                try:
-                    query_embedding = await asyncio.to_thread(
-                        self.embeddings.embed_query, user_input
-                    )
-                except Exception as e:
-                    logger.warning(f"预计算 query embedding 失败（缓存将跳过）: {e}")
 
             # 4. 检索相关知识
             context_docs = await self._retrieve_context(
@@ -368,14 +373,18 @@ class RAGConversationService:
                 logger.info("未构建过滤条件，执行无过滤检索")
 
             # 构建与 Qdrant filter_obj 逻辑等价的 BM25 元数据过滤函数
+            # 注意：Qdrant payload 中字段结构为 payload["metadata"]["auth_option"]，
+            # 由 from_qdrant 加载后 doc.metadata 为 {"metadata": {...}}，需展平一层
             metadata_filter = None
             if login_username:
                 def _bm25_auth_filter(doc: Document) -> bool:
-                    metadata = doc.metadata or {}
-                    auth = metadata.get("auth_option")
+                    raw_metadata = doc.metadata or {}
+                    # 兼容嵌套结构（Qdrant payload）和扁平结构
+                    meta = raw_metadata.get("metadata", raw_metadata)
+                    auth = meta.get("auth_option")
                     if auth == "public":
                         return True
-                    if auth == "private" and metadata.get("create_username") == login_username:
+                    if auth == "private" and meta.get("create_username") == login_username:
                         return True
                     return False
                 metadata_filter = _bm25_auth_filter
@@ -392,15 +401,24 @@ class RAGConversationService:
                     vector_top_k=k * 5,
                     filter_obj=filter_obj,
                     metadata_filter=metadata_filter,
+                    precomputed_embedding=precomputed_embedding,
                 )
             else:
                 logger.info(f"【纯向量检索-降级模式】查询='{query[:60]}...', top_k={k}")
-                docs = await asyncio.to_thread(
-                    self.vectorstore.similarity_search,
-                    query,
-                    k=k,
-                    filter=filter_obj
-                )
+                if precomputed_embedding is not None:
+                    docs = await asyncio.to_thread(
+                        self.vectorstore.similarity_search_by_vector,
+                        precomputed_embedding,
+                        k=k,
+                        filter=filter_obj,
+                    )
+                else:
+                    docs = await asyncio.to_thread(
+                        self.vectorstore.similarity_search,
+                        query,
+                        k=k,
+                        filter=filter_obj,
+                    )
 
 
             logger.info(f"检索完成: 查询='{query}', 找到 {len(docs)} 个文档")
@@ -444,14 +462,18 @@ class RAGConversationService:
         """
         粗略估算 Token 数量。
 
-        策略：中文字符按 1.5 倍估算，英文单词按 1.2 倍估算，
-        其余字符按 0.1 倍估算。此估算偏保守，实际值通常更小。
+        策略：中文字符按 1倍估算，英文单词按 1.3倍估算，
+        其余字符按 1 倍估算。此估算偏保守，实际值通常更小。
         """
         import re
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
         english_words = len(re.findall(r'[a-zA-Z]+', text))
-        other_chars = len(text) - chinese_chars - len(re.findall(r'[a-zA-Z]', text))
-        return int(chinese_chars * 1.5 + english_words * 1.2 + other_chars * 0.1)
+        # 标点、数字、空格、其他符号等
+        other_chars = len(re.findall(r'[^\u4e00-\u9fffa-zA-Z\s]', text))  # 标点符号
+        spaces = len(re.findall(r'\s', text))
+
+        # 中文≈1 token/字，英文单词≈1.3 token/词，标点≈1 token/个，空格≈0.5 token/个
+        return int(chinese_chars * 1.0 + english_words * 1.3 + other_chars * 1.0 + spaces * 0.5)
 
     async def _build_compressed_history(
         self,

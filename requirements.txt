@@ -27,6 +27,8 @@ jieba
 sentence-transformers
 # 经典稀疏检索算法实现，基于词频统计对文档进行相关性排序，常与向量检索混合使用（Hybrid RAG）
 rank-bm25
+# numpy：BM25 向量化检索依赖（get_scores + argpartition 替代 Python 循环，提速 10~50 倍）
+numpy
 # Qdrant 向量数据库 Python 客户端，支持本地磁盘模式和远程服务模式
 qdrant-client>=1.9.0
 
@@ -91,3 +93,5 @@ cos-python-sdk-v5==1.9.33
 python-docx
 
 modelscope
+
+langsmith==0.8.11

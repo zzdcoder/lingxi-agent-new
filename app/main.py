@@ -71,6 +71,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"BM25 索引启动预热失败: {e}")
 
+    # 启动时预热 jieba 词典，避免首次请求额外耗时 ~1s
+    try:
+        import jieba
+        jieba.initialize()
+        logger.info("jieba 词典启动预热完成")
+    except Exception as e:
+        logger.warning(f"jieba 词典预热失败: {e}")
+
     # 初始化语义缓存（基于 Qdrant，降级为无缓存模式）
     try:
         from rag.semantic_cache import init_semantic_cache

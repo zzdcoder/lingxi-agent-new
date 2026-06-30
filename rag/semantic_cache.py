@@ -171,13 +171,16 @@ class SemanticCache:
     # -------------------------------------------------------------------------
 
     async def get(
-        self, query: str, login_username: Optional[str] = None
+        self,
+        query: str,
+        login_username: Optional[str] = None,
+        precomputed_embedding: Optional[List[float]] = None,
     ) -> Optional[CacheEntry]:
         """
         语义缓存查询。
 
         流程：
-            1. 调用 embedding 模型计算 query 向量
+            1. 调用 embedding 模型计算 query 向量（或使用预计算向量）
             2. 在缓存集合中搜索最相似的条目（top_k=1）
             3. 判断 score >= 阈值
             4. 权限校验：缓存的 login_username 必须匹配
@@ -185,17 +188,22 @@ class SemanticCache:
 
         :param query: 用户问题
         :param login_username: 当前登录用户名
+        :param precomputed_embedding: 可选的预计算 query embedding，避免重复计算
         :return: 命中时返回 CacheEntry，否则返回 None
         """
         if not self.enabled:
             return None
 
         try:
-            # 1. 计算 query embedding（复用 DashScope API）
+            # 1. 获取 query embedding（优先使用预计算向量）
             import asyncio
-            query_embedding = await asyncio.to_thread(
-                self.embedding.embed_query, query
-            )
+
+            if precomputed_embedding is not None:
+                query_embedding = precomputed_embedding
+            else:
+                query_embedding = await asyncio.to_thread(
+                    self.embedding.embed_query, query
+                )
 
             # 2. 构建权限过滤条件
             #    允许命中：(public 且无用户) OR (当前用户名匹配)
