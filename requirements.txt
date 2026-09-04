@@ -1,16 +1,30 @@
-﻿# ============================================
-# 1. RAG / LLM 核心框架（LangChain 生态）
+# ============================================
+# 1. RAG / LLM 核心框架（LangChain + LangGraph 生态）
 # ============================================
 # LangChain 核心库，提供 Chain、Prompt、OutputParser、消息类型等基础抽象与编排能力
-langchain-core
-# LangChain 主包，提供 ConversationChain、ConversationBufferMemory 等高级组件
-langchain
-# LangChain 社区组件库，集成大量第三方工具、向量库、文档加载器等扩展组件
-langchain-community
-# LangChain 对 OpenAI 的官方适配，支持 GPT 系列模型调用、Embedding 生成、流式输出
-langchain-openai
+# 注：1.4.0 依赖已 yanked 的 langgraph 1.2.11，故锁定 1.3.10
+langchain-core==1.6.1
+# LangChain 主包（v1 精简版），提供 create_agent 等 Agent 构建能力
+langchain==1.3.10
+# LangChain 对 OpenAI 的官方适配（兼容通义千问 DashScope OpenAI 兼容接口）
+langchain-openai==1.6.0
 # LangChain 对 Qdrant 向量数据库的集成封装，支持向量检索与存储的链式调用
-langchain-qdrant
+langchain-qdrant==1.1.0
+# 说明：langchain-community 官方已宣布 sunset（停更），且本项目未使用，故移除
+# ============================================
+# 1.1 LangGraph 编排框架（状态机 + 持久化 + 人工审批）
+# ============================================
+# LangGraph 核心编排框架，用于意图路由图、任务执行图、Human-in-the-loop 审批
+# 注：1.2.11 已被官方 yanked（broken），故锁定 1.2.10
+langgraph==1.2.10
+# LangGraph 检查点基础库（状态持久化），由 langgraph 自动拉取
+langgraph-checkpoint==4.2.0
+# LangGraph MySQL 检查点保存器，用于将图状态持久化到 MySQL（跨请求恢复）
+langgraph-checkpoint-mysql==3.0.0
+# OpenAI 官方 Python SDK（embedding_deal.py 直接使用 OpenAI 客户端）
+openai==3.8.0
+# 飞书开放平台官方 Python SDK（用于审批流对接）
+lark-oapi==1.7.3
 
 # ============================================
 # 2. 文档解析与文本处理
@@ -30,7 +44,7 @@ rank-bm25
 # numpy：BM25 向量化检索依赖（get_scores + argpartition 替代 Python 循环，提速 10~50 倍）
 numpy
 # Qdrant 向量数据库 Python 客户端，支持本地磁盘模式和远程服务模式
-qdrant-client>=1.9.0
+qdrant-client==1.19.0
 
 # ============================================
 # 4. Web 框架与服务器
@@ -94,4 +108,4 @@ python-docx
 
 modelscope
 
-langsmith==0.8.11
+langsmith==0.12.1
