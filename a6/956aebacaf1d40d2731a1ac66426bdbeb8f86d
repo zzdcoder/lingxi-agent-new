@@ -1,0 +1,165 @@
+models/task_schema.py
+  s_03ead153b668eb::t_5d963990ae9b40 1-40
+agent/intent_router.py
+  s_03ead153b668eb::t_1b790c493baa5a 1-104
+agent/knowledge_service.py
+  s_03ead153b668eb::t_d2f977ddea31e2 1-11,13-55,73-102,104-111,113-119,121-189
+  s_03ead153b668eb::t_abc9fca192f963 56-72
+  s_03ead153b668eb::t_44404f99e18e30 12
+  s_03ead153b668eb::t_70e0ddc474a64e 103,112,120
+agent/graph_builder.py
+  s_03ead153b668eb::t_e8334775cfb5c0 279,286-339
+  s_03ead153b668eb::t_a1f78d7d403789 17
+  s_03ead153b668eb::t_6af9099a248c6b 177-202
+  s_03ead153b668eb::t_866c1040d83a64 126-128
+  s_03ead153b668eb::t_0b5fd55c1d0ed6 1-14,16,18-20,22-59,63-125,129-134,139-141,147-176,206-270
+  s_03ead153b668eb::t_7f03c5d9d53011 135-138,142-146
+  s_03ead153b668eb::t_c694c0917e8f55 60,62
+  s_03ead153b668eb::t_b803048de1f060 271-278,280-285,340-353
+  s_03ead153b668eb::t_437bab77642097 203-205
+  s_03ead153b668eb::t_cf71fe9495c3f6 15,21
+  s_03ead153b668eb::t_057e0e2daa64cb 61
+agent/state.py
+  s_03ead153b668eb::t_eeb9b79c5d1c42 1-46
+models/task_model.py
+  s_03ead153b668eb::t_49ef9a139559a9 1-36
+agent/approval/callback.py
+  s_03ead153b668eb::t_8ce5a53d2e02c5 125-127
+  s_03ead153b668eb::t_7ae2fbd591262f 24
+  s_03ead153b668eb::t_bd65d69a8d8956 85-87
+  s_03ead153b668eb::t_ca79fae91f8ebd 1-23,25-84,88-124,128-159
+agent/approval/__init__.py
+  s_03ead153b668eb::t_47d69b3cf0076b 1-8
+api/routes/approval.py
+  s_03ead153b668eb::t_279a028086743c 1-88
+agent/tools/registry.py
+  s_03ead153b668eb::t_664ced998d18e8 1-3,6-10,14-15,17-28,35-47,49-50,52-53,55-57,59-60,62-66,68-69,71-73,75-76,78-80,82-83,85-88,90-107,109-113
+  s_03ead153b668eb::t_094c745fe18d67 4-5,11-13,16,29-34,48,51,54,58,61,67,70,74,77,81,84,89,108
+models/agent_schema.py
+  s_03ead153b668eb::t_a88b7a92c46008 1-50
+agent/streaming.py
+  s_03ead153b668eb::t_9c162921f5dbb1 1-60,67-69
+  s_03ead153b668eb::t_e87ffd3c9869db 61-66
+agent/tools/db_tools.py
+  s_03ead153b668eb::t_e430f5b9e5090b 277,282-288
+  s_03ead153b668eb::t_14aeb6646f2327 1-61,64-124,156-162,164-168,171-210,212-215,217-221,229-271,273-276,278-281,289-321,323-327,329-332,340-360,362-366,368-371
+  s_03ead153b668eb::t_43b238ba70549d 211
+  s_03ead153b668eb::t_b570e102deb131 322
+  s_03ead153b668eb::t_09abcaf786430c 361
+  s_03ead153b668eb::t_d12640b5ca5e48 367,372-378
+  s_03ead153b668eb::t_f8f43d0c821c29 62-63
+  s_03ead153b668eb::t_f200908a51ddbc 125-135
+  s_03ead153b668eb::t_e00a454759738c 272
+  s_03ead153b668eb::t_55025ba18ba219 163,169-170
+  s_03ead153b668eb::t_a7c49c1488898f 328,333-339
+  s_03ead153b668eb::t_1bc7fcfadd5f97 136-155
+  s_03ead153b668eb::t_f4a70974eea6bd 216,222-228
+agent/nodes/knowledge_node.py
+  s_03ead153b668eb::t_da9164e6abdd63 72-73
+  s_03ead153b668eb::t_9b8ffa2d60aaeb 47-50
+  s_03ead153b668eb::t_26876ad8b1d51e 9,11-12,27
+  s_03ead153b668eb::t_0fbfb4bcfe406e 1-8,10,13-26,28-46,51-71,74-112
+api/routes/agent.py
+  s_03ead153b668eb::t_31f80ac955b040 146,149,163-168
+  s_03ead153b668eb::t_d43c20072ea436 1-19,22-25,71-122,132,141-145,150-162,169-213
+  s_03ead153b668eb::t_057e0e2daa64cb 123-131,133-140,147-148
+  s_03ead153b668eb::t_8f9b2addc716e9 20-21,26-70
+models/approval_schema.py
+  s_03ead153b668eb::t_faf8d58f049d73 6
+  s_03ead153b668eb::t_99baae32d1b2dc 1-5,7-8,10-31
+  s_03ead153b668eb::t_a3cd3f58f447fa 32-33
+  s_03ead153b668eb::t_ff79cc9ee09160 9
+docs/lingxi_agent_langgraph_development_tasks.md
+  s_03ead153b668eb::t_e172e2e7997904 658-667
+  s_03ead153b668eb::t_f353b613b06f04 1-655,657,670-673
+  s_03ead153b668eb::t_1070b957eec3ec 656,668-669
+evaluation/dataset.py
+  s_6a85f0d2903290::t_28223053f2fbd8 1-420
+agent/nodes/__init__.py
+  s_03ead153b668eb::t_32a857f35d51c8 1
+agent/approval/approval_service.py
+  s_03ead153b668eb::t_248fd238df5e9a 1-44,47-55,57,59-66,68,77-294,296,298,302,306-307,310-311,313,318-399
+  s_03ead153b668eb::t_3e6c726f348fec 45-46,56,58,67,69-76
+  s_03ead153b668eb::t_9494484da31260 295,297,299-301,303-305,308-309,312,314-317
+agent/nodes/task_node.py
+  s_03ead153b668eb::t_ffebc33dba8863 34
+  s_03ead153b668eb::t_86b84bc9443d2e 129-131
+  s_03ead153b668eb::t_8c936d422f09f0 23,28,36,45,47-50,67-70,74-86,89-90,92,94-96,119-120,122,124-125
+  s_03ead153b668eb::t_68ca6f8d862c01 154
+  s_03ead153b668eb::t_04da7965d62a86 121,123
+  s_03ead153b668eb::t_315e435e5ef6fa 1-22,24-27,29-33,35,37-44,46,51-66,71-73,87-88,91,93,97-98,104-118,126-128,132-142,144-146,149-153,155,169-172,174-176,189-190,192,194,197-230,251-296
+  s_03ead153b668eb::t_abbcd96a99c263 99-103
+  s_03ead153b668eb::t_5357051e63dfb2 143,147-148,156-168,173,177-188,191,193,195-196
+  s_03ead153b668eb::t_bcc9e74fcc7cd9 231-250
+evaluation/evaluators.py
+  s_6a85f0d2903290::t_28223053f2fbd8 1-808
+agent/tools/__init__.py
+  s_03ead153b668eb::t_680b59439c033c 1-3
+models/approval_model.py
+  s_03ead153b668eb::t_24d4a6b0f0f85d 1-41
+agent/__init__.py
+  s_03ead153b668eb::t_7961f2c39d5817 1-5
+.gitignore
+  s_03ead153b668eb::t_4921b04cdf1606 70-72
+  s_03ead153b668eb::t_df6a330d5e0a0e 62,65-67
+  s_03ead153b668eb::t_057e0e2daa64cb 1-14,28,37-56,58-61,63-64,68-69
+  s_03ead153b668eb::t_c4a1d614548a06 15-27,29-36,57
+agent/nodes/chat_node.py
+  s_03ead153b668eb::t_0a5d008b4d15bd 9,25-27
+  s_03ead153b668eb::t_923ebaf3bf76c6 1-8,10-24,28-95
+evaluation/__init__.py
+  s_6a85f0d2903290::t_28223053f2fbd8 1-71
+agent/approval/feishu_client.py
+  s_03ead153b668eb::t_5894f2b2dd9d40 11,15,65,70
+  s_03ead153b668eb::t_a63a4370a97981 1-10,12-14,16-64,66-69,71-86
+evaluation/run_eval.py
+  s_6a85f0d2903290::t_28223053f2fbd8 1-646
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "a6956aebacaf1d40d2731a1ac66426bdbeb8f86d",
+  "prompts": {},
+  "sessions": {
+    "s_03ead153b668eb": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9e1b261b30b85f91991db4",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": "zhouzd <zhouzd@asiainfo.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6a9e1b261b30b85f91991db4",
+        "display_model_name": "DeepSeek-V4-Flash 正式版",
+        "source_scene": "agent",
+        "external_session_id": "6a9e1b261b30b85f91991db4",
+        "edit_kind": "file_edit",
+        "operation_id": "6a9f7e2b018e7ee47e5e4484",
+        "tool_use_id": "6a9f7e2b018e7ee47e5e4484",
+        "tool_name": "Edit"
+      }
+    },
+    "s_6a85f0d2903290": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9a7309cab5d8c89a0509d4",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": "zhouzd <zhouzd@asiainfo.com>",
+      "custom_attributes": {
+        "external_session_id": "6a9a7309cab5d8c89a0509d4",
+        "display_model_name": "DeepSeek-V4-Flash 正式版",
+        "source_scene": "agent",
+        "operation_id": "6a9a9066cab5d8c89a050c12",
+        "edit_kind": "bash",
+        "tool_name": "RunCommand",
+        "tool_use_id": "6a9a9066cab5d8c89a050c12",
+        "client_type": "ide",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6a9a7309cab5d8c89a0509d4"
+      }
+    }
+  }
+}
