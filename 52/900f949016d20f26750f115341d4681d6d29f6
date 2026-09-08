@@ -1,0 +1,121 @@
+models/__init__.py
+  s_03ead153b668eb::t_ee9e248c9fce16 12
+  s_03ead153b668eb::t_78f1c8896ec8b9 13,18
+embeddings/embedding_deal.py
+  s_03ead153b668eb::t_52837db5907481 269
+  s_03ead153b668eb::t_0f812b0a3a5a1d 80-81,86-87,89
+  s_03ead153b668eb::t_87002fa2d2a2d2 273-274,276,282,287-305,308-310,312-318,320-329
+  s_03ead153b668eb::t_f623a1795ae930 205-208,210,212-223
+  s_03ead153b668eb::t_a9988dc2502255 5,15-21,37-39,54,56,59,62,64-65,77-79
+  s_03ead153b668eb::t_82ed368150cd8f 306-307,311,319
+  s_03ead153b668eb::t_6b26eabb82d4c0 8,34,53,55,57-58,60-61,63,66-76
+  s_03ead153b668eb::t_1be463e8b5a2ad 118-181
+  s_03ead153b668eb::t_0d3cc87dd6f625 204
+rag/hybrid_retriever.py
+  s_03ead153b668eb::t_28c2d5b4a06fff 254
+  s_03ead153b668eb::t_717781cf3c5d4e 316,324,327,329,336-337,342-349,351
+  s_03ead153b668eb::t_067a3b7c93c2ff 553,560,571
+  s_03ead153b668eb::t_30bfcdced0d67f 37-39
+  s_03ead153b668eb::t_2b8dd1cf018271 286,293,302-303,311-313
+  s_03ead153b668eb::t_b3e75cccdab704 6-8,14,16-19,30,54-55,59,96,100,267,273-274,282,292,295,298,307,319,321-322,325,328,330-335,339-340,350,352-361,363-376,387,401-404,406,422,436,440,479,491-492,515-517,519,549,559,569-570,589-590,594,597
+  s_03ead153b668eb::t_89258738ae495a 391,407-408,420-421,423-424
+  s_03ead153b668eb::t_c7c93e82940001 5,12-13,21-22
+.env.dev
+  s_03ead153b668eb::t_1602777e8f35de 46-66
+rag/rag_conversation_service.py
+  s_03ead153b668eb::t_b1219b227083d6 16
+  s_03ead153b668eb::t_f14918628c5593 222
+  s_03ead153b668eb::t_0b4398208d20ee 39,44,59,75,81,112,114,116-118,125
+  s_03ead153b668eb::t_c42539e1a86bbd 188,190,192-193
+  s_03ead153b668eb::t_26a1625f9f21bb 402,411,417
+  s_03ead153b668eb::t_51f62f6cba3431 392-393,396-400,404,408-409,412-415,418,420-426,429-433,436-442,445-451,454-463
+  s_03ead153b668eb::t_155c219e393676 101
+  s_03ead153b668eb::t_e761ad2df7013d 273,279,288,403
+  s_03ead153b668eb::t_1f71b4f87e69e2 339
+  s_03ead153b668eb::t_30cb31c7b3d20f 407
+  h_a8c36d68950adc 405
+  s_03ead153b668eb::t_5ce32fd03e1076 327-328,335
+  s_03ead153b668eb::t_7a4d3146653a0c 32
+  s_03ead153b668eb::t_042d6fea90e162 466-473,476
+  s_03ead153b668eb::t_eb038056620249 394-395
+  s_03ead153b668eb::t_0762962a04c56a 401
+  s_03ead153b668eb::t_0188af5955c2cb 410
+  s_03ead153b668eb::t_f2cc5b766c2278 416
+  s_03ead153b668eb::t_3ec54152bf7d95 419
+  s_03ead153b668eb::t_b2cda2647dc6ed 427-428
+  s_03ead153b668eb::t_022e875bde9eae 434-435
+  s_03ead153b668eb::t_4768f2c67dd0f4 443-444
+  s_03ead153b668eb::t_fe396c0840e500 452-453
+  s_03ead153b668eb::t_186eabc6f69867 464-465
+  s_03ead153b668eb::t_c7d93692a4b397 474-475
+api/routes/file_process.py
+  s_03ead153b668eb::t_d6afade3e63284 20
+  s_03ead153b668eb::t_85837af3d9ab69 70,72-73,75
+docs/lingxi_agent_langgraph_redesign.md
+  s_03ead153b668eb::t_6d6cff40ab030b 83
+  s_03ead153b668eb::t_7295aec6d77d48 1066
+  s_03ead153b668eb::t_ad70e3a18fcffe 121
+  h_a8c36d68950adc 7,17,26,50,54,127,142,155,157,230,439,452,595,745,897,901,904,906-908,910-913,915,917,920,922-927,929-932,937,969,991,996,998,1000,1005,1042,1054
+  s_03ead153b668eb::t_0a721a5703f51a 153
+  s_03ead153b668eb::t_ed4b0645d2294d 1060
+  s_03ead153b668eb::t_e93fd64b38cce5 1030-1032
+  s_03ead153b668eb::t_739b58b6f39263 1065
+  s_03ead153b668eb::t_49c3ba33d6c475 1038,1040
+  s_03ead153b668eb::t_5f4401fdecfbce 60-65,67,69-73,1023-1029,1033-1034
+  s_03ead153b668eb::t_8d9eceb9ec7792 1050
+  s_03ead153b668eb::t_5052110eba5b3e 90
+  s_03ead153b668eb::t_bc1953c7705e23 487
+  s_03ead153b668eb::t_e9fc9e53f0810b 1039
+  s_03ead153b668eb::t_6a12a0dd880e36 324
+  s_03ead153b668eb::t_6138c7e25b9e26 66
+  s_03ead153b668eb::t_9ae9dfd17f889e 68
+requirements.txt
+  s_03ead153b668eb::t_8c9363b6ec24b2 40
+app/main.py
+  s_03ead153b668eb::t_b35fda051800f1 189-190
+  s_03ead153b668eb::t_e8b0244f82948b 31,142
+  s_03ead153b668eb::t_654e463a129c6c 110-117,136-141
+  s_03ead153b668eb::t_2c1b223591511d 118-125
+  s_03ead153b668eb::t_cc25ed8a254a43 68,72,74
+  s_03ead153b668eb::t_b3eea95c23d279 32
+run.py
+  s_03ead153b668eb::t_51249b07da8aeb 96
+prompt/prompt_storage.py
+  s_03ead153b668eb::t_1d284ce8a552a8 75-141
+core/config.py
+  s_03ead153b668eb::t_71cf7049f82eda 67-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "52900f949016d20f26750f115341d4681d6d29f6",
+  "prompts": {},
+  "humans": {
+    "h_a8c36d68950adc": {
+      "author": "zhouzd <zhouzd@asiainfo.com>"
+    }
+  },
+  "sessions": {
+    "s_03ead153b668eb": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9e1b261b30b85f91991db4",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": "zhouzd <zhouzd@asiainfo.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "tool_id": "Edit",
+        "edit_kind": "file_edit",
+        "dedupe_key": "6a9e1b261b30b85f91991db4:6a9f7a1d018e7ee47e5e4434:afterEdit:fb7278c1",
+        "tool_use_id": "6a9f7a1d018e7ee47e5e4434",
+        "session_id": "6a9e1b261b30b85f91991db4",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6a9e1b261b30b85f91991db4",
+        "tool_type": "agent",
+        "source_scene": "unknown",
+        "operation_id": "6a9f7a1d018e7ee47e5e4434"
+      }
+    }
+  }
+}
