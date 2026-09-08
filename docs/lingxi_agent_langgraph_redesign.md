@@ -4,7 +4,7 @@
 > 日期：2026-09-04
 > 状态：待评审
 
----
+***
 
 ## 目录
 
@@ -14,7 +14,7 @@
 4. [总体架构设计](#4-总体架构设计)
 5. [核心模块设计](#5-核心模块设计)
 6. [流程图](#6-流程图)
-7. #7-关键功能实现
+7. \#7-关键功能实现
 8. [数据表设计](#8-数据表设计)
 9. [API 设计](#9-api-设计)
 10. [配置项设计](#10-配置项设计)
@@ -23,13 +23,13 @@
 13. [分阶段实施计划](#13-分阶段实施计划)
 14. [风险与注意事项](#14-风险与注意事项)
 
----
+***
 
 ## 1. 文档说明
 
 ### 1.1 背景
 
-当前 lingxi-agent 项目是一个基于 FastAPI 的 RAG 问答系统，已具备知识库混合检索（BM25 + 向量 + RRF 融合 + Cross-Encoder 重排序）、语义缓存、对话记忆（MySQL）、文件清洗切分与向量入库等能力。
+当前 lingxi-agent 项目是一个基于 FastAPI 的 RAG 问答系统，已具备知识库混合检索（Qdrant 稀疏向量(基于text-embedding-v4) + 稠密向量 + RRF 融合 + Cross-Encoder 重排序）、语义缓存、对话记忆（MySQL）、文件清洗切分与向量入库等能力。
 
 本次改造的核心诉求：
 
@@ -47,30 +47,30 @@
 | 决策点          | 结论                                                                    |
 | ------------ | --------------------------------------------------------------------- |
 | 审批触发条件       | 仅当「路由到任务执行」且「LLM 决策是对数据库某张表做**删除或修改**」时触发审批；查询/插入不触发                  |
-| 审批人确定方式      | 使用**飞书审批流自动路由**（审批流编码 approval_code + 流程内配置的审批人/角色）                   |
+| 审批人确定方式      | 使用**飞书审批流自动路由**（审批流编码 approval\_code + 流程内配置的审批人/角色）                  |
 | 接口兼容策略       | **新增接口，保留旧接口**（`/api/conversations/chat` 维持不变，新增 `/api/agent/chat`）   |
 | 任务执行工具范围（初期） | 只读查询、数据插入、数据更新（触发审批）、数据删除（触发审批），全部基于**结构化参数 + 表/列白名单**，禁止 LLM 直接拼 SQL |
 
----
+***
 
 ## 2. 现状分析
 
 ### 2.1 当前技术栈
 
-| 层次        | 技术                                                                          | 说明                       |
-| --------- | --------------------------------------------------------------------------- | ------------------------ |
-| Web 框架    | FastAPI 0.115 + Uvicorn                                                     | 异步 API 服务                |
-| ORM       | SQLAlchemy 2.0 (asyncio) + aiomysql                                         | 异步数据库访问                  |
-| 配置        | Pydantic v2 + pydantic-settings                                             | `.env.dev` 环境配置          |
-| LLM       | `langchain-openai.ChatOpenAI`（通义千问 DashScope 兼容接口）                          | 对话/摘要/意图                 |
-| Embedding | 自研 `DashScopeEmbedding`（openai SDK 直连 DashScope）                            | text-embedding-v3，1024 维 |
-| 向量库       | Qdrant（本地磁盘模式）                                                              | 文档向量 + 语义缓存两个集合          |
-| 检索        | 自研 `HybridRetriever`：BM25(jieba+rank-bm25) + 向量 + RRF 融合 + Cross-Encoder 重排 | 核心检索链路                   |
-| 记忆        | 自研 `MySQLChatMessageHistory` / `MySQLConversationSummaryMemory`             | 消息持久化 + 长对话摘要压缩          |
-| 缓存        | 自研 `SemanticCache`（Qdrant 独立集合）                                             | 语义级问答缓存                  |
-| 认证        | JWT + bcrypt + 图片验证码                                                        | 用户体系                     |
-| 存储        | 腾讯云 COS                                                                     | 文件持久化                    |
-| 追踪        | LangSmith                                                                   | 已接入                      |
+| 层次        | 技术                                                                            | 说明                       |
+| --------- | ----------------------------------------------------------------------------- | ------------------------ |
+| Web 框架    | FastAPI 0.115 + Uvicorn                                                       | 异步 API 服务                |
+| ORM       | SQLAlchemy 2.0 (asyncio) + aiomysql                                           | 异步数据库访问                  |
+| 配置        | Pydantic v2 + pydantic-settings                                               | `.env.dev` 环境配置          |
+| LLM       | `langchain-openai.ChatOpenAI`（通义千问 DashScope 兼容接口）                            | 对话/摘要/意图                 |
+| Embedding | 自研 `DashScopeEmbedding`（DashScope 原生 SDK 直连）                            | text-embedding-v4，1024 维（稠密+稀疏双输出） |
+| 向量库       | Qdrant（本地磁盘模式）                                                                | 文档向量 + 语义缓存两个集合          |
+| 检索        | 自研 `HybridRetriever`：Qdrant 稀疏向量(text-embedding-v4) + 稠密向量 + RRF 融合 + Cross-Encoder 重排 | 核心检索链路                   |
+| 记忆        | 自研 `MySQLChatMessageHistory` / `MySQLConversationSummaryMemory`               | 消息持久化 + 长对话摘要压缩          |
+| 缓存        | 自研 `SemanticCache`（Qdrant 独立集合）                                               | 语义级问答缓存                  |
+| 认证        | JWT + bcrypt + 图片验证码                                                          | 用户体系                     |
+| 存储        | 腾讯云 COS                                                                       | 文件持久化                    |
+| 追踪        | LangSmith                                                                     | 已接入                      |
 
 ### 2.2 当前模块结构
 
@@ -80,15 +80,14 @@ lingxi-agent/
 ├── api/routes/                 # 路由层
 │   ├── auth.py                 # 验证码/注册/登录/me
 │   ├── conversation.py         # 会话 CRUD + 流式对话（use_rag 参数二选一）
-│   ├── file_process.py         # 文件清洗切分 + 向量入库 + BM25 重建
+│   ├── file_process.py         # 文件清洗切分 + 双向量入库（同 doc_id 先删后插）+ 语义缓存失效
 │   ├── metadata.py             # 元数据定义 CRUD
 │   ├── attachments.py          # 附件
 │   └── cache.py                # 语义缓存统计
 ├── core/                       # config / database / exceptions
 ├── models/                     # ORM 模型 + Pydantic Schema
 ├── rag/
-│   ├── hybrid_retriever.py     # HybridRetriever / BM25Indexer / CrossEncoderReranker
-│   ├── bm25_index_manager.py   # BM25 索引持久化与重建
+│   ├── hybrid_retriever.py     # HybridRetriever（稀疏+稠密双路） / CrossEncoderReranker
 │   ├── rag_conversation_service.py  # RAG 对话服务（检索 + 记忆 + 流式）
 │   ├── conversation_service.py # 普通对话服务
 │   ├── semantic_cache.py       # 语义缓存
@@ -107,7 +106,7 @@ POST /api/conversations/chat   (SSE)
   ├─ use_rag=true  → RAGConversationService.chat_with_rag
   │                  ├─ 预计算 query embedding
   │                  ├─ 语义缓存命中？→ 直接流式返回缓存回答
-  │                  ├─ 混合检索（权限过滤 + BM25 + 向量 + RRF + 重排）
+  │                  ├─ 混合检索（权限过滤 + 稀疏向量(text-embedding-v4) + 稠密向量 + RRF + 重排）
   │                  ├─ 上下文压缩 + 摘要（MySQL）
   │                  ├─ RAG Prompt → LLM 流式生成
   │                  └─ 保存消息 + 写缓存
@@ -119,13 +118,13 @@ POST /api/conversations/chat   (SSE)
 ```
 用户问题
   ├─ 1. 权限过滤：metadata.auth_option ∈ {public} ∪ {private ∧ create_username=当前用户}
-  ├─ 2. 并行召回：BM25（jieba 分词, top_k=k*5）  ∥  向量（相似度搜索, top_k=k*5）
+  ├─ 2. 并行召回：稀疏向量召回（text-embedding-v4, top_k=k*5）  ∥  稠密向量（相似度搜索, top_k=k*5）
   ├─ 3. RRF 融合：score(d) = Σ 1/(k + rank_i(d))，k=60
   ├─ 4. Cross-Encoder 重排序（bge-reranker-base 本地模型, 候选 12 条）
   └─ 5. 返回 Top-K 文档（新知识优先，按 created_at 倒序）
 ```
 
----
+***
 
 ## 3. 改造目标与技术选型
 
@@ -140,7 +139,7 @@ POST /api/conversations/chat   (SSE)
 | langgraph                  | 1.2.10 | 锁定原因：1.2.11 已被官方 **yanked**（broken），1.2.10 为最新可用稳定版      |
 | langgraph-checkpoint       | 4.2.0  | 图状态持久化基础库（由 langgraph 自动拉取）                              |
 | langgraph-checkpoint-mysql | 3.0.0  | MySQL 检查点保存器，用于跨请求恢复审批中断点                                |
-| openai                     | 3.8.0  | 最新稳定版（embedding_deal.py 直连使用，旧 1.x 语法已废弃）                |
+| openai                     | 3.8.0  | 最新稳定版（embedding\_deal.py 直连使用，旧 1.x 语法已废弃）               |
 | lark-oapi                  | 1.7.3  | 飞书开放平台官方 SDK（审批流对接）                                      |
 | qdrant-client              | 1.19.0 | 向量库客户端                                                   |
 | langsmith                  | 0.12.1 | 链路追踪                                                     |
@@ -151,11 +150,11 @@ POST /api/conversations/chat   (SSE)
 
 1. **LangGraph 承担编排**：意图路由、条件分支、多意图**并行执行与自动汇聚**、任务执行、Human-in-the-loop 审批，全部由 StateGraph 表达，状态显式、可回放、可持久化；
 2. **LangChain 承担模型抽象**：ChatOpenAI、Prompt、Message、Structured Output、Document 等；
-3. **复用现有检索资产**：`HybridRetriever`、`SemanticCache`、`BM25IndexManager` 等检索组件不重写，通过薄适配层接入图节点；
+3. **复用现有检索资产**：`HybridRetriever`、`SemanticCache` 等检索组件不重写，通过薄适配层接入图节点；稀疏向量与稠密向量均由 **text-embedding-v4** 一次调用双输出并存储于 Qdrant，**不再维护独立 BM25 内存索引**；
 4. **审批采用官方 HITL 机制**：`create_agent` + `HumanInTheLoopMiddleware` + LangGraph `interrupt()` + `MySQLAsyncSaver` 检查点持久化，天然支持服务重启后继续审批流；
-5. **API 全部使用最新官方接口**：`StateGraph/add_node/add_conditional_edges/interrupt/Command/with_structured_output` 等。任务 Agent 使用 `langchain.agents.create_agent`（LangGraph v1 官方推荐），**不使用已弃用的 `langgraph.prebuilt.create_react_agent`**，也不使用已废弃的 `Chain`/`LLMChain`/`SequentialChain` 等旧 API。
+5. **API 全部使用最新官方接口**：`StateGraph/add_node/add_conditional_edges/interrupt/Command/with_structured_output` 等。任务 Agent 使用 `langchain.agents.create_agent`（LangGraph v1 官方推荐），**不使用已弃用的** **`langgraph.prebuilt.create_react_agent`**，也不使用已废弃的 `Chain`/`LLMChain`/`SequentialChain` 等旧 API。
 
----
+***
 
 ## 4. 总体架构设计
 
@@ -228,7 +227,7 @@ lingxi-agent/
     ├── prompt_storage.py               # 扩展：意图识别/任务执行提示词
 ```
 
----
+***
 
 ## 5. 核心模块设计
 
@@ -322,7 +321,7 @@ class KnowledgeService:
 
 1. 预计算 query embedding；
 2. 语义缓存检查（命中 → 直接作为回答，写入消息）；
-3. 未命中 → 混合检索（权限过滤 + BM25 + 向量 + RRF + 重排，`k=4`）；
+3. 未命中 → 混合检索（权限过滤 + 稀疏向量(text-embedding-v4) + 稠密向量 + RRF + 重排，`k=4`）；
 4. 组装 RAG Prompt（复用 `RAG_SYSTEM_PROMPT_WITH_CONTEXT/WITHOUT_CONTEXT`）；
 5. LLM 流式生成（供 API 层 `stream_mode="messages"` 转发 SSE），产出写入 `rag_answer`（并行场景下供 merge 节点合并）；
 6. 回答落库（MySQL） + 写入语义缓存。
@@ -437,7 +436,7 @@ intent_router（多标签）
 #### 5.8.2 与飞书审批的交互（并行 + 中断）
 
 - 知识库分支通常先完成：`rag_answer` 写入 state，检索与生成结果**不因审批中断而丢失**；
-- 任务分支命中写操作 → HITL 中间件 interrupt → 整个图暂停（thread_id=conversation_id 持久化）；
+- 任务分支命中写操作 → HITL 中间件 interrupt → 整个图暂停（thread\_id=conversation\_id 持久化）；
 - SSE 行为：知识库答案的 token 在中断前已可流式下发 → 随后推送 `event=approval_required` → 审批通过后恢复 → 任务分支完成 → merge 汇总 → 推送最终回答；
 - 兜底：若前端连接断开，可通过 `GET /api/agent/tasks/{task_execution_id}` 轮询获得合并后的 `final_response`。
 
@@ -450,7 +449,7 @@ intent_router（多标签）
 - **可观测性**：`final_response` 连同各分支原始结果一并落库 `task_execution`（含 `rag_answer`、`task_answer` 快照），便于审计与回溯；
 - 汇总节点为普通 LLM 调用（非 Agent），无工具、无审批，天然适合作为 DAG 汇聚点。
 
----
+***
 
 ## 6. 流程图
 
@@ -485,7 +484,7 @@ flowchart TD
     B --> C{语义缓存命中?}
     C -->|是| D[直接返回缓存回答]
     C -->|否| E[构建权限过滤<br/>public 或 private-本人]
-    E --> F[混合检索<br/>BM25 并行 向量]
+    E --> F[混合检索<br/>稀疏向量 并行 稠密向量]
     F --> G[RRF 融合 k=60]
     G --> H[Cross-Encoder 重排]
     H --> I[组装 RAG Prompt<br/>上下文压缩 + 摘要]
@@ -593,7 +592,7 @@ sequenceDiagram
     G-->>U: SSE 推送最终回答
 ```
 
----
+***
 
 ## 7. 关键功能实现
 
@@ -743,7 +742,7 @@ def build_graph(checkpointer) -> StateGraph:
     return g.compile(checkpointer=checkpointer)
 ```
 
-**汇总节点（merge_node）实现**：
+**汇总节点（merge\_node）实现**：
 
 ```python
 # agent/nodes/merge_node.py（设计示意）
@@ -895,47 +894,47 @@ data: {"event": "ping"}
 data: {"event": "done"}
 ```
 
----
+***
 
 ## 8. 数据表设计
 
-### 8.1 task_execution（任务执行记录，审计）
+### 8.1 task\_execution（任务执行记录，审计）
 
-| 字段                      | 类型             | 说明                                                       |
-| ----------------------- | -------------- | -------------------------------------------------------- |
-| id                      | varchar(36) PK | UUID                                                     |
-| conversation_id         | varchar(36)    | 关联会话                                                     |
-| user_id                 | varchar(36)    | 发起人                                                      |
-| intent                  | varchar(64)    | 路由意图（task / knowledge_base / task,knowledge_base / chat） |
-| status                  | varchar(32)    | running / completed / rejected / failed / canceled       |
-| tool_calls              | JSON           | 工具调用序列（名称、参数、结果摘要）                                       |
-| rag_answer              | text           | 知识库分支产出（并行场景快照，供审计/回溯）                                   |
-| task_answer             | text           | 任务分支产出（含审批后结果快照）                                         |
-| result                  | text           | 最终回答（final_response，含合并润色结果）                             |
-| error                   | text           | 错误信息                                                     |
-| created_at / updated_at | datetime       | 时间戳                                                      |
+| 字段                        | 类型             | 说明                                                         |
+| ------------------------- | -------------- | ---------------------------------------------------------- |
+| id                        | varchar(36) PK | UUID                                                       |
+| conversation\_id          | varchar(36)    | 关联会话                                                       |
+| user\_id                  | varchar(36)    | 发起人                                                        |
+| intent                    | varchar(64)    | 路由意图（task / knowledge\_base / task,knowledge\_base / chat） |
+| status                    | varchar(32)    | running / completed / rejected / failed / canceled         |
+| tool\_calls               | JSON           | 工具调用序列（名称、参数、结果摘要）                                         |
+| rag\_answer               | text           | 知识库分支产出（并行场景快照，供审计/回溯）                                     |
+| task\_answer              | text           | 任务分支产出（含审批后结果快照）                                           |
+| result                    | text           | 最终回答（final\_response，含合并润色结果）                              |
+| error                     | text           | 错误信息                                                       |
+| created\_at / updated\_at | datetime       | 时间戳                                                        |
 
-### 8.2 approval_request（审批单）
+### 8.2 approval\_request（审批单）
 
-| 字段                      | 类型             | 说明                                       |
-| ----------------------- | -------------- | ---------------------------------------- |
-| id                      | varchar(36) PK | UUID                                     |
-| task_execution_id       | varchar(36)    | 关联任务                                     |
-| conversation_id         | varchar(36)    | 关联会话（= thread_id）                        |
-| requester_id            | varchar(64)    | 发起人（飞书 user_id/open_id）                  |
-| approval_type           | varchar(32)    | update / delete                          |
-| target_table            | varchar(64)    | 目标表                                      |
-| tool_params             | JSON           | 待执行工具参数（恢复时使用）                           |
-| status                  | varchar(32)    | pending / approved / rejected / canceled |
-| feishu_instance_code    | varchar(128)   | 飞书审批实例编码（回调关联）                           |
-| approved_by             | varchar(64)    | 审批人                                      |
-| callback_payload        | JSON           | 飞书回调原文（审计）                               |
-| created_at / updated_at | datetime       | 时间戳                                      |
+| 字段                        | 类型             | 说明                                       |
+| ------------------------- | -------------- | ---------------------------------------- |
+| id                        | varchar(36) PK | UUID                                     |
+| task\_execution\_id       | varchar(36)    | 关联任务                                     |
+| conversation\_id          | varchar(36)    | 关联会话（= thread\_id）                       |
+| requester\_id             | varchar(64)    | 发起人（飞书 user\_id/open\_id）                |
+| approval\_type            | varchar(32)    | update / delete                          |
+| target\_table             | varchar(64)    | 目标表                                      |
+| tool\_params              | JSON           | 待执行工具参数（恢复时使用）                           |
+| status                    | varchar(32)    | pending / approved / rejected / canceled |
+| feishu\_instance\_code    | varchar(128)   | 飞书审批实例编码（回调关联）                           |
+| approved\_by              | varchar(64)    | 审批人                                      |
+| callback\_payload         | JSON           | 飞书回调原文（审计）                               |
+| created\_at / updated\_at | datetime       | 时间戳                                      |
 
 > 索引：`idx_appr_instance(instance_code)`、`idx_appr_conv(conversation_id, status)`。
 > 新表由 `Base.metadata.create_all` 在启动时自动创建（沿用现有机制）。
 
----
+***
 
 ## 9. API 设计
 
@@ -967,7 +966,7 @@ data: {"event": "done"}
 - `/api/conversations/*` 会话 CRUD、消息列表
 - `/api/auth/*`、`/api/file/process`、`/api/metadata/*`、`/api/attachments/*`、`/api/cache/*`
 
----
+***
 
 ## 10. 配置项设计
 
@@ -989,21 +988,21 @@ AGENT_TASK_TIMEOUT_SECONDS=120           # 任务执行超时
 AGENT_INSERT_REQUIRES_APPROVAL=false     # 插入操作是否审批（默认否）
 ```
 
----
+***
 
 ## 11. 安全设计
 
-| 风险点         | 措施                                                    |
-| ----------- | ----------------------------------------------------- |
-| SQL 注入      | 工具仅接收结构化参数，语句全部绑定参数化执行；禁止 LLM 拼接 SQL                  |
-| 越权访问数据      | 表/列白名单 + 权限过滤（复用现有 metadata.auth_option 机制）+ 查询 LIMIT |
-| 任务 Agent 失控 | 工具集最小化、每次调用审计落库、超时保护、审批门兜底                            |
-| 飞书回调伪造      | 验签（verification_token）+ 事件解密（encrypt_key）+ 幂等状态守卫     |
-| 提示词注入       | 意图识别与工具描述中显式声明"仅处理授权范围内的数据库操作"；知识库内容注入的防御沿用现有提示词分层隔离  |
-| 敏感信息泄露      | 日志与审计中不记录完整参数值（脱敏），审批表单仅展示必要摘要                        |
-| 并发/重复审批     | 审批单状态机（pending→approved/rejected 单向流转）+ 恢复时再次校验状态     |
+| 风险点         | 措施                                                     |
+| ----------- | ------------------------------------------------------ |
+| SQL 注入      | 工具仅接收结构化参数，语句全部绑定参数化执行；禁止 LLM 拼接 SQL                   |
+| 越权访问数据      | 表/列白名单 + 权限过滤（复用现有 metadata.auth\_option 机制）+ 查询 LIMIT |
+| 任务 Agent 失控 | 工具集最小化、每次调用审计落库、超时保护、审批门兜底                             |
+| 飞书回调伪造      | 验签（verification\_token）+ 事件解密（encrypt\_key）+ 幂等状态守卫    |
+| 提示词注入       | 意图识别与工具描述中显式声明"仅处理授权范围内的数据库操作"；知识库内容注入的防御沿用现有提示词分层隔离   |
+| 敏感信息泄露      | 日志与审计中不记录完整参数值（脱敏），审批表单仅展示必要摘要                         |
+| 并发/重复审批     | 审批单状态机（pending→approved/rejected 单向流转）+ 恢复时再次校验状态      |
 
----
+***
 
 ## 12. 影响范围与改动清单
 
@@ -1021,23 +1020,26 @@ AGENT_INSERT_REQUIRES_APPROVAL=false     # 插入操作是否审批（默认否�
 
 ### 12.2 修改文件（改动极小，需评审确认）
 
-| 文件                                | 改动点                                                                                       | 影响范围               |
-| --------------------------------- | ----------------------------------------------------------------------------------------- | ------------------ |
-| `requirements.txt`                | 已改：新增 langgraph 生态、openai 3.x、lark-oapi；升级 langchain 系列                                   | 依赖安装（由用户执行）        |
-| `core/config.py`                  | 新增飞书/任务执行配置项（纯新增字段，默认值兜底）                                                                 | 无行为影响              |
-| `.env.dev`                        | 新增飞书配置占位                                                                                  | 仅本地开发              |
-| `app/main.py`                     | lifespan 中初始化 Agent 图（含 MySQL 检查点）；注册 2 个新路由                                              | 启动流程扩展，失败降级不影响现有功能 |
-| `prompt/prompt_storage.py`        | 新增意图识别/任务执行提示词（纯追加）                                                                       | 无                  |
-| `rag/rag_conversation_service.py` | 新增 2~3 个**公开薄方法**（如 `retrieve_context_public`、`get_compressed_history_public`），内部委托现有私有方法 | 仅新增方法，不改动现有逻辑      |
-| `rag/memory_mysql.py`             | 如需可暴露历史加载公开方法（可选）                                                                         | 仅新增方法              |
+| 文件                                | 改动点                                                                                                                                                                                                                       | 影响范围               |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `requirements.txt`                | 已改：新增 langgraph 生态、openai 3.x、lark-oapi；升级 langchain 系列                                                                                                                                                                   | 依赖安装（由用户执行）        |
+| `core/config.py`                  | 新增飞书/任务执行配置项（纯新增字段，默认值兜底）                                                                                                                                                                                                 | 无行为影响              |
+| `.env.dev`                        | 新增飞书配置占位                                                                                                                                                                                                                  | 仅本地开发              |
+| `app/main.py`                     | lifespan 中初始化 Agent 图（含 MySQL 检查点）；注册 2 个新路由                                                                                                                                                                              | 启动流程扩展，失败降级不影响现有功能 |
+| `prompt/prompt_storage.py`        | 新增意图识别/任务执行提示词（纯追加）                                                                                                                                                                                                       | 无                  |
+| `rag/rag_conversation_service.py` | 新增 2\~3 个**公开薄方法**（如 `retrieve_context_public`、`get_compressed_history_public`），内部委托现有私有方法；移除 BM25 索引管理器初始化/重建，`rebuild_hybrid_index` 改为 `invalidate_kb_semantic_cache`（仅失效语义缓存），检索链路预计算稠密+稀疏双向量并全链路传递 | 检索行为不变，仅实现载体变化     |
+| `rag/hybrid_retriever.py`         | 移除内存 `BM25Indexer`/持久化/同步机制，BM25 路改为 Qdrant **稀疏向量**查询（`query_points` + `using="sparse"`，查询侧与写入侧共用 text-embedding-v4 生成的稀疏向量，支持 `precomputed_sparse` 预计算复用）；RRF 双路融合与 Cross-Encoder 重排保留                                                                  | 检索行为不变，依赖更少        |
+| `embeddings/embedding_deal.py`    | 集合同时配置**稠密 + 稀疏**向量（兼容存量无名稠密向量，增量补充 sparse 配置）；`save_to_vectors` 双向量写入，同 `doc_id` 先删后插（Qdrant 删点即删全部向量）；`DashScopeEmbedding` 基于 text-embedding-v4 一次调用双输出（`embed_documents_with_sparse` / `embed_query_with_sparse`）                                                          | 写入侧新增稀疏向量，检索侧无需感知  |
+| `api/routes/file_process.py`      | 移除 BM25 索引重建步骤，改为知识库变更后失效语义缓存（失败仅告警不阻断）                                                                                                                                                                                   | 同 doc_id 自动先删后插    |
+| `rag/memory_mysql.py`             | 如需可暴露历史加载公开方法（可选）                                                                                                                                                                                                         | 仅新增方法              |
 
 ### 12.3 明确不改动
 
-- `rag/hybrid_retriever.py`、`rag/bm25_index_manager.py`、`rag/semantic_cache.py`（检索链路原样保留）
-- `embeddings/embedding_deal.py`、`ingestion/**`、`utils/**`
-- `api/routes/conversation.py`、`auth.py`、`file_process.py`、`metadata.py`、`attachments.py`、`cache.py`（旧接口原样保留）
+- `rag/semantic_cache.py`、`rag/memory_mysql.py`、`ingestion/**`、`utils/**`（原样保留）
+- `rag/hybrid_retriever.py`、`embeddings/embedding_deal.py` 已完成 **BM25→text-embedding-v4 稀疏向量**改造（见 §12.2）；`rag/bm25_index_manager.py` 已删除
+- `api/routes/conversation.py`、`auth.py`、`metadata.py`、`attachments.py`、`cache.py`（旧接口原样保留）
 
----
+***
 
 ## 13. 分阶段实施计划
 
@@ -1045,18 +1047,20 @@ AGENT_INSERT_REQUIRES_APPROVAL=false     # 插入操作是否审批（默认否�
 | --- | ------------------------------ | ------------------------------- | ------------------------------------------ |
 | 0   | 用户按 requirements.txt 安装依赖      | 可运行环境                           | `pip install -r requirements.txt` 成功，服务可启动 |
 | 1   | 意图识别 + 主图骨架（路由到知识库/聊天）         | `agent/` 基础模块、`/api/agent/chat` | 知识库问答与普通聊天流式正常，检索结果与旧接口一致                  |
-| 2   | 任务执行子图 + 工具层（只读/插入）            | 工具注册表、db_tools                  | 查询/插入任务可完成并出审计报告                           |
+| 2   | 任务执行子图 + 工具层（只读/插入）            | 工具注册表、db\_tools                 | 查询/插入任务可完成并出审计报告                           |
 | 3   | 飞书审批（写操作拦截 + interrupt + 回调恢复） | 审批模块、审批表、回调接口                   | update/delete 触发审批，通过后执行、拒绝后终止，重启可恢复       |
 | 4   | 观测与加固                          | LangSmith 追踪完善、日志、超时、幂等         | 全链路可追踪，异常可降级                               |
 
----
+***
 
 ## 14. 风险与注意事项
 
 1. **依赖兼容**：已通过 PyPI 版本核对锁定版本组合（langchain 1.3.10 + langgraph 1.2.10 + langchain-core 1.6.1），langgraph 1.2.11 与 langchain 1.4.0 组合不可用（yanked），后续升级需重新验证；
 2. **LLM 意图误判**：采用结构化输出 + 低置信度降级 + 任务写操作双重确认（意图识别 + Agent 工具决策）降低误判概率；上线初期可开启意图结果日志抽查。多意图并行场景下，若误判为 `task+knowledge_base` 会导致一次额外检索/任务开销，通过意图归一化与置信度阈值控制，且单分支结果缺失时 merge 节点可容错输出；
+   - **并行分支 + 审批中断（T3-9 已验证）**：LangGraph 中某节点触发 `GraphInterrupt` 会取消同超步中仍在执行的其他并行分支。`task+knowledge_base` 场景下任务分支先触发审批中断时，知识分支（检索 + LLM 生成较慢）会被取消，导致 `rag_answer` 缺失。实现上由 merge 节点在检测到「意图含 knowledge_base 但 rag_answer 为空」时重新执行知识分支以恢复结果（抑制流式、仅恢复文本），保证审批恢复后汇总完整。生产建议使用 Qdrant Server 模式（本地路径模式不允许多进程并发访问）。
 3. **审批恢复依赖 MySQL 检查点**：`langgraph-checkpoint-mysql` 需独立的数据库表权限（自动建表）；生产环境建议与业务库隔离或单独 Schema；
 4. **SSE 长连接**：审批等待期间连接保持，通过心跳保活；若连接断开，前端可轮询 `/api/agent/tasks/{id}` 兜底；
 5. **飞书审批流配置**：审批人自动路由在飞书审批流管理后台配置，应用侧仅传入 `approval_code` 与表单数据；
 6. **数据库写操作范围**：初期白名单表由配置控制，务必在生产环境收敛到最小集合；
-7. **API 生命周期监控**：`langgraph.prebuilt.create_react_agent` 已在 LangGraph v1 弃用，本项目统一使用 `langchain.agents.create_agent`；LangChain/LangGraph 迭代较快，开发与升级时应以官方文档为准持续跟进（`langchain.agents.middleware` 中 HITL 相关类的构造方式以实际版本 API 为准）。
+7. **API 生命周期监控**：`langgraph.prebuilt.create_react_agent` 已在 LangGraph v1 弃用，本项目统一使用 `langchain.agents.create_agent`；LangChain/LangGraph 迭代较快，开发与升级时应以官方文档为准持续跟进（`langchain.agents.middleware` 中 HITL 相关类的构造方式以实际版本 API 为准）；
+8. **存量数据稀疏向量为空（T 系列新增）**：改造前写入 Qdrant 的点仅含稠密向量，稀疏路（text-embedding-v4 关键词）对这些点召回为空。集合已增量补充 `sparse` 向量配置（`update_collection`），但存量点需**重新上传文档**（走 `process_file` 同 `doc_id` 先删后插）后才会生成稀疏向量；检索侧稀疏路为空时自动降级为仅稠密路，不影响服务可用性。

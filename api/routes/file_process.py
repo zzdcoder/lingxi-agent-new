@@ -17,7 +17,7 @@ import os
 from models.file_schema import FileDDLAndSplitInput, FileDDLAndSplitOutput
 from ingestion.fileddl_service import get_file_ddl_split_service
 from embeddings import embedding_deal
-from rag.rag_conversation_service import rebuild_hybrid_index
+from rag.rag_conversation_service import invalidate_kb_semantic_cache
 from utils import get_current_user
 
 
@@ -67,14 +67,12 @@ async def process_file(
                 logger.error(f"向量存储失败: file_id={input_data.file_id}, 错误: {e}")
                 raise FileProcessingException(f"向量存储失败: {str(e)}")
 
-            # 步骤 2: BM25 索引全量重建（与向量存储解耦，失败不影响文件处理结果）
+            # 步骤 2: 知识库变更，清除语义缓存（缓存失效失败不阻断文件处理）
             try:
-                await rebuild_hybrid_index()
-                logger.info(f"BM25 索引重建成功: file_id={input_data.file_id}")
+                await invalidate_kb_semantic_cache()
+                logger.info(f"语义缓存已清除: file_id={input_data.file_id}")
             except Exception as e:
-                logger.error(f"BM25 索引重建失败: file_id={input_data.file_id}, 错误: {e}")
-                # BM25 重建失败不阻断文件处理，但抛出异常让调用方知晓
-                raise FileProcessingException(f"BM25 索引重建失败: {str(e)}")
+                logger.warning(f"语义缓存清除失败（非致命）: file_id={input_data.file_id}, 错误: {e}")
 
         return result
 

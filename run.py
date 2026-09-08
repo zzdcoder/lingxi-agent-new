@@ -93,7 +93,7 @@ def main():
             host=args.host,
             port=args.port,
             reload=True,
-            reload_dirs=["app", "api", "rag", "models", "core", "utils", "embeddings", "ingestion", "prompt"],
+            reload_dirs=["app", "api", "rag", "models", "core", "utils", "embeddings", "ingestion", "prompt", "agent"],
             reload_excludes=[
                 "qdrant_data",
                 "qdrant_data_backup",

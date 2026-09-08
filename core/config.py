@@ -64,5 +64,29 @@ class Settings(BaseSettings):
     # 应用配置
     debug: bool = False
 
+    # ============================================================
+    # 飞书审批配置（Agent 任务写操作人工审批）
+    # 未配置时相关功能自动降级：写操作拒绝并提示"审批未配置"
+    # ============================================================
+    feishu_app_id: str = ""                        # 飞书应用 App ID
+    feishu_app_secret: str = ""                    # 飞书应用 App Secret
+    feishu_approval_code: str = ""                 # 审批流编码（审批人/角色在飞书后台配置，自动路由）
+    feishu_encrypt_key: str = ""                   # 事件回调 AES 加密密钥
+    feishu_verification_token: str = ""            # 事件回调验签 token
+    feishu_callback_url: str = ""                  # 事件订阅地址（可选，仅用于配置提示）
+
+    # ============================================================
+    # 任务执行（Agent 数据库工具）配置
+    # ============================================================
+    agent_db_allowed_tables: str = "user,conversation,conversation_message"  # 表白名单，逗号分隔
+    agent_query_max_rows: int = 50                 # 单次查询最大返回行数
+    agent_task_timeout_seconds: int = 120          # 任务执行超时（秒）
+    agent_insert_requires_approval: bool = False   # 插入操作是否触发审批（默认否）
+
+    @property
+    def agent_db_allowed_table_list(self) -> list[str]:
+        """将逗号分隔的表白名单解析为列表（过滤空项）。"""
+        return [t.strip() for t in self.agent_db_allowed_tables.split(",") if t.strip()]
+
 
 settings = Settings()

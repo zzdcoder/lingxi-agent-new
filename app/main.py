@@ -28,6 +28,8 @@ from api.routes import metadata
 from api.routes import file_process
 from api.routes import conversation
 from api.routes import cache as cache_routes
+from api.routes import agent as agent_routes
+from api.routes import approval as approval_routes
 from models.metadata_model import MetadataDefinition
 from utils.captcha import cleanup_expired_captchas
 
@@ -63,21 +65,13 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"数据库初始化失败，应用将以降级模式运行: {exc}")
 
-    # 初始化混合检索器（启动时预热 BM25 索引）
+    # 初始化混合检索器（启动时预热，含 Cross-Encoder 重排序模型）
     try:
         from rag.rag_conversation_service import init_hybrid_retriever
         init_hybrid_retriever()
-        logger.info("BM25 索引启动预热完成")
+        logger.info("混合检索器启动预热完成")
     except Exception as e:
-        logger.error(f"BM25 索引启动预热失败: {e}")
-
-    # 启动时预热 jieba 词典，避免首次请求额外耗时 ~1s
-    try:
-        import jieba
-        jieba.initialize()
-        logger.info("jieba 词典启动预热完成")
-    except Exception as e:
-        logger.warning(f"jieba 词典预热失败: {e}")
+        logger.error(f"混合检索器启动预热失败: {e}")
 
     # 初始化语义缓存（基于 Qdrant，降级为无缓存模式）
     try:
@@ -113,6 +107,22 @@ async def lifespan(app: FastAPI):
 
     cache_task = asyncio.create_task(cache_cleanup_loop())
 
+    # 初始化审批检查点（MySQL，失败降级为无审批模式）
+    # 必须早于主图预热：主图编译需要携带 checkpointer
+    try:
+        from agent.graph_builder import init_checkpointer
+        await init_checkpointer()
+    except Exception as e:
+        logger.warning(f"审批检查点初始化异常（降级为无审批模式）: {e}")
+
+    # 预热 Agent 主图（失败不阻塞启动，/api/agent/chat 首次调用时自动编译）
+    try:
+        from agent.graph_builder import get_graph
+        get_graph()
+        logger.info("Agent 主图编译预热完成")
+    except Exception as e:
+        logger.warning(f"Agent 主图预热失败（首次调用时重试）: {e}")
+
     yield
 
     # 取消后台任务
@@ -122,6 +132,13 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         pass
+
+    # 关闭审批检查点连接
+    try:
+        from agent.graph_builder import close_checkpointer
+        await close_checkpointer()
+    except Exception as e:
+        logger.warning(f"审批检查点关闭异常: {e}")
 
 
 app = FastAPI(
@@ -169,6 +186,8 @@ app.include_router(metadata.router, prefix="/api")
 app.include_router(file_process.router, prefix="/api")
 app.include_router(conversation.router, prefix="/api")
 app.include_router(cache_routes.router, prefix="/api")
+app.include_router(agent_routes.router, prefix="/api")
+app.include_router(approval_routes.router, prefix="/api")
 
 
 @app.get("/health", tags=["健康检查"])

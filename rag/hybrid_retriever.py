@@ -2,47 +2,41 @@
 企业级混合检索模块 (Hybrid Retriever)
 
 设计目标：
-    结合 BM25 关键词检索与向量语义检索，通过 RRF (Reciprocal Rank Fusion) 算法融合多路结果，
-    解决单一检索方式的局限性：
-    - BM25 擅长精确匹配关键词（如产品型号、专有名词、身份证号）
-    - 向量检索擅长语义理解（如同义词、近义表达、上下文推理）
+    结合 Qdrant 稀疏向量（text-embedding-v4 关键词检索）与稠密向量（语义检索），
+    通过 RRF (Reciprocal Rank Fusion) 算法融合多路结果，解决单一检索方式的局限性：
+    - 稀疏向量擅长精确匹配关键词（如产品型号、专有名词、身份证号）
+    - 稠密向量擅长语义理解（如同义词、近义表达、上下文推理）
     - RRF 融合不依赖分数绝对值，只利用排名的相对位置，天然适配不同检索方式的分数尺度差异
 
 架构组成：
-    1. BM25Indexer:   基于 rank-bm25 构建内存索引，支持中文 jieba 分词
-    2. HybridRetriever: 编排 BM25 + 向量两路检索，执行 RRF 融合，输出最终排序结果
+    1. Qdrant 稀疏向量: 由 text-embedding-v4 一次调用双输出生成，写入时随稠密向量
+       一并存入 Qdrant（命名向量 "sparse"）；
+    2. HybridRetriever: 编排 稀疏 + 稠密 两路检索，执行 RRF 融合，输出最终排序结果。
 
-依赖安装：
-    pip install rank-bm25 jieba
+设计演进（相对旧版内存 BM25 索引）：
+    - 不再维护独立的 BM25 索引文件与全量重建流程（索引持久化/同步机制一并移除）；
+    - 稀疏向量与稠密向量在文档写入时一并落库，检索完全由 Qdrant 完成；
+    - 文档更新时按 doc_id 先删后插（Qdrant 删点即删全部向量），无需重建索引。
 
-企业级特性：
-    - 索引持久化（pickle 序列化到磁盘，重启后秒级恢复）
-    - 全量同步机制（从 Qdrant 拉取全部数据重建 BM25 索引）
-    - 增量同步机制（追加新文档时局部重建）
-    - 完善的日志与异常处理
-    - 类型注解与文档字符串
-
-作者：AI Assistant
-日期：2026-06-17
+依赖说明：
+    无需额外分词/稀疏算法依赖，稀疏向量由 text-embedding-v4 直接生成。
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
-import pickle
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import jieba
 from langchain_core.documents import Document
 from langchain_qdrant import QdrantVectorStore
 from langsmith import traceable
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Filter
-from rank_bm25 import BM25Okapi
+from qdrant_client.models import SparseVector
+
+from embeddings.embedding_deal import SPARSE_VECTOR_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -57,35 +51,17 @@ k 越大，低排名文档获得的分数衰减越慢，等于给后排文档更
 k 越小，排名靠前的文档优势越明显。60 是 Cormack 等人在 TREC 实验中验证的通用最优值。
 """
 
-DEFAULT_BM25_TOPK: int = 50
-"""BM25 单路检索召回数量。由于 RRF 依赖排名而非分数，每路都需要召回足够多
+DEFAULT_SPARSE_TOPK: int = 50
+"""稀疏向量单路检索召回数量。由于 RRF 依赖排名而非分数，每路都需要召回足够多
 的候选（通常取最终 top_k 的 3~5 倍），否则融合时会因候选池太小而损失精度。"""
 
 DEFAULT_VECTOR_TOPK: int = 50
-"""向量检索单路召回数量，理由同上。"""
-
-
+"""稠密向量单路检索召回数量，理由同上。"""
 
 
 # =============================================================================
 # 工具函数
 # =============================================================================
-
-def _default_tokenizer(text: str) -> List[str]:
-    """
-    默认中文分词器。
-
-    使用 jieba.cut_for_search 而非 jieba.cut，因为：
-    - cut_for_search 会对长词进行更细粒度的切分（如"中华人民共和国"会被切成
-      "中华"/"人民"/"共和国"/"中华人民共和国"）
-    - 检索场景下，细粒度切分能提高召回率，即使查询词只命中长词的一部分也能被检索到
-    - 代价是索引体积稍大，但在企业知识库规模（万级文档）下完全可以接受
-
-    如果你的领域有大量英文/数字混合文本（如"Python3.11 异步编程"），
-    建议在此函数中增加正则清洗逻辑，去除纯标点符号 token。
-    """
-    return list(jieba.cut_for_search(text.strip()))
-
 
 def _compute_doc_id(doc: Document, key: str = "chunk_id") -> str:
     """
@@ -109,382 +85,6 @@ def _compute_doc_id(doc: Document, key: str = "chunk_id") -> str:
 
 
 # =============================================================================
-# BM25 索引器
-# =============================================================================
-
-@dataclass
-class BM25IndexState:
-    """
-    BM25 索引的可序列化状态。
-
-    rank-bm25 库内部使用 numpy 数组存储词频统计，BM25Okapi 对象本身支持 pickle。
-    为了后续扩展（如增加自定义字段、版本控制），我们将其包装为 dataclass，
-    而非直接序列化裸对象。
-    """
-    bm25: BM25Okapi
-    documents: List[Document] = field(default_factory=list)
-    tokenized_corpus: List[List[str]] = field(default_factory=list)
-    doc_id_key: str = "chunk_id"
-    version: int = 1
-
-
-class BM25Indexer:
-    """
-    BM25 关键词检索索引器。
-
-    职责：
-        1. 维护一组文档的内存 BM25 索引；
-        2. 提供关键词检索接口（retrieve）；
-        3. 支持索引的持久化与恢复；
-        4. 支持从 Qdrant 向量库全量同步数据。
-
-    线程安全：
-        本类**不是线程安全的**。若在生产环境的多线程/多进程场景中使用，
-        建议在调用 add_documents / rebuild_index 时加锁，或每个 worker 维护独立索引副本。
-
-    性能边界：
-        - 万级文档（< 10 万 chunk）：内存占用 < 500MB，检索延迟 < 50ms，完全适用；
-        - 百万级文档：建议迁移到 Elasticsearch / OpenSearch，用其原生 BM25 实现。
-    """
-
-    def __init__(
-        self,
-        documents: Optional[List[Document]] = None,
-        tokenizer: Optional[Callable[[str], List[str]]] = None,
-        doc_id_key: str = "chunk_id",
-    ):
-        """
-        初始化 BM25 索引器。
-
-        Args:
-            documents: 初始文档列表，为 None 时表示空索引，后续通过 add_documents 或
-                       from_qdrant 填充。
-            tokenizer: 自定义分词函数，默认使用 jieba.cut_for_search。
-            doc_id_key: 从 metadata 中提取唯一标识的字段名。
-        """
-        self._tokenizer: Callable[[str], List[str]] = tokenizer or _default_tokenizer
-        self._doc_id_key: str = doc_id_key
-
-        # 内部状态
-        self._documents: List[Document] = []
-        self._tokenized_corpus: List[List[str]] = []
-        self._bm25: Optional[BM25Okapi] = None
-        self._doc_id_to_index: Dict[str, int] = {}
-
-        if documents:
-            self.rebuild_index(documents)
-
-    # -------------------------------------------------------------------------
-    # 核心索引操作
-    # -------------------------------------------------------------------------
-
-    def rebuild_index(self, documents: List[Document]) -> None:
-        """
-        全量重建 BM25 索引。
-
-        这是 BM25 索引器的核心方法。由于 rank-bm25 的 BM25Okapi 在构造时需要
-        完整的语料库统计信息（IDF 基于全局词频计算），它不支持真正的"增量插入"
-        （不像倒排索引那样可以单独为新文档建 posting list）。
-
-        因此，无论是首次构建还是追加文档，最稳妥的方式都是传入全部文档重新构建。
-        在万级文档规模下，重建耗时通常在毫秒级，完全可以接受。
-
-        Args:
-            documents: 完整的文档列表（包含旧文档 + 新文档）。
-        """
-        if not documents:
-            logger.warning("BM25 rebuild_index 收到空文档列表，清空当前索引")
-            self._documents = []
-            self._tokenized_corpus = []
-            self._bm25 = None
-            self._doc_id_to_index = {}
-            return
-
-        start_time = time.time()
-        logger.info(f"BM25 开始重建索引，文档数: {len(documents)}")
-
-        # 步骤 1: 去重（以 doc_id 为键，保留最新出现的版本）
-        # 去重顺序很重要：如果同一 chunk_id 出现多次，后面的覆盖前面的
-        deduped: Dict[str, Document] = {}
-        for doc in documents:
-            doc_id = _compute_doc_id(doc, self._doc_id_key)
-            deduped[doc_id] = doc
-
-        self._documents = list(deduped.values())
-        self._doc_id_to_index = {
-            _compute_doc_id(doc, self._doc_id_key): idx
-            for idx, doc in enumerate(self._documents)
-        }
-
-        # 步骤 2: 分词（对每篇文档的 page_content 执行分词）
-        self._tokenized_corpus = [
-            self._tokenizer(doc.page_content)
-            for doc in self._documents
-        ]
-
-        # 步骤 3: 构建 BM25Okapi 索引
-        # BM25Okapi 构造函数接收分词后的二维列表，内部自动计算词频和 IDF
-        self._bm25 = BM25Okapi(self._tokenized_corpus)
-
-        elapsed = time.time() - start_time
-        logger.info(
-            f"BM25 索引重建完成，去重后文档数: {len(self._documents)}, "
-            f"耗时: {elapsed:.3f}s"
-        )
-
-    def add_documents(self, documents: List[Document]) -> None:
-        """
-        增量添加文档。
-
-        实现方式：将新文档追加到现有文档列表，然后调用 rebuild_index 全量重建。
-        虽然名字是"增量"，但底层是重建。在中小规模数据下这是最简单可靠的策略。
-
-        Args:
-            documents: 要新增的文档列表。
-        """
-        if not documents:
-            return
-        logger.info(f"BM25 增量添加 {len(documents)} 个文档")
-        combined = self._documents + documents
-        self.rebuild_index(combined)
-
-    # -------------------------------------------------------------------------
-    # 检索接口
-    # -------------------------------------------------------------------------
-
-    @traceable(name="bm25_retrieve", tags=["bm25", "retrieval"])
-    def retrieve(
-        self,
-        query: str,
-        top_k: int = DEFAULT_BM25_TOPK,
-        metadata_filter: Optional[Callable[[Document], bool]] = None,
-    ) -> List[Document]:
-        """
-        执行 BM25 关键词检索。
-
-        流程：
-            1. 对查询串分词；
-            2. 调用 BM25Okapi.get_scores 向量化计算全量得分；
-            3. 若有 metadata_filter，将不符合条件的文档得分置为负无穷；
-            4. 用 np.argpartition 局部排序取 top-k（O(N) 复杂度）；
-            5. 将索引映射回 Document 对象返回。
-
-        Args:
-            query: 用户查询字符串。
-            top_k: 返回文档数量。建议取最终需求 top_k 的 3~5 倍，为 RRF 融合留出候选空间。
-            metadata_filter: 可选的元数据过滤函数，接收 Document 返回 bool。
-                             仅对符合条件的文档执行 BM25 排名。
-
-        Returns:
-            按 BM25 得分降序排列的 Document 列表。
-        """
-        if not self._bm25:
-            logger.warning("BM25 索引为空，返回空结果")
-            return []
-
-        if not query or not query.strip():
-            return []
-
-        start_time = time.time()
-        tokenized_query = self._tokenizer(query)
-
-        if not tokenized_query:
-            logger.warning("BM25 查询分词结果为空，返回空结果")
-            return []
-
-        import numpy as np
-
-        # 向量化计算全量得分：get_scores() 底层用 numpy 矩阵运算，
-        # 比 get_top_n 的 Python 循环快 10~50 倍（文档量越大优势越明显）
-        scores = self._bm25.get_scores(tokenized_query)
-
-        # 构建候选索引列表，支持元数据预过滤
-        if metadata_filter:
-            # 将不符合条件的文档得分置为负无穷，排除出 top-k
-            mask = np.array([
-                metadata_filter(self._documents[idx])
-                for idx in range(len(self._documents))
-            ])
-            scores[~mask] = -np.inf
-
-        # argpartition 是 O(N) 的局部排序，比全排序 argsort 更快
-        actual_k = min(top_k, len(self._documents))
-        if actual_k <= 0:
-            logger.info("BM25 过滤后无候选文档，返回空结果")
-            return []
-
-        # argpartition 要求 kth < len(arr)，文档数等于 k 时直接全排序
-        if actual_k < len(self._documents):
-            top_indices = np.argpartition(scores, -actual_k)[-actual_k:]
-            # 对 top-k 内部按得分降序排列
-            top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
-        else:
-            top_indices = np.argsort(scores)[::-1]
-
-        results = [self._documents[idx] for idx in top_indices if scores[idx] > -np.inf]
-
-        elapsed = time.time() - start_time
-        filter_info = "(已过滤)" if metadata_filter else ""
-        logger.info(
-            f"BM25 检索完成{filter_info}，查询='{query[:50]}...', "
-            f"召回 {len(results)} 个，耗时: {elapsed:.3f}s"
-        )
-        return results
-
-    # -------------------------------------------------------------------------
-    # 持久化与恢复
-    # -------------------------------------------------------------------------
-
-    def save(self, filepath: str) -> None:
-        """
-        将 BM25 索引持久化到磁盘。
-
-        使用 pickle 协议 4（Python 3.4+ 支持），兼容性良好。
-        生产环境建议：
-            - 将文件存储到对象存储（MinIO / OSS / S3），实现多机共享；
-            - 定期备份（如每天一次），防止单点故障；
-            - 文件命名带上时间戳（如 bm25_index_20260617.pkl），保留历史版本。
-
-        Args:
-            filepath: 存储路径。目录不存在时会自动创建。
-        """
-        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
-        state = BM25IndexState(
-            bm25=self._bm25,
-            documents=self._documents,
-            tokenized_corpus=self._tokenized_corpus,
-            doc_id_key=self._doc_id_key,
-        )
-        with open(filepath, "wb") as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-        logger.info(f"BM25 索引已持久化到: {filepath}")
-
-    @classmethod
-    def load(cls, filepath: str) -> "BM25Indexer":
-        """
-        从磁盘加载 BM25 索引。
-
-        注意：如果 pickle 文件是在不同 Python 版本或不同 rank-bm25 版本下生成的，
-        加载时可能报兼容性错误。生产环境建议在 CI 中做版本锁定（requirements.txt）。
-
-        Args:
-            filepath: 索引文件路径。
-
-        Returns:
-            恢复后的 BM25Indexer 实例。
-        """
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"BM25 索引文件不存在: {filepath}")
-
-        with open(filepath, "rb") as f:
-            state: BM25IndexState = pickle.load(f)
-
-        instance = cls.__new__(cls)
-        instance._bm25 = state.bm25
-        instance._documents = state.documents
-        instance._tokenized_corpus = state.tokenized_corpus
-        instance._doc_id_key = state.doc_id_key
-        instance._tokenizer = _default_tokenizer
-        instance._doc_id_to_index = {
-            _compute_doc_id(doc, state.doc_id_key): idx
-            for idx, doc in enumerate(state.documents)
-        }
-        logger.info(f"BM25 索引已从 {filepath} 加载，文档数: {len(instance._documents)}")
-        return instance
-
-    # -------------------------------------------------------------------------
-    # 从 Qdrant 同步
-    # -------------------------------------------------------------------------
-
-    @classmethod
-    def from_qdrant(
-        cls,
-        client: QdrantClient,
-        collection_name: str,
-        filter_obj: Optional[Filter] = None,
-        tokenizer: Optional[Callable[[str], List[str]]] = None,
-        doc_id_key: str = "chunk_id",
-    ) -> "BM25Indexer":
-        """
-        从 Qdrant 向量库全量拉取数据，构建 BM25 索引。
-
-        适用场景：
-            - 服务首次启动时，从已有向量库同步构建 BM25 索引；
-            - 定期全量重建（如每天凌晨），确保 BM25 与向量库数据一致。
-
-        实现细节：
-            - 使用 Qdrant 的 scroll API 分页拉取全部数据，避免一次性加载导致内存溢出；
-            - 每批次 1000 条，对万级数据通常只需几轮即可拉完。
-
-        Args:
-            client: QdrantClient 实例。
-            collection_name: Qdrant 集合名称。
-            filter_obj: 可选的过滤条件（如只同步 public 文档）。
-            tokenizer: 自定义分词器。
-            doc_id_key: 文档唯一标识字段。
-
-        Returns:
-            构建完成的 BM25Indexer 实例。
-        """
-        logger.info(
-            f"开始从 Qdrant 同步 BM25 索引，集合: {collection_name}, "
-            f"过滤条件: {filter_obj is not None}"
-        )
-        start_time = time.time()
-
-        documents: List[Document] = []
-        offset = None
-        batch_size = 1000
-        total_fetched = 0
-
-        while True:
-            # scroll 是 Qdrant 的游标分页 API，适合全量遍历
-            records, offset = client.scroll(
-                collection_name=collection_name,
-                scroll_filter=filter_obj,
-                limit=batch_size,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,  # BM25 不需要向量，节省带宽和内存
-            )
-
-            if not records:
-                break
-
-            for record in records:
-                payload = record.payload or {}
-                # Qdrant 存储时通常将文本放在 page_content 字段
-                page_content = payload.get("page_content", "")
-                metadata = {k: v for k, v in payload.items() if k != "page_content"}
-                documents.append(Document(page_content=page_content, metadata=metadata))
-
-            total_fetched += len(records)
-            logger.debug(f"已拉取 {total_fetched} 条记录")
-
-            if offset is None:
-                break
-
-        elapsed_fetch = time.time() - start_time
-        logger.info(f"Qdrant 数据拉取完成，共 {len(documents)} 条，耗时: {elapsed_fetch:.3f}s")
-
-        instance = cls(
-            documents=documents,
-            tokenizer=tokenizer,
-            doc_id_key=doc_id_key,
-        )
-        return instance
-
-    # -------------------------------------------------------------------------
-    # 属性
-    # -------------------------------------------------------------------------
-
-    @property
-    def document_count(self) -> int:
-        """当前索引中的文档数量。"""
-        return len(self._documents)
-
-
-# =============================================================================
 # Cross-Encoder 重排序器
 # =============================================================================
 
@@ -493,11 +93,11 @@ class CrossEncoderReranker:
     基于 Cross-Encoder 的重排序器（使用 sentence-transformers）。
 
     设计目标：
-        在 BM25 + 向量检索完成初筛后，使用精度更高的 Cross-Encoder 模型
+        在 稀疏 + 稠密 混合检索完成初筛后，使用精度更高的 Cross-Encoder 模型
         对候选文档进行精细重排，显著提升 Top-K 结果的相关性。
 
     为什么需要重排序？
-        - BM25 和向量检索都是"双塔"架构：查询和文档分别编码，相似度计算
+        - 稀疏向量和稠密向量都是"双塔"架构：查询和文档分别编码，相似度计算
           发生在向量空间，会损失细粒度交互信息；
         - Cross-Encoder 将查询和文档拼接后一起输入 Transformer，通过
           self-attention 捕捉词级别交互，相关性判断更精准；
@@ -651,7 +251,7 @@ class HybridRetriever:
     企业级混合检索器。
 
     工作流程：
-        1. 【并行召回】同时执行 BM25 关键词检索和向量语义检索；
+        1. 【并行召回】同时执行 Qdrant 稀疏向量（text-embedding-v4）检索和稠密向量语义检索；
         2. 【RRF 融合】将两路结果按排名位置融合为一个统一排序；
         3. 【去重截断】去除重复文档，截取 top_k 返回。
 
@@ -664,79 +264,116 @@ class HybridRetriever:
         其中 k 为平滑常数（默认 60）。
 
         为什么 RRF 比直接加权求和更好？
-            - 不同检索方式的分数尺度完全不同（BM25 可能是 10~30，向量相似度是 0~1），
+            - 不同检索方式的分数尺度完全不同（稀疏向量与稠密向量相似度范围不同），
               直接加权相当于让分数尺度大的一路主导结果；
             - RRF 只关心"排名第几"，天然消除了分数尺度的差异；
             - 实现简单，无需训练，零超参（k=60 是论文通用值）。
 
     适用场景：
-        - 用户查询中包含明确的关键词（如"退款政策"、"2026年预算"），BM25 能精准命中；
-        - 用户使用口语化、近义词表达（如"怎么退钱"、"今年的花费计划"），向量检索能捕捉语义；
+        - 用户查询中包含明确的关键词（如"退款政策"、"2026年预算"），稀疏向量能精准命中；
+        - 用户使用口语化、近义词表达（如"怎么退钱"、"今年的花费计划"），稠密向量能捕捉语义；
         - 混合检索在绝大多数真实场景下 Recall@K 显著优于单路检索。
     """
 
     def __init__(
         self,
         vectorstore: QdrantVectorStore,
-        bm25_indexer: Optional[BM25Indexer] = None,
         rrf_k: int = DEFAULT_RRF_K,
-        bm25_weight: float = 1.0,
+        sparse_weight: float = 1.0,
         vector_weight: float = 1.0,
         reranker: Optional[CrossEncoderReranker] = None,
         rerank_top_k: Optional[int] = None,
+        embedder: Optional[Any] = None,
     ):
         """
         初始化混合检索器。
 
         Args:
-            vectorstore: LangChain 的 QdrantVectorStore 实例，负责语义检索。
-            bm25_indexer: BM25Indexer 实例，负责关键词检索。为 None 时需要在
-                          首次检索前通过 from_qdrant 或 set_indexer 设置。
+            vectorstore: LangChain 的 QdrantVectorStore 实例，负责稠密向量语义检索，
+                         其内部的 QdrantClient 同时承担稀疏向量检索。
             rrf_k: RRF 平滑常数，默认 60。
-            bm25_weight: BM25 路得分的权重乘数（默认 1.0）。
+            sparse_weight: 稀疏路得分的权重乘数（默认 1.0）。
                          如果你发现业务中关键词匹配更重要，可提高到 1.2~1.5；
                          如果语义理解更重要，可降低到 0.8。
-            vector_weight: 向量路得分的权重乘数（默认 1.0）。与 bm25_weight 配合使用。
+            vector_weight: 稠密路得分的权重乘数（默认 1.0）。与 sparse_weight 配合使用。
             reranker: Cross-Encoder 重排序器实例。为 None 时不启用重排序。
             rerank_top_k: 送入重排序器的候选文档数量。
                           默认为 None（取最终 top_k 的 5 倍，或至少 50）。
+            embedder: 查询稀疏向量编码器（需提供 embed_query_with_sparse 方法）。
+                      为 None 时从 vectorstore.embeddings 兜底获取。
         """
         self._vectorstore: QdrantVectorStore = vectorstore
-        self._bm25_indexer: Optional[BM25Indexer] = bm25_indexer
         self._rrf_k: int = rrf_k
-        self._bm25_weight: float = bm25_weight
+        self._sparse_weight: float = sparse_weight
         self._vector_weight: float = vector_weight
         self._reranker: Optional[CrossEncoderReranker] = reranker
         self._rerank_top_k: Optional[int] = rerank_top_k
-
-    # -------------------------------------------------------------------------
-    # 索引管理
-    # -------------------------------------------------------------------------
-
-    def set_bm25_indexer(self, indexer: BM25Indexer) -> None:
-        """设置或更换 BM25 索引器。"""
-        self._bm25_indexer = indexer
-
-    def sync_bm25_from_qdrant(
-        self,
-        client: QdrantClient,
-        collection_name: str,
-        filter_obj: Optional[Filter] = None,
-    ) -> None:
-        """
-        从 Qdrant 全量同步数据并重建 BM25 索引。
-
-        建议在以下时机调用：
-            - 服务启动时（若本地无缓存索引）；
-            - 批量导入文档后；
-            - 定时任务（如每天凌晨 3 点）。
-        """
-        indexer =  BM25Indexer.from_qdrant(
-            client=client,
-            collection_name=collection_name,
-            filter_obj=filter_obj,
+        self._embedder: Optional[Any] = embedder or getattr(
+            getattr(vectorstore, "embeddings", None), None
         )
-        self.set_bm25_indexer(indexer)
+
+    # -------------------------------------------------------------------------
+    # 稀疏向量（关键词）检索
+    # -------------------------------------------------------------------------
+
+    def _sparse_retrieve(
+        self,
+        query: str,
+        top_k: int = DEFAULT_SPARSE_TOPK,
+        filter_obj: Optional[Filter] = None,
+        precomputed_sparse: Optional[SparseVector] = None,
+    ) -> List[Document]:
+        """
+        使用 Qdrant 稀疏向量执行关键词召回。
+
+        查询稀疏向量由 text-embedding-v4 生成（与写入侧算法一致），
+        交由 Qdrant 原生稀疏索引检索，无需维护任何内存索引。
+
+        Args:
+            query: 用户查询字符串。
+            top_k: 返回文档数量。建议取最终需求 top_k 的 3~5 倍，为 RRF 融合留出候选空间。
+            filter_obj: Qdrant 过滤条件（权限等），与稠密路共用，保证过滤逻辑一致。
+            precomputed_sparse: 预计算的查询稀疏向量（由上层一次性生成，避免重复 API 调用）。
+                                为 None 时通过 embedder 兜底计算。
+
+        Returns:
+            按稀疏向量得分降序排列的 Document 列表。
+        """
+        query_sparse = precomputed_sparse
+        if query_sparse is None:
+            # 兜底：未预计算时由 embedder 一次调用生成查询稀疏向量
+            if self._embedder is None or not hasattr(self._embedder, "embed_query_with_sparse"):
+                logger.warning("无可用稀疏编码器且未提供预计算稀疏向量，跳过稀疏召回")
+                return []
+            _, query_sparse = self._embedder.embed_query_with_sparse(query)
+
+        if not query_sparse.indices:
+            logger.info("稀疏查询为空（无有效 token），跳过稀疏召回")
+            return []
+
+        client: QdrantClient = self._vectorstore.client
+        response = client.query_points(
+            collection_name=self._vectorstore.collection_name,
+            query=query_sparse,
+            using=SPARSE_VECTOR_NAME,
+            query_filter=filter_obj,
+            limit=top_k,
+            with_payload=True,
+        )
+
+        docs = []
+        for point in response.points:
+            payload = point.payload or {}
+            page_content = payload.get("page_content", "")
+            # 与 langchain_qdrant 的 Document 构造保持一致：
+            # payload 除 page_content 外整体作为 metadata（含嵌套 metadata 字段）
+            metadata = {k: v for k, v in payload.items() if k != "page_content"}
+            docs.append(Document(page_content=page_content, metadata=metadata))
+
+        logger.info(
+            f"稀疏向量召回完成，查询='{query[:50]}...', 召回 {len(docs)} 个"
+        )
+        return docs
 
     # -------------------------------------------------------------------------
     # 核心检索接口
@@ -747,11 +384,11 @@ class HybridRetriever:
         self,
         query: str,
         top_k: int = 10,
-        bm25_top_k: int = DEFAULT_BM25_TOPK,
+        sparse_top_k: int = DEFAULT_SPARSE_TOPK,
         vector_top_k: int = DEFAULT_VECTOR_TOPK,
         filter_obj: Optional[Filter] = None,
-        metadata_filter: Optional[Callable[[Document], bool]] = None,
         precomputed_embedding: Optional[List[float]] = None,
+        precomputed_sparse: Optional[SparseVector] = None,
     ) -> List[Document]:
         """
         执行混合检索并返回融合后的结果。
@@ -761,27 +398,18 @@ class HybridRetriever:
         Args:
             query: 用户查询字符串。
             top_k: 最终返回的文档数量。
-            bm25_top_k: BM25 单路召回数量。建议 >= top_k * 3。
-            vector_top_k: 向量检索单路召回数量。建议 >= top_k * 3。
-            filter_obj: Qdrant 过滤条件（权限、状态等），仅传递给向量检索。
-            metadata_filter: BM25 元数据过滤函数，接收 Document 返回 bool。
-                             仅对符合条件的文档执行 BM25 排名，使 BM25 与向量检索
-                             在过滤逻辑上保持一致。
+            sparse_top_k: 稀疏向量单路召回数量。建议 >= top_k * 3。
+            vector_top_k: 稠密向量单路召回数量。建议 >= top_k * 3。
+            filter_obj: Qdrant 过滤条件（权限、状态等），两路共用，
+                        使稀疏与稠密检索在过滤逻辑上保持一致。
             precomputed_embedding: 可选的预计算 query embedding，直接传入可跳过
-                                   向量检索内部的 embedding 计算。
+                                   稠密路内部的 embedding 计算。
+            precomputed_sparse: 可选的预计算 query 稀疏向量（与稠密向量同一模型同一次
+                                调用生成），直接传入可跳过稀疏路的 API 调用。
 
         Returns:
             按 RRF 得分降序排列的 Document 列表，长度 <= top_k。
-
-        Raises:
-            RuntimeError: 当 BM25 索引器未初始化时抛出。
         """
-        if not self._bm25_indexer:
-            raise RuntimeError(
-                "BM25 索引器未初始化。请先调用 sync_bm25_from_qdrant() "
-                "或 set_bm25_indexer() 设置索引。"
-            )
-
         start_time = time.time()
         logger.info(
             f"混合检索开始，查询='{query[:60]}...', top_k={top_k}, "
@@ -789,10 +417,11 @@ class HybridRetriever:
         )
 
         # 步骤 1: 并行执行两路检索
-        # 注：BM25 检索是纯 CPU 计算，向量检索涉及网络 IO。
-        # 若提供了 precomputed_embedding，向量检索跳过内部 embedding 计算。
-        bm25_results = self._bm25_indexer.retrieve(
-            query, top_k=bm25_top_k, metadata_filter=metadata_filter
+        # 注：稀疏路是查询向量生成 + Qdrant 查询，稠密路涉及 embedding 计算与网络 IO。
+        # 若提供了 precomputed_embedding / precomputed_sparse，两路均跳过内部向量生成。
+        sparse_results = self._sparse_retrieve(
+            query, top_k=sparse_top_k, filter_obj=filter_obj,
+            precomputed_sparse=precomputed_sparse,
         )
         if precomputed_embedding is not None:
             vector_results = self._vectorstore.similarity_search_by_vector(
@@ -804,11 +433,11 @@ class HybridRetriever:
             )
 
         logger.info(
-            f"两路召回完成: BM25={len(bm25_results)}, Vector={len(vector_results)}"
+            f"两路召回完成: Sparse={len(sparse_results)}, Vector={len(vector_results)}"
         )
 
         # 步骤 2: RRF 融合
-        fused_results = self._rrf_fusion(bm25_results, vector_results)
+        fused_results = self._rrf_fusion(sparse_results, vector_results)
 
         # 步骤 3: Cross-Encoder 重排序（若启用）
         if self._reranker and fused_results:
@@ -847,7 +476,7 @@ class HybridRetriever:
     @traceable(name="rrf_fusion", tags=["fusion", "rrf"])
     def _rrf_fusion(
         self,
-        bm25_results: List[Document],
+        sparse_results: List[Document],
         vector_results: List[Document],
     ) -> List[Document]:
         """
@@ -859,8 +488,8 @@ class HybridRetriever:
             3. 按得分降序排列，去重后返回。
 
         Args:
-            bm25_results: BM25 检索结果（已按 BM25 得分降序排列）。
-            vector_results: 向量检索结果（已按相似度降序排列）。
+            sparse_results: 稀疏向量检索结果（已按得分降序排列）。
+            vector_results: 稠密向量检索结果（已按相似度降序排列）。
 
         Returns:
             融合后按 RRF 得分降序排列的 Document 列表（已去重）。
@@ -883,11 +512,11 @@ class HybridRetriever:
                 scores[doc_id]["score"] += contribution
                 scores[doc_id]["sources"].add(source_name)
 
-        # 注册 BM25 路
-        if bm25_results:
-            _register(bm25_results, self._bm25_weight, "bm25")
+        # 注册稀疏路
+        if sparse_results:
+            _register(sparse_results, self._sparse_weight, "sparse")
 
-        # 注册向量路
+        # 注册稠密路
         if vector_results:
             _register(vector_results, self._vector_weight, "vector")
 
@@ -917,35 +546,30 @@ class HybridRetriever:
         self,
         query: str,
         top_k: int = 10,
-        bm25_top_k: int = DEFAULT_BM25_TOPK,
+        sparse_top_k: int = DEFAULT_SPARSE_TOPK,
         vector_top_k: int = DEFAULT_VECTOR_TOPK,
         filter_obj: Optional[Filter] = None,
-        metadata_filter: Optional[Callable[[Document], bool]] = None,
         precomputed_embedding: Optional[List[float]] = None,
+        precomputed_sparse: Optional[SparseVector] = None,
     ) -> List[Document]:
         """
         异步版本的混合检索。
 
         与 retrieve 的区别：
-            - BM25 检索放入 asyncio.to_thread 避免阻塞事件循环；
-            - 向量检索仍使用同步 API（LangChain 的 QdrantVectorStore 未提供原生异步接口）。
-            - 支持传入 precomputed_embedding 跳过内部 embedding 计算。
+            - 两路检索均放入 asyncio.to_thread 避免阻塞事件循环；
+            - 支持传入 precomputed_embedding / precomputed_sparse 跳过两路内部的向量生成。
 
         如果你的服务使用 FastAPI + Uvicorn，建议调用此方法而非同步的 retrieve。
         """
         import asyncio
 
-        if not self._bm25_indexer:
-            raise RuntimeError("BM25 索引器未初始化")
-
         start_time = time.time()
         logger.info(f"异步混合检索开始，查询='{query[:60]}...'")
 
-        # BM25 放入线程池执行（避免阻塞主事件循环）
-        bm25_task = asyncio.to_thread(
-            self._bm25_indexer.retrieve, query, bm25_top_k, metadata_filter
+        # 稀疏路与稠密路并发执行（均放入线程池，避免阻塞主事件循环）
+        sparse_task = asyncio.to_thread(
+            self._sparse_retrieve, query, sparse_top_k, filter_obj, precomputed_sparse
         )
-        # 向量检索（若提供了预计算 embedding，跳过内部 embedding 计算）
         if precomputed_embedding is not None:
             vector_task = asyncio.to_thread(
                 self._vectorstore.similarity_search_by_vector,
@@ -962,15 +586,15 @@ class HybridRetriever:
             )
 
         # 并发等待两路结果
-        bm25_results, vector_results = await asyncio.gather(
-            bm25_task, vector_task
+        sparse_results, vector_results = await asyncio.gather(
+            sparse_task, vector_task
         )
 
         logger.info(
-            f"异步两路召回完成: BM25={len(bm25_results)}, Vector={len(vector_results)}"
+            f"异步两路召回完成: Sparse={len(sparse_results)}, Vector={len(vector_results)}"
         )
 
-        fused_results = self._rrf_fusion(bm25_results, vector_results)
+        fused_results = self._rrf_fusion(sparse_results, vector_results)
 
         # Cross-Encoder 重排序（若启用）
         if self._reranker and fused_results:
@@ -990,5 +614,3 @@ class HybridRetriever:
         elapsed = time.time() - start_time
         logger.info(f"异步混合检索完成，返回 {len(final_results)} 个，耗时: {elapsed:.3f}s")
         return final_results
-
-

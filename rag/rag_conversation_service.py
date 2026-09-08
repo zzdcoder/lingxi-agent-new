@@ -13,14 +13,13 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 import asyncio
 
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import SparseVector
 from sqlalchemy.ext.asyncio import AsyncSession
-from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from rag.hybrid_retriever import HybridRetriever, CrossEncoderReranker
-from rag.bm25_index_manager import BM25IndexManager
 from rag.memory_mysql import MySQLChatMessageHistory, MySQLConversationSummaryMemory
 from rag.semantic_cache import SemanticCache, get_semantic_cache
 from prompt.prompt_storage import (
@@ -30,20 +29,19 @@ from prompt.prompt_storage import (
     CONVERSATION_SUMMARY_PREFIX,
     INCREMENTAL_SUMMARY_PROMPT,
 )
-from embeddings.embedding_deal import DashScopeEmbedding, QDRANT_PATH, QDRANT_COLLECTION
+from embeddings.embedding_deal import DashScopeEmbedding
 from core.config import settings
 from embeddings.embedding_deal import EmbeddingHandler
 
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# 全局混合检索器与 BM25 管理器（由 app/main.py lifespan 在启动时注入）
+# 全局混合检索器（由 app/main.py lifespan 在启动时注入）
 # =============================================================================
 
 _hybrid_retriever: Optional[HybridRetriever] = None
-_bm25_manager: Optional[BM25IndexManager] = None
 """
-全局混合检索器单例与 BM25 索引管理器。
+全局混合检索器单例。
 
 为什么使用模块级全局变量而非依赖注入？
     1. RAGConversationService 通过 get_rag_conversation_service 创建，该函数
@@ -58,7 +56,7 @@ def set_hybrid_retriever(retriever: HybridRetriever) -> None:
     """
     设置全局混合检索器实例。
 
-    由外部模块（如 file_process）在索引重建成功后调用。
+    由外部模块（如 file_process）在知识库变更后调用。
     """
     global _hybrid_retriever
     _hybrid_retriever = retriever
@@ -70,22 +68,17 @@ def get_hybrid_retriever() -> Optional[HybridRetriever]:
     return _hybrid_retriever
 
 
-def get_bm25_manager() -> Optional[BM25IndexManager]:
-    """获取全局 BM25 索引管理器。"""
-    return _bm25_manager
-
-
 def init_hybrid_retriever() -> HybridRetriever:
     """
     惰性初始化全局混合检索器。
 
-    首次调用时创建 HybridRetriever 实例，并通过 BM25IndexManager 加载/重建索引。
+    首次调用时创建 HybridRetriever 实例，并预热 Cross-Encoder 重排序模型。
     后续调用直接返回已有实例，避免重复初始化。
 
     Returns:
         全局 HybridRetriever 实例。
     """
-    global _hybrid_retriever, _bm25_manager
+    global _hybrid_retriever
     if _hybrid_retriever is not None:
         return _hybrid_retriever
 
@@ -105,77 +98,31 @@ def init_hybrid_retriever() -> HybridRetriever:
         reranker._lazy_load()
         logger.info(f"Cross-Encoder 重排序器已启用并加载完成: {settings.reranker_model}")
 
+    # 稀疏向量（text-embedding-v4）与稠密向量均存储于 Qdrant，无需额外的 BM25 索引管理器
     _hybrid_retriever = HybridRetriever(
         vectorstore=vectorstore,
         reranker=reranker,
         rerank_top_k=12,  # 减少送入重排序器的候选数，大幅降低推理耗时
     )
 
-    # ── 创建 BM25 索引管理器并启动加载 ──
-    from embeddings.embedding_deal import get_qdrant_client
-    _bm25_manager = BM25IndexManager(
-        persist_path="./data/bm25_index.pkl",
-        qdrant_client=get_qdrant_client(),
-        collection_name=QDRANT_COLLECTION,
-    )
-
-    # 尝试从磁盘加载缓存
-    indexer = _bm25_manager.load_sync()
-    if indexer:
-        _hybrid_retriever.set_bm25_indexer(indexer)
-    else:
-        # 缓存不存在或损坏，从 Qdrant 全量重建
-        indexer = _bm25_manager.build_sync()
-        if indexer:
-            _hybrid_retriever.set_bm25_indexer(indexer)
-        else:
-            logger.warning(
-                "BM25 索引初始化失败，检索将降级为纯向量模式。"
-                "请检查 Qdrant 连接并调用 rebuild_hybrid_index()"
-            )
-
     logger.info("混合检索器初始化完成")
     return _hybrid_retriever
 
 
-async def rebuild_hybrid_index() -> None:
+async def invalidate_kb_semantic_cache() -> None:
     """
-    从 Qdrant 全量同步数据，重建 BM25 索引并原子替换。
+    知识库变更后清除语义缓存（保证回答一致性）。
 
-    本函数为异步接口，内部通过 BM25IndexManager 实现：
-        - 获取锁防止并发重建
-        - 在线程池中执行重建和持久化（避免阻塞事件循环）
-        - 使用临时文件 + 原子替换保证持久化安全
-        - 重建失败保留旧索引
-
-    应在以下场景调用：
-        - 向量存储完成新文档写入后（file_process 接口）；
-        - 文档被删除或更新后；
-        - 定时全量重建（可选）。
+    稀疏向量与稠密向量在文档写入时已一并落库，检索无需任何索引重建；
+    本函数仅在知识库数据变更后失效语义缓存，避免旧回答被复用。
     """
-    global _hybrid_retriever, _bm25_manager
-
-    # 确保混合检索器壳子已存在
-    if _hybrid_retriever is None:
-        init_hybrid_retriever()
-
-    if _bm25_manager is None:
-        logger.warning("BM25 管理器未初始化，跳过重建")
-        return
-
     try:
-        doc_count = await _bm25_manager.rebuild_and_swap()
-        # 原子替换 HybridRetriever 中的 indexer 引用
-        _hybrid_retriever.set_bm25_indexer(_bm25_manager.indexer)
-        logger.info(f"BM25 索引重建完成，当前文档数: {doc_count}")
-
-        # 知识库变更，全量清除语义缓存（保证回答一致性）
         semantic_cache = get_semantic_cache()
         if semantic_cache:
             cleared = await semantic_cache.invalidate_all()
             logger.info(f"知识库变更，语义缓存已全量清除: {cleared} 条")
     except Exception as e:
-        logger.error(f"BM25 索引重建失败: {e}，保留旧索引")
+        logger.error(f"知识库变更后语义缓存清除失败: {e}")
         raise
 
 
@@ -238,11 +185,12 @@ class RAGConversationService:
             user_input = messages[-1].get("content", "")
             logger.info(f"【用户问题】{user_input}")
 
-            # 2. 预计算 query embedding（只算一次，全链路复用）
+            # 2. 预计算 query embedding（只算一次，全链路复用：稠密 + 稀疏）
             query_embedding = None
+            query_sparse = None
             try:
-                query_embedding = await asyncio.to_thread(
-                    self.embeddings.embed_query, user_input
+                query_embedding, query_sparse = await asyncio.to_thread(
+                    self.embeddings.embed_query_with_sparse, user_input
                 )
             except Exception as e:
                 logger.warning(f"预计算 query embedding 失败: {e}")
@@ -271,6 +219,7 @@ class RAGConversationService:
             context_docs = await self._retrieve_context(
                 user_input, k=4, login_username=login_username,
                 precomputed_embedding=query_embedding,
+                precomputed_sparse=query_sparse,
             )
             context_text = self._format_context(context_docs)
             
@@ -321,20 +270,22 @@ class RAGConversationService:
         k: int = 3,
         login_username: str = None,
         precomputed_embedding: Optional[List[float]] = None,
+        precomputed_sparse: Optional[SparseVector] = None,
     ) -> List[Any]:
         """
         检索相关知识（混合检索模式）。
 
         检索策略优先级：
-            1. 若 hybrid_retriever 已初始化，执行 BM25 + 向量混合检索，
+            1. 若 hybrid_retriever 已初始化，执行稀疏向量 + 稠密向量混合检索，
                经 RRF 融合后按 created_at 倒序排列（新知识优先）；
             2. 若 hybrid_retriever 未初始化（如启动失败或依赖未安装），
-               自动降级为纯向量检索，保证服务可用性。
+               自动降级为纯稠密向量检索，保证服务可用性。
 
         :param query: 查询文本
         :param k: 返回文档数量
         :param login_username: 当前登录用户名，用于权限过滤
         :param precomputed_embedding: 预计算的 query embedding（供缓存复用）
+        :param precomputed_sparse: 预计算的 query 稀疏向量（与稠密向量同一次调用生成）
         :return: 相关文档列表
         """
         if not self.vectorstore:
@@ -372,36 +323,20 @@ class RAGConversationService:
             else:
                 logger.info("未构建过滤条件，执行无过滤检索")
 
-            # 构建与 Qdrant filter_obj 逻辑等价的 BM25 元数据过滤函数
-            # 注意：Qdrant payload 中字段结构为 payload["metadata"]["auth_option"]，
-            # 由 from_qdrant 加载后 doc.metadata 为 {"metadata": {...}}，需展平一层
-            metadata_filter = None
-            if login_username:
-                def _bm25_auth_filter(doc: Document) -> bool:
-                    raw_metadata = doc.metadata or {}
-                    # 兼容嵌套结构（Qdrant payload）和扁平结构
-                    meta = raw_metadata.get("metadata", raw_metadata)
-                    auth = meta.get("auth_option")
-                    if auth == "public":
-                        return True
-                    if auth == "private" and meta.get("create_username") == login_username:
-                        return True
-                    return False
-                metadata_filter = _bm25_auth_filter
-
             # -----------------------------------------------------------------
-            # 步骤 2: 执行检索（混合检索优先，降级到纯向量检索）
+            # 步骤 2: 执行检索（混合检索优先，降级到纯稠密向量检索）
+            # 稀疏路与稠密路共用 filter_obj，保证两路权限过滤逻辑一致
             # -----------------------------------------------------------------
             if self.hybrid_retriever:
                 logger.info(f"【混合检索】查询='{query[:60]}...', top_k={k}")
                 docs = await self.hybrid_retriever.aretrieve(
                     query=query,
                     top_k=k,
-                    bm25_top_k=k * 5,      # 单路召回数取最终需求的 5 倍，为 RRF 预留候选池
+                    sparse_top_k=k * 5,   # 稀疏路召回数取最终需求的 5 倍，为 RRF 预留候选池
                     vector_top_k=k * 5,
                     filter_obj=filter_obj,
-                    metadata_filter=metadata_filter,
                     precomputed_embedding=precomputed_embedding,
+                    precomputed_sparse=precomputed_sparse,
                 )
             else:
                 logger.info(f"【纯向量检索-降级模式】查询='{query[:60]}...', top_k={k}")
@@ -452,6 +387,91 @@ class RAGConversationService:
             context_parts.append(f"[文档{idx}]\n{doc.page_content}")
         
         return "\n\n".join(context_parts)
+
+    # -----------------------------------------------------------------
+    # Agent 图节点复用用的公开薄方法
+    # 仅委托现有私有方法，不改动既有逻辑（供 agent/knowledge_service.py 调用）
+    # -----------------------------------------------------------------
+
+    async def retrieve_context_public(
+        self,
+        query: str,
+        k: int = 4,
+        login_username: Optional[str] = None,
+        precomputed_embedding: Optional[List[float]] = None,
+        precomputed_sparse: Optional[SparseVector] = None,
+    ) -> List[Any]:
+        """
+        Agent 图节点复用：混合检索（委托 _retrieve_context）。
+
+        :param query: 查询文本
+        :param k: 返回文档数量
+        :param login_username: 当前登录用户名，用于权限过滤
+        :param precomputed_embedding: 预计算的 query embedding
+        :param precomputed_sparse: 预计算的 query 稀疏向量
+        :return: 相关文档列表
+        """
+        return await self._retrieve_context(
+            query, k=k, login_username=login_username,
+            precomputed_embedding=precomputed_embedding,
+            precomputed_sparse=precomputed_sparse,
+        )
+
+    def format_context_public(self, docs: List[Any]) -> str:
+        """
+        Agent 图节点复用：格式化检索结果（委托 _format_context）。
+
+        :param docs: 文档列表
+        :return: 格式化后的上下文字符串
+        """
+        return self._format_context(docs)
+
+    async def get_compressed_history_public(
+        self,
+        conversation_id: str,
+    ) -> List[Any]:
+        """
+        Agent 图节点复用：获取压缩后的对话历史（委托 _build_compressed_history）。
+
+        :param conversation_id: 会话 ID
+        :return: 压缩/摘要后的消息列表
+        """
+        mysql_history = MySQLChatMessageHistory(
+            session=self.db,
+            conversation_id=conversation_id,
+        )
+        return await self._build_compressed_history(mysql_history)
+
+    async def save_messages_public(
+        self,
+        conversation_id: str,
+        user_input: str,
+        answer: str,
+    ) -> None:
+        """
+        Agent 图节点复用：将用户输入与回答写入会话历史并提交事务。
+
+        :param conversation_id: 会话 ID
+        :param user_input: 用户输入
+        :param answer: 回答内容
+        """
+        mysql_history = MySQLChatMessageHistory(
+            session=self.db,
+            conversation_id=conversation_id,
+        )
+        await mysql_history.add_message(HumanMessage(content=user_input))
+        await mysql_history.add_message(AIMessage(content=answer))
+        await self.db.commit()
+
+    def build_rag_chain_public(self, model: str, context: str) -> Any:
+        """
+        Agent 图节点复用：构建 RAG 对话链（委托 _build_rag_chain）。
+
+        :param model: 模型名
+        :param context: 检索到的上下文（为空时走无上下文 Prompt）
+        :return: LangChain 对话链
+        """
+        return self._build_rag_chain(model, context)
 
     # -----------------------------------------------------------------
     # 上下文压缩相关方法

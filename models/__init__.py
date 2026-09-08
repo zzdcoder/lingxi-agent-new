@@ -9,8 +9,11 @@ from models.file_model import UploadedFile
 from models.file_schema import AttachmentCreate, AttachmentOut
 from models.user_model import User
 from models.user_schema import UserRegister, UserLogin, UserOut, Token, CaptchaResponse
+from models.task_model import TaskExecution
+from models.approval_model import ApprovalRequest
 
 __all__ = [
     "UploadedFile", "AttachmentCreate", "AttachmentOut",
     "User", "UserRegister", "UserLogin", "UserOut", "Token", "CaptchaResponse",
+    "TaskExecution", "ApprovalRequest",
 ]
