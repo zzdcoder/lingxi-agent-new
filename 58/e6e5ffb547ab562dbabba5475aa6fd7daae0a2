@@ -1,0 +1,35 @@
+.gitignore
+  s_03ead153b668eb::t_8c143c5c59695b 39,42
+core/config.py
+  s_03ead153b668eb::t_a34370b3d2835c 36-38
+  s_03ead153b668eb::t_4eb76947cfe147 50-51
+  s_03ead153b668eb::t_e80c55948316cc 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "58e6e5ffb547ab562dbabba5475aa6fd7daae0a2",
+  "prompts": {},
+  "sessions": {
+    "s_03ead153b668eb": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9e1b261b30b85f91991db4",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": "zhouzd <zhouzd@asiainfo.com>",
+      "custom_attributes": {
+        "session_id": "6a9e1b261b30b85f91991db4",
+        "operation_id": "6a9f804f018e7ee47e5e44d7",
+        "source_scene": "agent",
+        "tool_use_id": "6a9f804f018e7ee47e5e44d7",
+        "external_session_id": "6a9e1b261b30b85f91991db4",
+        "tool_name": "RunCommand",
+        "client_type": "ide",
+        "display_model_name": "DeepSeek-V4-Flash 正式版",
+        "edit_kind": "bash",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
