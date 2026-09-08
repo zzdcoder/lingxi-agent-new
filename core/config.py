@@ -7,6 +7,7 @@
 """
 
 import os
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,9 +33,9 @@ class Settings(BaseSettings):
     # 验证码配置
     captcha_expires_seconds: int = 120
 
-    # 腾讯云 COS 配置
-    cos_secret_id: str = "***REMOVED***"
-    cos_secret_key: str = "***REMOVED***"
+    # 腾讯云 COS 配置（密钥经 .env.dev / 环境变量注入，禁止硬编码）
+    cos_secret_id: str = ""
+    cos_secret_key: str = ""
     cos_region: str = "ap-chengdu"
     cos_bucket: str = "lingxi-agent-persistence-1314815866"
     cos_domain: str = "https://lingxi-agent-persistence-1314815866.cos.ap-chengdu.myqcloud.com"
@@ -46,7 +47,8 @@ class Settings(BaseSettings):
     file_default_separators: str = "\n\n,\n"  # 默认分隔符
     file_temp_dir: str = "./temp"  # 临时文件目录
 
-    api_key :str ="***REMOVED***"
+    # 通义千问 DashScope API Key（经 .env.dev 的 OPENAI_API_KEY 注入，禁止硬编码）
+    api_key: str = Field(default="", validation_alias="OPENAI_API_KEY")
 
     # Cross-Encoder 重排序配置
     reranker_model: str = "./bge-reranker-base"  # 本地路径
