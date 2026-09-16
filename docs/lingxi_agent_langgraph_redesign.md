@@ -14,7 +14,7 @@
 4. [总体架构设计](#4-总体架构设计)
 5. [核心模块设计](#5-核心模块设计)
 6. [流程图](#6-流程图)
-7. \#7-关键功能实现
+7. [关键功能实现](#7-关键功能实现)
 8. [数据表设计](#8-数据表设计)
 9. [API 设计](#9-api-设计)
 10. [配置项设计](#10-配置项设计)
@@ -208,7 +208,10 @@ lingxi-agent/
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── registry.py                 # 工具注册表（名称/风险等级/审批开关）
-│   │   └── db_tools.py                 # 数据库工具（结构化参数 + 白名单 + 参数化执行）
+│   │   ├── db_tools.py                 # 数据库工具（结构化参数 + 白名单 + 参数化执行）
+│   │   ├── circuit_breaker.py          # 工具熔断器（状态机 + 自动/人工熔断，§7.7）
+│   │   ├── registrar.py                # 启动注册（@tool 扫描 + ToolSpec upsert，§7.8）
+│   │   └── manager.py                  # 运行时绑定（查生效工具 + 超时/熔断包装，§7.9）
 │   ├── approval/
 │   │   ├── __init__.py
 │   │   ├── approval_service.py         # 审批业务（建单/SSE卡片载荷/决策受理/恢复图，幂等状态机）
@@ -218,10 +221,13 @@ lingxi-agent/
 │   ├── task_model.py                   # 新增：任务执行记录表
 │   ├── task_schema.py                  # 新增：任务相关 Schema
 │   ├── approval_model.py               # 新增：审批单表
-│   └── approval_schema.py              # 新增：审批相关 Schema
+│   ├── approval_schema.py              # 新增：审批相关 Schema
+│   ├── tool_model.py                   # 新增：工具注册表（tool_registry，§8.3）
+│   └── tool_schema.py                  # 新增：工具 Schema（列表/状态变更/同步结果）
 ├── api/routes/
 │   ├── agent.py                        # 新增：/api/agent/chat (SSE) 等
-│   └── approval.py                     # 新增：/api/approval/*（决策提交 + 状态查询 + 会话审批列表）
+│   ├── approval.py                     # 新增：/api/approval/*（决策提交 + 状态查询 + 会话审批列表）
+│   └── tools.py                        # 新增：/api/tools/*（工具列表/详情/状态变更，§9.1）
 └── prompt/
     ├── prompt_storage.py               # 扩展：意图识别/任务执行提示词
 ```
@@ -996,6 +1002,98 @@ data: {"event": "done"}
 
 > 前端处理要点：收到 `approval_required` 即在消息流插入审批卡片并进入等待态（此时连接保持，`ping` 心跳保活）；收到 `approval_decided` 翻转卡片状态；随后 `content` 帧为任务执行结果或拒绝说明；`done` 结束本轮流。
 
+### 7.7 企业级工具熔断治理（新增）
+
+> 变更记录：为满足"单工具粒度的故障隔离、减少影响面"，新增工具注册表（§8.3）+ 熔断器（本小节）+ 启动注册（§7.8）+ 运行时绑定（§7.9）四件套。核心代码：`agent/tools/circuit_breaker.py`（熔断器）、`agent/tools/registrar.py`（启动注册）、`agent/tools/manager.py`（运行时绑定）、`api/routes/tools.py`（运维 API）。
+
+#### 7.7.1 目标
+
+当某个工具**持续异常**（连续失败 / 窗口失败率超阈值）时，**只熔断该工具本身**，将其 `tool_registry.status` 置为 `2`（熔断），使任务 Agent 不再绑定/快速失败该工具：
+
+- **减少影响面**：不熔断整个 Agent 或整条链路，仅让"坏工具"退出服务，其余工具与分支不受影响；
+- **快速失败（fail-fast）**：OPEN 期间直接拒绝（抛 `CircuitOpenError`），不再等待超时拖垮请求；
+- **自动恢复**：冷却期后进入半开探测，验证工具恢复后自动回到生效状态（status=1）。
+
+#### 7.7.2 熔断器状态机与触发时机
+
+状态机（`circuit_state` 列，`CLOSED / OPEN / HALF_OPEN`）：
+
+```
+CLOSED（关闭/正常）
+  │ 连续失败 ≥ failure_threshold，或 窗口调用量 ≥ min_calls 且失败率 ≥ failure_ratio
+  ▼
+OPEN（打开/熔断）→ 同步 tool_registry.status = 2
+  │ 冷却期（cooldown_seconds）到期
+  ▼
+HALF_OPEN（半开/探测）
+  │ 放行 ≤ half_open_max_trials 个探测请求
+  ├─ 任一探测成功 → CLOSED（status=1，计数器清零，自动恢复）
+  └─ 任一探测失败 → OPEN（status=2，重新计时冷却期）
+```
+
+**自动熔断触发时机**（CLOSED 下判定 `_should_trip`）：
+
+| 触发条件 | 默认值 | 说明 |
+| ---- | ---- | ---- |
+| 连续失败次数 ≥ `failure_threshold` | 5 | 快速响应：连续 N 次失败立即熔断 |
+| 窗口调用量 ≥ `min_calls` 且失败率 ≥ `failure_ratio` | 10 / 0.5 | 小样本防误熔断：窗口内调用量足够时按失败率判定 |
+
+**熔断影响面与恢复**：
+
+- OPEN 期间：任务节点不再绑定该工具（`load_active_tools` 只查 `status=1`）；已绑定的存量调用经熔断器**快速失败**，`CircuitOpenError`（`ToolException` 子类）经 `handle_tool_error` 转为 ToolMessage 送回 Agent 循环——模型收到"工具暂时不可用"后**换工具或如实告知用户**，而非中断整个任务；
+- 冷却期（默认 60s）到期自动进入 HALF_OPEN，放行最多 `half_open_max_trials`（3）个探测请求（防雪崩），任一成功即自动恢复 status=1；任一失败即重新熔断；
+- 熔断判定与计数**持久化在 tool_registry 表**（跨请求、跨重启可恢复）；进程内维护 TTL=1s 的决策缓存，避免每次调用查库；
+- 只统计**业务异常**（`ToolException` 子类等），超时/参数错误等可控错误不计入熔断计数（避免正常波动误熔断）；`agent_circuit_enabled=false` 时仅统计不熔断。
+
+#### 7.7.3 人工治理（运维操作）
+
+`PATCH /api/tools/{name}/status`（`breaker.manual_transition`），合法流转：
+
+```
+1(生效) → 0(失效)：人工下线（不再绑定）
+0(失效) → 1(生效)：人工恢复
+1(生效) → 2(熔断)：人工熔断（立即打开熔断器，不再依赖失败统计）
+2(熔断) → 1(生效)：人工恢复（关闭熔断器，计数器清零）
+2(熔断) → 0(失效)：熔断后直接下线
+```
+
+非法流转抛 `ValueError`（API 返回 400）；操作后同步失效进程内决策缓存，后续调用立即按新状态判定。**"熔断 → 修改表 status=2"由 `_open_circuit` 自动落库**，人工操作与自动熔断共用同一套状态流转。
+
+#### 7.7.4 双层保护（超时 + 熔断）
+
+每个工具在绑定处统一注入（`agent/tools/manager.py`）：
+
+```
+handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超时抛 DbToolError
+        → breaker.call(db, tool_name, ...)                 # 熔断保护：判定/计数/快速失败
+        → StructuredTool.from_function(handle_tool_error=tool_error_content)  # 异常转 ToolMessage
+```
+
+### 7.8 工具启动注册机制（新增）
+
+> 核心代码：`agent/tools/registrar.py`，在 `app/main.py` lifespan 中 `create_all` 后调用（失败降级不阻塞启动）。
+
+**注册来源（两路合并）**：
+
+1. **@tool 装饰器工具**：`discover_decorated_tools()` 遍历 `agent_tool_scan_packages`（默认 `tools`）及其子模块，以 `isinstance(obj, BaseTool)` 判定（`@tool` 返回 `StructuredTool` 实例），提取名称 / 描述 / 参数 JSON Schema（`args_schema.model_json_schema()`）；结果进程级缓存（`get_decorated_tools`，运行时绑定复用）；
+2. **ToolSpec 注册表**：`agent/tools/registry.py` 中声明的内置工具（`REGISTRY`，db 工具 + `search_knowledge`），参数 Schema 由执行器方法签名推导（`_signature_to_json_schema`，支持 Optional/list/dict/默认值）。
+
+**幂等 upsert**（`sync_tool_registry`，按 `name` 唯一键）：
+
+- **新增工具**：插入，`status=生效(1)`，熔断参数取当前配置快照；
+- **已存在工具**：仅刷新元数据（描述 / 参数 / 分类 / 风险 / 审批开关 / 来源 / 熔断配置快照），**保留 `status / circuit_state / 计数`**——人工下线的 0、熔断中的 2 不被代码热升级重置，运维决策不丢；
+- 代码已移除的工具**不自动删除**（保留审计记录，可人工下线）；
+- 返回 `ToolSyncResult`（扫描/新增/更新/错误统计），供启动日志与观测。
+
+### 7.9 运行时绑定（查询生效工具 bind_tools，新增）
+
+> 核心代码：`agent/tools/manager.py`，接入点：`agent/nodes/task_node.py::_build_task_agent`（改为 `async def` 并 `await bind_active_tools(...)`）。
+
+1. `load_active_tools(db, approval_mode)`：查询 `tool_registry` 表 **`status=1`（生效）** 的工具；非审批模式（checkpointer 不可用）额外剔除 `requires_approval=1` 的写工具；
+2. `bind_active_tools(...)`：按 `source` 列解析运行时执行函数——`executor:<方法名>` 取执行器实例方法（DbToolExecutor / KnowledgeToolExecutor）、`module:...` 取扫描到的 @tool 对象、兜底按注册表 handler 解析；统一注入超时 + 熔断后生成 LangChain Tool 列表；
+3. 注册时未提取到参数 Schema 的工具首次绑定时惰性回填；
+4. **治理闭环**：熔断/下线一个工具 → 表状态置 2/0 → 下次任务 `load_active_tools` 即不再绑定该工具，实现单工具粒度的故障隔离（无需重启、无需改代码）。
+
 ***
 
 ## 8. 数据表设计
@@ -1040,6 +1138,47 @@ data: {"event": "done"}
 > 索引：`idx_appr_instance(instance_code)`（废弃后可不再新建）、`idx_appr_conv(conversation_id, status)`（支撑"按会话查 pending 审批单"卡片重建）。
 > 新表由 `Base.metadata.create_all` 在启动时自动创建（沿用现有机制）。
 
+### 8.3 tool\_registry（工具注册表，新增）
+
+> 企业级工具管理表：集中存储 Agent 全部工具的元数据、运行状态与熔断状态，是"工具生命周期管理"的数据底座（§7.7~§7.9）。核心代码：`models/tool_model.py`（ORM）/ `models/tool_schema.py`（Schema）。
+
+**状态语义（status 列）**：`1=生效`（允许绑定给 Agent）、`0=失效`（人工下线）、`2=熔断`（熔断器打开，自动或人工触发）。
+
+| 字段 | 类型 | 说明 |
+| ---- | ---- | ---- |
+| id | varchar(36) PK | UUID |
+| name | varchar(128) UK | 工具名（Agent 调用名，唯一键） |
+| description | text | 工具能力描述（供 LLM 选择工具） |
+| parameters | JSON | 工具参数 JSON Schema（管理台展示 / 参数级校验） |
+| category | varchar(64) | 工具分类：db / knowledge / search / custom |
+| risk\_level | varchar(16) | 风险等级：read / write |
+| requires\_approval | smallint | 是否触发人工审批：1/0 |
+| status | smallint | **1=生效 0=失效 2=熔断**（索引） |
+| source | varchar(255) | 工具来源：`executor:<方法名>` / `module:<模块>:<属性>`（运行时解析执行函数用） |
+| version | varchar(32) | 工具版本（工具变更时递增） |
+| failure\_threshold | int | 连续失败阈值（默认 5） |
+| failure\_ratio | float | 窗口失败率阈值快照（默认 0.5） |
+| window\_seconds | int | 失败率统计窗口（秒，默认 60） |
+| cooldown\_seconds | int | 熔断冷却期（秒，默认 60） |
+| half\_open\_max\_trials | int | 半开探测最大放行次数（默认 3，防雪崩） |
+| circuit\_state | varchar(16) | 熔断状态：CLOSED / OPEN / HALF\_OPEN |
+| consecutive\_failures | int | 连续失败次数 |
+| total\_calls / success\_calls / fail\_calls | int | 累计调用 / 成功 / 失败次数 |
+| window\_failures / window\_calls | int | 当前窗口失败 / 调用次数 |
+| window\_start\_at | datetime | 当前统计窗口开始时间 |
+| half\_open\_trials | int | 半开已放行探测次数 |
+| circuit\_open\_at | datetime | 熔断打开时间 |
+| circuit\_open\_until | datetime | 熔断到期时间（到期进入半开探测） |
+| last\_error | text | 最近一次失败原因（脱敏） |
+| last\_call\_at / last\_success\_at | datetime | 最近调用 / 成功时间 |
+| avg\_latency\_ms | int | 平均耗时（毫秒，指数平滑 EMA） |
+| remark | varchar(255) | 备注（熔断原因 / 下线原因等，审计） |
+| created\_by | varchar(64) | 创建人（默认 system） |
+| created\_at / updated\_at | datetime | 创建 / 更新时间 |
+
+> 索引：`idx_tool_status(status)`（支撑启动注册与运行时"查生效工具"）、`idx_tool_category(category)`（管理台按分类过滤）。
+> 写入时机：① 启动时由 `registrar.sync_tool_registry` 幂等 upsert；② 运行时由熔断器（`_open_circuit` 置 status=2）与工具管理 API（人工流转）更新。
+
 ***
 
 ## 9. API 设计
@@ -1053,6 +1192,9 @@ data: {"event": "done"}
 | GET  | `/api/approval?conversation_id=xxx`    | 按会话查询审批单列表（刷新后重建审批卡片）         | JWT（仅发起人）   |
 | GET  | `/api/agent/tasks/{task_execution_id}` | 查询任务执行状态与结果（轮询兜底）             | JWT         |
 | GET  | `/api/approval/{approval_id}`          | 查询审批单状态（轮询兜底）                 | JWT         |
+| GET  | `/api/tools`                           | 工具列表（按 status/category/keyword 过滤，管理台） | JWT         |
+| GET  | `/api/tools/{name}`                    | 工具详情（含熔断状态与调用统计）              | JWT         |
+| PATCH | `/api/tools/{name}/status`            | 调整工具状态（1↔0、1→2、2→1、2→0，运维熔断/恢复/下线） | JWT         |
 
 > 变更记录：原 `POST /api/approval/callback`（飞书事件回调，无 JWT）随飞书对接移除而废弃。
 
@@ -1092,6 +1234,17 @@ AGENT_TASK_TIMEOUT_SECONDS=120           # 任务执行超时（非审批模式�
 AGENT_TOOL_TIMEOUT_SECONDS=30            # 单次工具调用总时长上限
 AGENT_LLM_TIMEOUT_SECONDS=60             # 单次 LLM 推理超时
 AGENT_INSERT_REQUIRES_APPROVAL=false     # 插入操作是否审批（默认否）
+
+# ---- 工具注册与熔断治理（§7.7~§7.9，新增） ----
+AGENT_TOOL_SCAN_PACKAGES=tools             # 扫描 @tool 装饰器工具的包（逗号分隔，相对项目根目录）
+TOOL_REGISTRY_SYNC_ON_START=true           # 启动时自动同步工具注册表（失败降级不阻塞启动）
+AGENT_CIRCUIT_ENABLED=true                 # 熔断器总开关（false 时仅统计不熔断）
+AGENT_CIRCUIT_FAILURE_THRESHOLD=5          # 连续失败阈值：连续失败达此值触发熔断（status=2）
+AGENT_CIRCUIT_FAILURE_RATIO=0.5            # 窗口失败率阈值：窗口内失败率超过且达到最小调用量时熔断
+AGENT_CIRCUIT_MIN_CALLS=10                 # 失败率判定所需的最小窗口调用量（防小样本误熔断）
+AGENT_CIRCUIT_WINDOW_SECONDS=60            # 失败率统计窗口（秒）
+AGENT_CIRCUIT_COOLDOWN_SECONDS=60          # 熔断冷却期（秒），到期后进入半开探测
+AGENT_CIRCUIT_HALF_OPEN_MAX_TRIALS=3       # 半开探测最大放行次数（成功即恢复，失败即重新熔断）
 ```
 
 > 变更记录：原 FEISHU_* 五项配置随飞书对接移除而废弃（`core/config.py` 中相应字段与 `agent/approval/feishu_client.py`、`callback.py` 一并清理）。
@@ -1124,6 +1277,12 @@ AGENT_INSERT_REQUIRES_APPROVAL=false     # 插入操作是否审批（默认否�
 | `models/task_model.py` / `task_schema.py`         | 任务表与 Schema          |
 | `models/approval_model.py` / `approval_schema.py` | 审批表与 Schema          |
 | `api/routes/agent.py` / `approval.py`             | 新接口路由                |
+| `models/tool_model.py` / `tool_schema.py`         | 工具注册表（tool_registry）ORM 与 Schema（§8.3，新增） |
+| `agent/tools/circuit_breaker.py`                  | 企业级工具熔断器（状态机 + 自动/人工熔断 + 快速失败，§7.7，新增） |
+| `agent/tools/registrar.py`                        | 启动注册（扫描 @tool 工具 + ToolSpec → 幂等 upsert，§7.8，新增） |
+| `agent/tools/manager.py`                          | 运行时绑定（查询 status=1 生效工具 + 超时/熔断包装，§7.9，新增） |
+| `api/routes/tools.py`                             | 工具管理 API（列表 / 详情 / 状态变更，§9.1，新增） |
+| `scripts/mock_circuit_breaker_test.py`            | 熔断器状态机 mock 测试脚本（CLOSED→OPEN→HALF_OPEN 全流程验证，§7.7，新增） |
 | `docs/lingxi_agent_langgraph_redesign.md`         | 本文档                  |
 
 ### 12.2 修改文件（改动极小，需评审确认）
@@ -1134,6 +1293,10 @@ AGENT_INSERT_REQUIRES_APPROVAL=false     # 插入操作是否审批（默认否�
 | `core/config.py`                  | 新增任务执行配置项（纯新增字段，默认值兜底）；**移除 FEISHU_\* 配置**，新增 `APPROVAL_WAIT_TIMEOUT`                                                                                                                                                 | 无行为影响              |
 | `.env.dev`                        | 移除飞书配置占位                                                                                                                                                                                                             | 仅本地开发              |
 | `app/main.py`                     | lifespan 中初始化 Agent 图（含 MySQL 检查点）；注册 2 个新路由                                                                                                                                                                         | 启动流程扩展，失败降级不影响现有功能 |
+| `app/main.py`（工具治理）           | lifespan 中 `create_all` 后同步工具注册表（`sync_tool_registry`，失败降级不阻塞启动）；注册 `api/routes/tools.py` 路由（§7.8/§9.1） | 启动流程扩展，无行为影响 |
+| `core/config.py`（工具治理）        | 新增 `AGENT_TOOL_SCAN_PACKAGES` / `TOOL_REGISTRY_SYNC_ON_START` / `AGENT_CIRCUIT_*` 系列配置（纯新增字段，默认值兜底，§10） | 无行为影响 |
+| `agent/nodes/task_node.py`（工具治理） | `_build_task_agent` 改为 `async def`，工具绑定由固定注册表改为 `await bind_active_tools(db, ...)`（查询 tool_registry status=1 生效工具，§7.9）；超时/错误处理逻辑迁至 `agent/tools/manager.py` | 工具集由数据库驱动，行为增强 |
+| `models/__init__.py`（工具治理）    | 导出 `ToolRegistry` / `ToolStatus` / `ToolCircuitState` | 无行为影响 |
 | `prompt/prompt_storage.py`        | 新增意图识别/任务执行提示词（纯追加）                                                                                                                                                                                                  | 无                  |
 | `rag/rag_conversation_service.py` | 新增 2\~3 个**公开薄方法**（如 `retrieve_context_public`、`get_compressed_history_public`），内部委托现有私有方法；移除 BM25 索引管理器初始化/重建，`rebuild_hybrid_index` 改为 `invalidate_kb_semantic_cache`（仅失效语义缓存），检索链路预计算稠密+稀疏双向量并全链路传递               | 检索行为不变，仅实现载体变化     |
 | `rag/hybrid_retriever.py`         | 移除内存 `BM25Indexer`/持久化/同步机制，BM25 路改为 Qdrant **稀疏向量**查询（`query_points` + `using="sparse"`，查询侧与写入侧共用 text-embedding-v4 生成的稀疏向量，支持 `precomputed_sparse` 预计算复用）；RRF 双路融合与 Cross-Encoder 重排保留                             | 检索行为不变，依赖更少        |

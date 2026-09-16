@@ -81,6 +81,23 @@ class Settings(BaseSettings):
     agent_tool_timeout_seconds: int = 30           # 单次工具调用总时长上限（秒），统一包裹所有工具
     agent_llm_timeout_seconds: int = 60            # 单次 LLM 推理超时（秒）
 
+    # ============================================================
+    # 工具注册（启动时扫描 @tool 装饰器工具并同步工具注册表，设计文档 §7.8 / §8.3）
+    # ============================================================
+    agent_tool_scan_packages: str = "tools"        # 扫描 @tool 装饰器工具的包（逗号分隔，相对项目根目录）
+    tool_registry_sync_on_start: bool = True       # 启动时是否自动同步工具注册表（失败降级不阻塞启动）
+
+    # ============================================================
+    # 工具熔断器（设计文档 §7.7）
+    # ============================================================
+    agent_circuit_failure_threshold: int = 5       # 连续失败阈值：连续失败达此值触发熔断（status=2）
+    agent_circuit_failure_ratio: float = 0.5       # 时间窗口失败率阈值：窗口内失败率超过且达到最小调用量时熔断
+    agent_circuit_min_calls: int = 10              # 失败率判定所需的最小窗口调用量（防小样本误熔断）
+    agent_circuit_window_seconds: int = 60         # 失败率统计窗口（秒）
+    agent_circuit_cooldown_seconds: int = 60       # 熔断冷却期（秒），到期后进入半开探测
+    agent_circuit_half_open_max_trials: int = 3    # 半开探测最大放行次数（成功即恢复，失败即重新熔断）
+    agent_circuit_enabled: bool = True             # 熔断器总开关（false 时仅统计不熔断）
+
     @property
     def agent_db_allowed_table_list(self) -> list[str]:
         """将逗号分隔的表白名单解析为列表（过滤空项）。"""

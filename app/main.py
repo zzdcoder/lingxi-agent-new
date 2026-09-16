@@ -30,6 +30,7 @@ from api.routes import conversation
 from api.routes import cache as cache_routes
 from api.routes import agent as agent_routes
 from api.routes import approval as approval_routes
+from api.routes import tools as tools_routes
 from models.metadata_model import MetadataDefinition
 from utils.captcha import cleanup_expired_captchas
 
@@ -64,6 +65,17 @@ async def lifespan(app: FastAPI):
             await conn.run_sync(Base.metadata.create_all)
     except Exception as exc:
         logger.warning(f"数据库初始化失败，应用将以降级模式运行: {exc}")
+
+    # 同步工具注册表（启动注册）：扫描 @tool 装饰器工具 + ToolSpec 注册表 → tool_registry 表
+    # 失败不阻塞启动（任务节点绑定工具时降级为无工具可用，见 agent/tools/manager.py）
+    if settings.tool_registry_sync_on_start:
+        try:
+            from agent.tools.registrar import sync_tool_registry
+            async with AsyncSessionLocal() as session:
+                await sync_tool_registry(session)
+            logger.info("工具注册表同步完成")
+        except Exception as e:
+            logger.warning(f"工具注册表同步失败（不阻塞启动）: {e}")
 
     # 初始化混合检索器（启动时预热，含 Cross-Encoder 重排序模型）
     try:
@@ -188,6 +200,7 @@ app.include_router(conversation.router, prefix="/api")
 app.include_router(cache_routes.router, prefix="/api")
 app.include_router(agent_routes.router, prefix="/api")
 app.include_router(approval_routes.router, prefix="/api")
+app.include_router(tools_routes.router, prefix="/api")
 
 
 @app.get("/health", tags=["健康检查"])
