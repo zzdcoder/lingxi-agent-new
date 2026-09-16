@@ -60,25 +60,45 @@ def _build_tools() -> dict[str, ToolSpec]:
         requires_approval=False,
         handler="query_data",
     ))
+    _register(ToolSpec(
+        name="search_knowledge",
+        description=(
+            "检索知识库文档，返回相关文档片段（执行任务需要政策/规则/文档依据时调用）。"
+            "参数 query 为检索问题，k 为返回文档数（1~10，默认 4）"
+        ),
+        risk_level=RiskLevel.READ,
+        requires_approval=False,
+        handler="search_knowledge",
+    ))
 
     # 写工具：insert 审批开关由配置控制，update/delete 强制审批
+    # 二次确认（§5.5.2）：全部写工具必填 user_intent_quote（用户原话片段）
     _register(ToolSpec(
         name="insert_data",
-        description="向指定表插入一条数据，仅限授权表白名单",
+        description=(
+            "向指定表插入一条数据，仅限授权表白名单。"
+            "必须提供 user_intent_quote：用户原话中表达插入/新增意图的原文片段"
+        ),
         risk_level=RiskLevel.WRITE,
         requires_approval=settings.agent_insert_requires_approval,
         handler="insert_data",
     ))
     _register(ToolSpec(
         name="update_data",
-        description="按条件更新指定表的数据，仅限授权表白名单，必须携带过滤条件",
+        description=(
+            "按条件更新指定表的数据，仅限授权表白名单，必须携带过滤条件。"
+            "必须提供 user_intent_quote：用户原话中表达更新/修改意图的原文片段"
+        ),
         risk_level=RiskLevel.WRITE,
         requires_approval=True,
         handler="update_data",
     ))
     _register(ToolSpec(
         name="delete_data",
-        description="按条件删除指定表的数据，仅限授权表白名单，必须携带过滤条件",
+        description=(
+            "按条件删除指定表的数据，仅限授权表白名单，必须携带过滤条件。"
+            "必须提供 user_intent_quote：用户原话中表达删除意图的原文片段"
+        ),
         risk_level=RiskLevel.WRITE,
         requires_approval=True,
         handler="delete_data",

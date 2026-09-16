@@ -1,16 +1,22 @@
 """
 审批服务（执行包装层）
 
-职责（设计文档 §5.6、§7.2）：
+职责（设计文档 §5.6、§7.2、§7.3）：
 1. 解析图执行中断（HITLRequest），落库审批单（approval_request, status=pending）；
-2. 创建飞书审批实例并回填 instance_code（配置缺失优雅降级）；
-3. 审批回调后以 Command(resume=...) 恢复同一 thread 的图执行；
+2. 构造审批卡片载荷（SSE approval_required 事件携带，前台据此渲染审批卡片）；
+3. 前台审批决策（POST /api/approval/{id}/decision）受理后，
+   以 Command(resume=...) 恢复同一 thread 的图执行；
 4. SSE 队列注册表：审批等待期连接存活时，后台恢复任务可向原连接推送结果；
 5. 幂等守卫：审批单状态单向流转（pending→approved/rejected/canceled），
-   重复回调 / 重复恢复被状态机拦截。
+   重复提交决策 / 重复恢复被状态机拦截。
 
-说明：单次中断通常仅包含一个待审批写操作，本实现按单个 action_request
-落库一张审批单（多 action 场景仅处理第一个并告警）。
+多 action 支持（设计文档 §5.6）：
+- 一次 HITL 中断可能包含多个待审批写操作（模型平行 tool calling）；
+- 单次中断落一张审批单，actions 字段保存全部操作（脱敏），
+  approval_type / target_table / tool_params 保存首个 action（卡片头部展示）；
+- 决策为批次级：恢复时 decisions 数量与 actions 数量一一对应，
+  与 LangChain HITL 中间件的数量校验（ValueError）保持一致；
+- 存量单（无 actions）按单元素处理，兼容旧逻辑。
 """
 import asyncio
 import logging
@@ -21,6 +27,7 @@ from langgraph.types import Command
 from sqlalchemy import select, update
 
 from core.config import settings
+from core.database import AsyncSessionLocal
 from models.approval_model import ApprovalRequest
 from models.task_model import TaskExecution
 from agent.streaming import put_content, put_ping
@@ -31,7 +38,7 @@ logger = logging.getLogger(__name__)
 # 审批等待心跳间隔（秒）：防网关/代理超时
 HEARTBEAT_INTERVAL = 15
 # 审批等待超时（秒）：超过后 SSE 结束等待，客户端可经轮询接口获取结果
-APPROVAL_WAIT_TIMEOUT = 7200
+APPROVAL_WAIT_TIMEOUT = settings.approval_wait_timeout
 
 # 工具名 -> 审批类型（approval_type 字段）
 _ACTION_TYPE_MAP = {
@@ -110,26 +117,40 @@ async def save_pending_approval(
     conversation_id: str,
     requester_id: str,
     action_requests: list[dict],
-) -> str:
+) -> ApprovalRequest:
     """
     解析 HITL 中断载荷并落库审批单（pending）。
+
+    单次中断可能含多个待审批写操作（模型平行 tool calling）：全部操作
+    脱敏后存入 actions 字段，approval_type / target_table / tool_params
+    保存首个 action（供卡片头部渲染）；决策数量与 actions 一一对应。
 
     :param db: 数据库会话
     :param conversation_id: 会话 ID（= thread_id）
     :param requester_id: 发起人标识
     :param action_requests: HITLRequest.action_requests
-    :return: 审批单 ID
+    :return: 审批单对象（供卡片载荷构造）
     """
     if not action_requests:
         raise ValueError("中断载荷缺少 action_requests")
     if len(action_requests) > 1:
-        logger.warning(
-            f"单次中断包含 {len(action_requests)} 个待审批操作，当前仅审批第一个"
+        logger.info(
+            f"单次中断包含 {len(action_requests)} 个待审批操作，"
+            f"合并为一张审批单（批次级决策）"
         )
 
-    action = action_requests[0]
-    tool_name = action.get("name", "")
-    args = action.get("args", {}) or {}
+    # 全部操作脱敏归一化：[{approval_type, target_table, tool_params}]
+    actions = [
+        {
+            "approval_type": _ACTION_TYPE_MAP.get(
+                act.get("name", ""), act.get("name", "")
+            ),
+            "target_table": str((act.get("args") or {}).get("table", ""))[:64],
+            "tool_params": _mask_params(act.get("args") or {}),
+        }
+        for act in action_requests
+    ]
+    first = actions[0]
 
     # 审批单关联任务记录（中断前任务节点已创建 status=running 的记录）
     task = await _find_running_task(db, conversation_id)
@@ -138,9 +159,10 @@ async def save_pending_approval(
         task_execution_id=task.id if task else None,
         conversation_id=conversation_id,
         requester_id=requester_id,
-        approval_type=_ACTION_TYPE_MAP.get(tool_name, tool_name),
-        target_table=str(args.get("table", ""))[:64],
-        tool_params=_mask_params(args),
+        approval_type=first["approval_type"],
+        target_table=first["target_table"],
+        tool_params=first["tool_params"],
+        actions=actions,
         status="pending",
     )
     db.add(approval)
@@ -148,100 +170,91 @@ async def save_pending_approval(
     await db.refresh(approval)
     logger.info(
         f"[Approval] 审批单创建: id={approval.id}, "
-        f"type={approval.approval_type}, table={approval.target_table}"
+        f"type={approval.approval_type}, table={approval.target_table}, "
+        f"actions={len(actions)}"
     )
-    return approval.id
+    return approval
 
 
 # =============================================================================
-# 飞书审批实例
+# 审批卡片载荷（前台可视化，设计文档 §7.5）
 # =============================================================================
 
-def _format_params_summary(params: dict) -> str:
-    """构造审批表单参数摘要（脱敏后）。"""
-    parts = []
-    for key, val in params.items():
-        if isinstance(val, dict):
-            parts.append(f"{key}=<{len(val)}项>")
-        elif isinstance(val, list):
-            parts.append(f"{key}=<{len(val)}项>")
-        else:
-            parts.append(f"{key}={val}")
-    return "; ".join(parts) or "-"
-
-
-async def create_feishu_instance(db, approval_id: str, requester_id: str) -> Optional[str]:
+def build_card_payload(approval: ApprovalRequest) -> dict:
     """
-    创建飞书审批实例并回填 instance_code。
+    构造前台审批卡片载荷（SSE approval_required 事件携带）。
 
-    飞书配置缺失或调用失败时返回 None（审批单保持 pending，可经轮询兜底）。
+    tool_params / actions 已在落库时脱敏（_mask_params）；datetime 转字符串，
+    避免 SSE JSON 编码失败。
     """
-    if not settings.feishu_approval_code:
-        logger.warning("[Approval] 飞书审批流未配置，跳过创建审批实例")
-        return None
-
-    approval = await _get_approval(db, approval_id)
-    if approval is None:
-        return None
-
-    try:
-        from agent.approval.feishu_client import FeishuApprovalClient, FeishuApprovalError
-        client = FeishuApprovalClient(settings.feishu_app_id, settings.feishu_app_secret)
-    except FeishuApprovalError as e:
-        logger.warning(f"[Approval] 飞书审批配置缺失: {e}")
-        return None
-
-    form = [
-        {"name": "操作类型", "value": approval.approval_type or "-"},
-        {"name": "目标表", "value": approval.target_table or "-"},
-        {"name": "参数摘要", "value": _format_params_summary(approval.tool_params or {})},
-        {"name": "发起人", "value": requester_id},
-    ]
-    try:
-        instance_code = await asyncio.to_thread(
-            client.create_instance, settings.feishu_approval_code, requester_id, form
-        )
-    except Exception as e:
-        logger.error(f"[Approval] 创建飞书审批实例失败: {e}")
-        return None
-
-    approval.feishu_instance_code = instance_code
-    await db.commit()
-    return instance_code
+    created_at = approval.created_at
+    return {
+        "approval_type": approval.approval_type,
+        "target_table": approval.target_table,
+        "tool_params": approval.tool_params or {},
+        "actions": approval.actions or [],
+        "requester_id": approval.requester_id,
+        "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S") if created_at else None,
+        "status": approval.status,
+    }
 
 
 # =============================================================================
 # 审批恢复
 # =============================================================================
 
-def _build_resume_value(decision: str) -> dict:
-    """构造 HITL 恢复载荷（decisions 与中断 action_requests 按位置一一对应）。"""
-    if decision == "approved":
-        return {"decisions": [{"type": "approve"}]}
-    if decision == "rejected":
-        return {"decisions": [{"type": "reject", "message": "审批人拒绝执行该写操作"}]}
-    # canceled 视为拒绝：写操作不执行
-    return {"decisions": [{"type": "reject", "message": "审批已取消，写操作未执行"}]}
-
-
-async def resume_graph(approval_id: str, decision: str, db) -> None:
+def _build_resume_value(decision: str, reason: str = "", count: int = 1) -> dict:
     """
-    审批回调后恢复图执行（幂等）。
+    构造 HITL 恢复载荷。
 
-    状态机守卫：仅当审批单为 pending 时抢占并流转，重复回调被拦截。
+    LangChain HITL 中间件校验 decisions 数量与中断挂起工具数必须一致
+    （不一致抛 ValueError）；单次中断可能含多个写操作，故按 count 批量生成。
+    """
+    if count < 1:
+        count = 1
+    if decision == "approved":
+        return {"decisions": [{"type": "approve"} for _ in range(count)]}
+    if decision == "rejected":
+        message = reason or "审批人拒绝执行该写操作"
+        return {"decisions": [{"type": "reject", "message": message} for _ in range(count)]}
+    # canceled 视为拒绝：写操作不执行
+    return {
+        "decisions": [
+            {"type": "reject", "message": "审批已取消，写操作未执行"}
+            for _ in range(count)
+        ]
+    }
+
+
+async def resume_graph(
+    approval_id: str,
+    decision: str,
+    db,
+    *,
+    approved_by: str = "",
+    reason: str = "",
+) -> None:
+    """
+    前台审批决策受理后恢复图执行（幂等）。
+
+    状态机守卫：仅当审批单为 pending 时抢占并流转，重复提交被拦截。
 
     :param approval_id: 审批单 ID
     :param decision: approved / rejected / canceled
     :param db: 数据库会话（后台任务独立会话）
+    :param approved_by: 审批人（JWT username）
+    :param reason: 审批意见（可选）
     """
     if decision not in ("approved", "rejected", "canceled"):
         logger.error(f"[Approval] 非法审批决策: {decision}")
         return
 
-    # 1. 原子状态抢占（幂等守卫）
-    claimed = await _claim_approval(db, approval_id, decision)
+    # 1. 原子状态抢占（幂等守卫），并回填审批人/意见（审计）
+    claimed = await _claim_approval(
+        db, approval_id, decision, approved_by=approved_by, reason=reason
+    )
     if not claimed:
-        logger.info(f"[Approval] 审批单 {approval_id} 已被处理，忽略重复回调")
+        logger.info(f"[Approval] 审批单 {approval_id} 已被处理，忽略重复提交")
         return
 
     # 2. 加载审批单
@@ -249,8 +262,21 @@ async def resume_graph(approval_id: str, decision: str, db) -> None:
     if approval is None:
         return
 
-    # 3. 恢复同一 thread 的图执行
+    # 挂起工具数（多 action 批次决策）；存量单无 actions 按 1 个处理
+    action_count = len(approval.actions) if approval.actions else 1
+
+    # 3. 推送审批决策回显（前端翻转卡片状态；连接已断开则跳过）
     queue = get_queue(approval_id)
+    if queue is not None:
+        await put_status(
+            queue,
+            "approval_decided",
+            approval_id=approval_id,
+            decision=decision,
+            approved_by=approved_by,
+        )
+
+    # 4. 恢复同一 thread 的图执行
     config = {
         "configurable": {
             "thread_id": approval.conversation_id,
@@ -260,7 +286,10 @@ async def resume_graph(approval_id: str, decision: str, db) -> None:
     }
     graph = get_graph()
     try:
-        result = await graph.ainvoke(Command(resume=_build_resume_value(decision)), config)
+        result = await graph.ainvoke(
+            Command(resume=_build_resume_value(decision, reason, action_count)),
+            config,
+        )
     except Exception as e:
         logger.exception(f"[Approval] 审批恢复图执行失败: approval_id={approval_id}")
         await _mark_task_error(db, approval, f"审批恢复执行失败：{str(e)[:120]}")
@@ -286,6 +315,39 @@ async def resume_graph(approval_id: str, decision: str, db) -> None:
     logger.info(
         f"[Approval] 审批恢复完成: approval_id={approval_id}, decision={decision}"
     )
+
+
+async def _resume_in_background(
+    approval_id: str,
+    decision: str,
+    approved_by: str,
+    reason: str,
+) -> None:
+    """后台恢复图执行（独立数据库会话，避免与请求会话生命周期冲突）。"""
+    try:
+        async with AsyncSessionLocal() as bg_db:
+            await resume_graph(
+                approval_id, decision, bg_db, approved_by=approved_by, reason=reason
+            )
+    except Exception:
+        logger.exception(f"[Approval] 后台恢复失败: approval_id={approval_id}")
+    finally:
+        # 通知 SSE 等待方：恢复完成（含最终结果推送）
+        set_completed(approval_id)
+
+
+def submit_decision(
+    approval_id: str,
+    decision: str,
+    approved_by: str,
+    reason: str = "",
+) -> None:
+    """
+    受理前台审批决策：以后台任务恢复图执行（幂等由审批单状态机守卫）。
+
+    立即返回，恢复结果经原 SSE 连接推送（断连时前端可轮询兜底）。
+    """
+    spawn_background(_resume_in_background(approval_id, decision, approved_by, reason))
 
 
 # =============================================================================
@@ -351,8 +413,15 @@ async def _get_task(db, task_execution_id: Optional[str]) -> Optional[TaskExecut
     return result.scalars().first()
 
 
-async def _claim_approval(db, approval_id: str, decision: str) -> bool:
-    """原子抢占审批单：仅 pending -> 目标状态，成功返回 True。"""
+async def _claim_approval(
+    db,
+    approval_id: str,
+    decision: str,
+    *,
+    approved_by: str = "",
+    reason: str = "",
+) -> bool:
+    """原子抢占审批单：仅 pending -> 目标状态并回填审计字段，成功返回 True。"""
     target = decision if decision in ("approved", "rejected", "canceled") else "rejected"
     result = await db.execute(
         update(ApprovalRequest)
@@ -360,7 +429,11 @@ async def _claim_approval(db, approval_id: str, decision: str) -> bool:
             ApprovalRequest.id == approval_id,
             ApprovalRequest.status == "pending",
         )
-        .values(status=target)
+        .values(
+            status=target,
+            approved_by=approved_by or None,
+            decision_reason=reason or None,
+        )
     )
     await db.commit()
     return result.rowcount > 0

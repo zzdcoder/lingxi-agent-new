@@ -23,8 +23,6 @@ langgraph-checkpoint==4.2.0
 langgraph-checkpoint-mysql==3.0.0
 # OpenAI 官方 Python SDK（embedding_deal.py 直接使用 OpenAI 客户端）
 openai==3.8.0
-# 飞书开放平台官方 Python SDK（用于审批流对接）
-lark-oapi==1.7.3
 
 # ============================================
 # 2. 文档解析与文本处理

@@ -39,9 +39,9 @@ async def _handle_interrupt(
     """
     处理图执行中的 HITL 审批中断。
 
-    1. 解析 HITLRequest（action_requests），落库审批单（pending）；
-    2. 创建飞书审批实例（配置缺失降级）；
-    3. SSE 推送 approval_required 事件并注册队列（供后台恢复推送结果）。
+    1. 解析 HITLRequest（action_requests），脱敏落库审批单（pending）；
+    2. SSE 推送 approval_required 事件（携带完整审批卡片载荷，前端据此渲染）；
+    3. 注册队列（供后台恢复任务推送决策回显与执行结果）。
 
     :return: 审批单 ID（处理失败返回 None）
     """
@@ -55,19 +55,21 @@ async def _handle_interrupt(
         logger.error("[Agent] 中断载荷缺少 action_requests")
         return None
 
-    approval_id = await approval_service.save_pending_approval(
+    approval = await approval_service.save_pending_approval(
         db,
         conversation_id=conversation_id,
         requester_id=current_user.username,
         action_requests=action_requests,
     )
-    await approval_service.create_feishu_instance(
-        db, approval_id, current_user.username
+    await put_status(
+        queue,
+        "approval_required",
+        approval_id=approval.id,
+        approval=approval_service.build_card_payload(approval),
     )
-    await put_status(queue, "approval_required", approval_id=approval_id)
-    approval_service.register_queue(approval_id, queue)
-    logger.info(f"[Agent] 审批待处理: approval_id={approval_id}")
-    return approval_id
+    approval_service.register_queue(approval.id, queue)
+    logger.info(f"[Agent] 审批待处理: approval_id={approval.id}")
+    return approval.id
 
 
 # ==========================================
@@ -123,9 +125,9 @@ async def agent_chat(
         """后台执行主图，异常兜底推送错误帧，结束推送 sentinel。
 
         审批路径：图执行命中 HITL 中断（写操作）时——
-        1. 落库审批单 + 创建飞书审批实例；
-        2. SSE 推送 approval_required 事件；
-        3. 等待审批恢复完成（心跳保活），结果由后台恢复任务经同一队列推送；
+        1. 脱敏落库审批单；
+        2. SSE 推送 approval_required 事件（含审批卡片载荷）；
+        3. 等待前台审批恢复完成（心跳保活），决策回显与结果由后台恢复任务经同一队列推送；
         4. 结束推送 sentinel。
         """
         approval_id = None

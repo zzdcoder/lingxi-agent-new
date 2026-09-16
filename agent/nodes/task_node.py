@@ -14,6 +14,8 @@
 - 工具参数化执行，白名单由 DbToolExecutor 强制校验；
 - 审计只记录参数摘要与结果摘要，不落完整参数值。
 """
+import asyncio
+import functools
 import logging
 import time
 import uuid
@@ -25,7 +27,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_openai import ChatOpenAI
-from langgraph.errors import GraphInterrupt
+from langgraph.errors import GraphInterrupt, GraphRecursionError
 
 from core.config import settings
 from prompt.prompt_storage import TASK_AGENT_SYSTEM_PROMPT
@@ -33,9 +35,45 @@ from models.task_model import TaskExecution
 from agent.state import AgentState
 from agent.streaming import get_sse_queue, put_content, put_status
 from agent.tools.db_tools import DbToolExecutor, DbToolError
+from agent.tools.knowledge_tool import KnowledgeToolExecutor
 from agent.tools.registry import ToolSpec, get_tool
 
 logger = logging.getLogger(__name__)
+
+# 模型-工具循环的递归上限（langgraph 每执行一个节点计 1 步，模型/工具各占步数）。
+# create_agent 无 max_iterations 参数，超限保护统一走 langgraph 的 recursion_limit
+#（默认 9999，此处收敛为小值），达到上限抛 GraphRecursionError 由节点层转友好错误。
+# 按每轮 1 次模型 + N 个工具估算，100 步约等于 25~50 轮往返，足够正常任务且防死循环。
+AGENT_MAX_RECURSION_LIMIT: int = 100
+
+
+def _tool_error_content(e: Exception) -> str:
+    """
+    工具执行失败的模型可见消息（作为 ToolMessage 送回 Agent 循环）。
+
+    基于 DbToolError 已脱敏（不暴露 SQL/参数值/堆栈）的异常消息，附加修复引导，
+    供模型决策"修正参数重试 / 换工具 / 如实告知用户无法完成"。
+    该函数仅对 ToolException 子类（如 DbToolError）生效。
+    """
+    return f"工具执行失败：{e}。请修正参数后重试；若仍失败，请如实告知用户暂时无法完成该操作。"
+
+
+def _with_tool_timeout(handler, timeout: float):
+    """
+    为工具调用包裹统一超时（单次调用总时长上限）。
+
+    - functools.wraps 保留原 handler 签名，供 StructuredTool.from_function
+      推断参数 schema（否则 wrapper(**kwargs) 会退化 schema，模型无法生成参数）；
+    - 超时抛 DbToolError（ToolException 子类），经 handle_tool_error
+      转为 ToolMessage 送回 Agent 循环（模型可感知超时并应对），而非中断循环。
+    """
+    @functools.wraps(handler)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await asyncio.wait_for(handler(*args, **kwargs), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise DbToolError(f"工具调用超时（>{timeout}s）") from None
+    return wrapped
 
 
 async def task_agent_node(
@@ -69,6 +107,8 @@ async def task_agent_node(
     approval_mode = get_checkpointer() is not None
 
     executor = DbToolExecutor(db)
+    # 知识库检索执行器：username 服务端注入（权限过滤），不暴露给模型
+    kb_executor = KnowledgeToolExecutor(db, username=state.get("username"))
     start = time.perf_counter()
 
     # 1. 任务记录（幂等）：恢复执行时复用中断前创建的 running 记录
@@ -87,13 +127,27 @@ async def task_agent_node(
 
     try:
         # 2. 构建任务 Agent（审批模式绑定全部工具）
-        agent = _build_task_agent(model, executor, approval_mode)
+        agent = _build_task_agent(model, executor, kb_executor, approval_mode)
 
         # 3. 执行任务（恢复执行时从检查点继续，审批决策自动路由）
+        # 注入 recursion_limit 覆盖 create_agent 默认值，防模型-工具死循环
         logger.info(f"[Agent-任务] 开始执行: task_execution_id={task_execution_id}")
-        result = await agent.ainvoke(
-            {"messages": [HumanMessage(content=user_input)]}, config=config
-        )
+        invoke_config = {**config, "recursion_limit": AGENT_MAX_RECURSION_LIMIT}
+        if approval_mode:
+            # 审批模式：不设整体墙钟超时（用户审批可能挂起较久，审批等待超时由
+            # 审批侧 APPROVAL_WAIT_TIMEOUT 语义负责），仍受工具级/LLM 超时与递归上限保护
+            result = await agent.ainvoke(
+                {"messages": [HumanMessage(content=user_input)]}, config=invoke_config
+            )
+        else:
+            # 非审批模式：Agent 循环整体墙钟超时兜底
+            result = await asyncio.wait_for(
+                agent.ainvoke(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    config=invoke_config,
+                ),
+                timeout=settings.agent_task_timeout_seconds,
+            )
         task_answer = _extract_answer(result)
 
         # 4. 推送最终回答到 SSE（任务结果非流式，一次性推送）
@@ -104,25 +158,46 @@ async def task_agent_node(
         await _update_task_record(
             db, task_execution_id, status="completed",
             task_answer=task_answer,
-            tool_calls=executor.tool_calls,
+            tool_calls=_merge_tool_calls(executor, kb_executor),
         )
         logger.info(
             f"[Agent-任务] 完成: task_execution_id={task_execution_id}, "
             f"耗时={int((time.perf_counter() - start) * 1000)}ms, "
-            f"工具调用={len(executor.tool_calls)} 次"
+            f"工具调用={len(_merge_tool_calls(executor, kb_executor))} 次"
         )
         return {
             "task_answer": task_answer,
             "task_execution_id": task_execution_id,
-            "tool_calls": executor.tool_calls,
+            "tool_calls": _merge_tool_calls(executor, kb_executor),
         }
     except GraphInterrupt:
         # 审批中断：持久化已发生的工具调用审计后向上传播（等待审批恢复）
         # 状态保持 running：审批恢复时任务节点重入并复用该记录
         await _update_task_record(
-            db, task_execution_id, status="running", tool_calls=executor.tool_calls
+            db, task_execution_id, status="running",
+            tool_calls=_merge_tool_calls(executor, kb_executor),
         )
         raise
+    except GraphRecursionError:
+        # 模型-工具循环达到 recursion_limit 上限（防死循环硬保护）
+        error_msg = "任务执行超过最大尝试次数，请将请求拆分或简化后重试"
+        if queue is not None:
+            await put_content(queue, error_msg)
+        await _update_task_record(
+            db, task_execution_id, status="failed",
+            error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
+        )
+        return {"task_answer": None, "error": error_msg}
+    except asyncio.TimeoutError:
+        # Agent 循环整体超时（非审批模式兜底）
+        error_msg = f"任务执行超时（>{settings.agent_task_timeout_seconds}s），请稍后重试"
+        if queue is not None:
+            await put_content(queue, error_msg)
+        await _update_task_record(
+            db, task_execution_id, status="failed",
+            error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
+        )
+        return {"task_answer": None, "error": error_msg}
     except Exception as e:
         logger.exception(f"[Agent-任务] 执行失败: {e}")
         error_msg = f"任务执行失败：{str(e)}"
@@ -131,7 +206,7 @@ async def task_agent_node(
             await put_content(queue, error_msg)
         await _update_task_record(
             db, task_execution_id, status="failed",
-            error=error_msg, tool_calls=executor.tool_calls,
+            error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
         )
         return {"task_answer": None, "error": error_msg}
 
@@ -140,7 +215,12 @@ async def task_agent_node(
 # 任务 Agent 构建
 # =============================================================================
 
-def _build_task_agent(model: str, executor: DbToolExecutor, approval_mode: bool):
+def _build_task_agent(
+    model: str,
+    executor: DbToolExecutor,
+    kb_executor: KnowledgeToolExecutor,
+    approval_mode: bool,
+):
     """
     构建任务执行 Agent。
 
@@ -151,9 +231,11 @@ def _build_task_agent(model: str, executor: DbToolExecutor, approval_mode: bool)
         model=model,
         openai_api_key=settings.api_key,
         openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        temperature=0.4
+        temperature=0.4,
+        # 单次 LLM 推理超时（模型挂死不再无限等待）
+        timeout=settings.agent_llm_timeout_seconds,
     )
-    tools = _bind_tools(executor, approval_mode)
+    tools = _bind_tools(executor, kb_executor, approval_mode)
 
     kwargs: dict = {}
     if approval_mode:
@@ -185,11 +267,16 @@ def _interrupt_on_config() -> dict:
     return interrupt_on
 
 
-def _bind_tools(executor: DbToolExecutor, approval_mode: bool) -> List[BaseTool]:
+def _bind_tools(
+    executor: DbToolExecutor,
+    kb_executor: Optional[KnowledgeToolExecutor],
+    approval_mode: bool,
+) -> List[BaseTool]:
     """将注册表中的工具绑定到 executor 实例方法，生成 LangChain Tool 列表。"""
     tools: List[BaseTool] = []
     # 审批模式绑定全部工具；无审批模式仅只读 + insert（insert 默认不审批）
-    spec_names = ["list_tables", "query_data"]
+    # 只读工具含知识库检索（search_knowledge，无审批模式同样可用）
+    spec_names = ["list_tables", "query_data", "search_knowledge"]
     if approval_mode or not settings.agent_insert_requires_approval:
         spec_names.append("insert_data")
     if approval_mode:
@@ -199,15 +286,28 @@ def _bind_tools(executor: DbToolExecutor, approval_mode: bool) -> List[BaseTool]
         spec: Optional[ToolSpec] = get_tool(name)
         if spec is None:
             continue
-        handler = getattr(executor, spec.handler, None)
+        # 双执行器降级查找：先数据库工具，后知识库检索工具
+        handlers = [executor]
+        if kb_executor is not None:
+            handlers.append(kb_executor)
+        handler = next(
+            (getattr(h, spec.handler, None) for h in handlers
+             if getattr(h, spec.handler, None) is not None),
+            None,
+        )
         if handler is None:
             logger.warning(f"[Agent-任务] 工具 {name} 无对应执行方法，跳过")
             continue
         tools.append(
             StructuredTool.from_function(
-                coroutine=handler,
+                coroutine=_with_tool_timeout(
+                    handler, settings.agent_tool_timeout_seconds
+                ),
                 name=spec.name,
                 description=spec.description,
+                # 工具业务异常（ToolException 子类）转 ToolMessage 送回 Agent 循环，
+                # 模型可修正参数重试或换工具，而非中断整个循环
+                handle_tool_error=_tool_error_content,
             )
         )
     return tools
@@ -222,6 +322,21 @@ def _extract_answer(result: Any) -> str:
         if content:
             return content if isinstance(content, str) else str(content)
     return "任务已完成（无文本结果）"
+
+
+def _merge_tool_calls(
+    executor: DbToolExecutor, kb_executor: Optional[KnowledgeToolExecutor]
+) -> list:
+    """
+    合并数据库与知识库两个执行器的审计记录（方案 A：合并取并集）。
+
+    知识库检索不触发审批，因此在审批恢复重入时其调用记录不会重复写入；
+    两个执行器分别记录，最终一次性合并落库。
+    """
+    calls = list(executor.tool_calls or [])
+    if kb_executor is not None:
+        calls.extend(kb_executor.tool_calls or [])
+    return calls
 
 
 # =============================================================================

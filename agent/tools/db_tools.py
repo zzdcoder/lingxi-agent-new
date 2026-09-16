@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 
+from langchain_core.tools import ToolException
+
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -43,9 +45,34 @@ SENSITIVE_COLUMNS = {
     "captcha_text",
 }
 
+# ---------------------------------------------------------
+# 写操作二次确认（设计文档 §5.5.2）
+# 写工具必填 user_intent_quote：模型必须从用户原话中引用
+# 表达了写意图的片段，命中任一意图关键词才允许进入审批流程，
+# 防止模型臆造写操作、误改客户数据。
+# ---------------------------------------------------------
 
-class DbToolError(Exception):
-    """数据库工具执行错误（安全拦截 / 参数非法 / 执行失败）"""
+# 写意图关键词（命中任一即视为具备用户授权迹象，审查宽容）
+WRITE_INTENT_KEYWORDS = (
+    "更新", "修改", "改掉", "改动", "改", "删除", "删掉", "删去", "删",
+    "新增", "插入", "添加", "增加", "写入", "变更", "替换", "调整",
+    "设置", "设为", "改成", "改为", "改为,", "对齐", "纠正", "纠正为",
+    "清空", "清除", "移除", "撤销", "重置", "恢复为", "更新为",
+)
+
+# 用户原话引用的最大长度（超长截断，防注入异常参数）
+_MAX_INTENT_QUOTE_LENGTH = 200
+
+
+class DbToolError(ToolException):
+    """
+    数据库工具执行错误（安全拦截 / 参数非法 / 执行失败）。
+
+    继承 langchain_core 的 ToolException：工具框架层默认只把 ToolException
+    视为"业务可恢复错误"，配合 create_agent 工具绑定的 handle_tool_error
+    可将异常转为 ToolMessage 送回 Agent 循环（模型可自我纠正），
+    而非直接中断整个 Agent 循环。
+    """
 
 
 class DbToolExecutor:
@@ -104,6 +131,31 @@ class DbToolExecutor:
         for key in values:
             DbToolExecutor._assert_column_name(str(key))
         return values
+
+    @classmethod
+    def _assert_intent_quote(cls, quote: str) -> str:
+        """
+        写操作二次确认：校验模型从用户原话中引用的写意图片段。
+
+        缺失/为空直接拒绝；超长截断；未命中写意图关键词视为
+        缺少用户明确授权迹象，拒绝并引导模型反问用户（设计文档 §5.5.2）。
+
+        :param quote: 用户原话中表达该写操作意图的片段
+        :return: 规范化后的 quote（去空白 + 截断）
+        :raises DbToolError: 缺少引用或不具备写意图
+        """
+        if not isinstance(quote, str) or not quote.strip():
+            raise DbToolError(
+                "写操作缺少 user_intent_quote（用户原话中表达该操作意图的片段）。"
+                "请勿直接执行，先向用户确认是否确实要执行此写操作。"
+            )
+        quote = quote.strip()[:_MAX_INTENT_QUOTE_LENGTH]
+        if not any(kw in quote for kw in WRITE_INTENT_KEYWORDS):
+            raise DbToolError(
+                f"user_intent_quote={quote!r} 未包含明确的写操作意图（如更新/修改/删除/新增）。"
+                "请勿直接执行，先与用户核对要执行的具体变更内容。"
+            )
+        return quote
 
     # =========================================================================
     # 执行辅助
@@ -252,11 +304,20 @@ class DbToolExecutor:
     # 写工具
     # =========================================================================
 
-    async def insert_data(self, table: str, values: Dict[str, Any]) -> dict:
-        """插入单条数据。"""
+    async def insert_data(
+        self, table: str, values: Dict[str, Any], user_intent_quote: str
+    ) -> dict:
+        """
+        插入单条数据（写操作二次确认：必须引用用户原话中的插入意图）。
+
+        :param table: 表名（白名单内）
+        :param values: 写入值 {col: value}
+        :param user_intent_quote: 用户原话中表达"插入/新增"意图的片段
+        """
         start = time.perf_counter()
         self._assert_table_allowed(table)
         values = self._validate_values(values)
+        quote = self._assert_intent_quote(user_intent_quote)
 
         cols = ", ".join(f"`{c}`" for c in values)
         placeholders = ", ".join(f":__v{i}__" for i in range(len(values)))
@@ -281,7 +342,7 @@ class DbToolExecutor:
         }
         self._record_call(
             "insert_data",
-            {"table": table, "values": values},
+            {"table": table, "values": values, "user_intent_quote": quote},
             result,
             result["elapsed_ms"],
         )
@@ -291,13 +352,22 @@ class DbToolExecutor:
         self,
         table: str,
         values: Dict[str, Any],
+        user_intent_quote: str,
         filters: Optional[Dict[str, Any]] = None,
     ) -> dict:
-        """按条件更新数据（必须携带过滤条件，防止全表更新）。"""
+        """
+        按条件更新数据（必须携带过滤条件防止全表更新，且二次确认写意图）。
+
+        :param table: 表名（白名单内）
+        :param values: 写入值 {col: value}
+        :param user_intent_quote: 用户原话中表达"更新/修改"意图的片段
+        :param filters: 等值过滤条件 {col: value}，必填
+        """
         start = time.perf_counter()
         self._assert_table_allowed(table)
         values = self._validate_values(values)
         filters = self._validate_filters(filters)
+        quote = self._assert_intent_quote(user_intent_quote)
         if not filters:
             raise DbToolError("update_data 必须携带过滤条件，禁止全表更新")
 
@@ -332,7 +402,7 @@ class DbToolExecutor:
         }
         self._record_call(
             "update_data",
-            {"table": table, "values": values},
+            {"table": table, "values": values, "user_intent_quote": quote},
             result,
             result["elapsed_ms"],
         )
@@ -341,12 +411,20 @@ class DbToolExecutor:
     async def delete_data(
         self,
         table: str,
+        user_intent_quote: str,
         filters: Optional[Dict[str, Any]] = None,
     ) -> dict:
-        """按条件删除数据（必须携带过滤条件，防止全表删除）。"""
+        """
+        按条件删除数据（必须携带过滤条件防止全表删除，且二次确认写意图）。
+
+        :param table: 表名（白名单内）
+        :param user_intent_quote: 用户原话中表达"删除"意图的片段
+        :param filters: 等值过滤条件 {col: value}，必填
+        """
         start = time.perf_counter()
         self._assert_table_allowed(table)
         filters = self._validate_filters(filters)
+        quote = self._assert_intent_quote(user_intent_quote)
         if not filters:
             raise DbToolError("delete_data 必须携带过滤条件，禁止全表删除")
 
@@ -371,7 +449,7 @@ class DbToolExecutor:
         }
         self._record_call(
             "delete_data",
-            {"table": table},
+            {"table": table, "user_intent_quote": quote},
             result,
             result["elapsed_ms"],
         )

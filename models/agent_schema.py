@@ -45,6 +45,8 @@ class ApprovalOut(BaseModel):
     conversation_id: Optional[str] = None
     approval_type: Optional[str] = None
     target_table: Optional[str] = None
+    tool_params: Optional[dict] = None
+    actions: Optional[list] = None
     status: str
     approved_by: Optional[str] = None
-    feishu_instance_code: Optional[str] = None
+    decision_reason: Optional[str] = None

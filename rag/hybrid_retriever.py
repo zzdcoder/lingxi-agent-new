@@ -282,8 +282,7 @@ class HybridRetriever:
         sparse_weight: float = 1.0,
         vector_weight: float = 1.0,
         reranker: Optional[CrossEncoderReranker] = None,
-        rerank_top_k: Optional[int] = None,
-        embedder: Optional[Any] = None,
+        rerank_top_k: Optional[int] = None
     ):
         """
         初始化混合检索器。
@@ -308,9 +307,9 @@ class HybridRetriever:
         self._vector_weight: float = vector_weight
         self._reranker: Optional[CrossEncoderReranker] = reranker
         self._rerank_top_k: Optional[int] = rerank_top_k
-        self._embedder: Optional[Any] = embedder or getattr(
-            getattr(vectorstore, "embeddings", None), None
-        )
+        # self._embedder: Optional[Any] = embedder or getattr(
+        #     getattr(vectorstore, "embeddings", None), None
+        # )
 
     # -------------------------------------------------------------------------
     # 稀疏向量（关键词）检索
@@ -340,16 +339,16 @@ class HybridRetriever:
             按稀疏向量得分降序排列的 Document 列表。
         """
         query_sparse = precomputed_sparse
-        if query_sparse is None:
-            # 兜底：未预计算时由 embedder 一次调用生成查询稀疏向量
-            if self._embedder is None or not hasattr(self._embedder, "embed_query_with_sparse"):
-                logger.warning("无可用稀疏编码器且未提供预计算稀疏向量，跳过稀疏召回")
-                return []
-            _, query_sparse = self._embedder.embed_query_with_sparse(query)
-
-        if not query_sparse.indices:
-            logger.info("稀疏查询为空（无有效 token），跳过稀疏召回")
-            return []
+        # if query_sparse is None:
+        #     # 兜底：未预计算时由 embedder 一次调用生成查询稀疏向量
+        #     if self._embedder is None or not hasattr(self._embedder, "embed_query_with_sparse"):
+        #         logger.warning("无可用稀疏编码器且未提供预计算稀疏向量，跳过稀疏召回")
+        #         return []
+        #     _, query_sparse = self._embedder.embed_query_with_sparse(query)
+        #
+        # if not query_sparse.indices:
+        #     logger.info("稀疏查询为空（无有效 token），跳过稀疏召回")
+        #     return []
 
         client: QdrantClient = self._vectorstore.client
         response = client.query_points(

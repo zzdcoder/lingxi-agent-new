@@ -217,7 +217,7 @@ class RAGConversationService:
 
             # 4. 检索相关知识
             context_docs = await self._retrieve_context(
-                user_input, k=4, login_username=login_username,
+                user_input, k=10, login_username=login_username,
                 precomputed_embedding=query_embedding,
                 precomputed_sparse=query_sparse,
             )

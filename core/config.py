@@ -67,23 +67,19 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # ============================================================
-    # 飞书审批配置（Agent 任务写操作人工审批）
-    # 未配置时相关功能自动降级：写操作拒绝并提示"审批未配置"
+    # 前台审批（Agent 任务写操作人工审批，设计文档 §5.6）
     # ============================================================
-    feishu_app_id: str = ""                        # 飞书应用 App ID
-    feishu_app_secret: str = ""                    # 飞书应用 App Secret
-    feishu_approval_code: str = ""                 # 审批流编码（审批人/角色在飞书后台配置，自动路由）
-    feishu_encrypt_key: str = ""                   # 事件回调 AES 加密密钥
-    feishu_verification_token: str = ""            # 事件回调验签 token
-    feishu_callback_url: str = ""                  # 事件订阅地址（可选，仅用于配置提示）
+    approval_wait_timeout: int = 7200             # 审批等待超时（秒），超时后 SSE 结束等待、轮询兜底
 
     # ============================================================
     # 任务执行（Agent 数据库工具）配置
     # ============================================================
     agent_db_allowed_tables: str = "user,conversation,conversation_message"  # 表白名单，逗号分隔
     agent_query_max_rows: int = 50                 # 单次查询最大返回行数
-    agent_task_timeout_seconds: int = 120          # 任务执行超时（秒）
+    agent_task_timeout_seconds: int = 120          # 任务执行超时（秒），非审批模式下 Agent 循环整体超时
     agent_insert_requires_approval: bool = False   # 插入操作是否触发审批（默认否）
+    agent_tool_timeout_seconds: int = 30           # 单次工具调用总时长上限（秒），统一包裹所有工具
+    agent_llm_timeout_seconds: int = 60            # 单次 LLM 推理超时（秒）
 
     @property
     def agent_db_allowed_table_list(self) -> list[str]:
