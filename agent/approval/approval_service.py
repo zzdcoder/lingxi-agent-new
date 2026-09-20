@@ -30,8 +30,15 @@ from core.config import settings
 from core.database import AsyncSessionLocal
 from models.approval_model import ApprovalRequest
 from models.task_model import TaskExecution
-from agent.streaming import put_content, put_ping
+from agent.streaming import put_content, put_ping, put_status
 from agent.graph_builder import get_graph
+from agent.observability import (
+    K_APPROVAL_PREFIX,
+    get_trace_id,
+    metrics,
+    run_metadata,
+    run_tags,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,10 +175,11 @@ async def save_pending_approval(
     db.add(approval)
     await db.commit()
     await db.refresh(approval)
+    metrics.incr(K_APPROVAL_PREFIX.format("created"))
     logger.info(
         f"[Approval] 审批单创建: id={approval.id}, "
         f"type={approval.approval_type}, table={approval.target_table}, "
-        f"actions={len(actions)}"
+        f"actions={len(actions)}, trace_id={get_trace_id()}"
     )
     return approval
 
@@ -277,19 +285,39 @@ async def resume_graph(
         )
 
     # 4. 恢复同一 thread 的图执行
+    #    阶段 4 加固：恢复路径此前**无任何超时保护**（落库/LLM 挂死会永久挂起后台任务，
+    #    前端只能等审批等待超时），此处补整体超时 + 主图递归上限。
     config = {
         "configurable": {
             "thread_id": approval.conversation_id,
             "sse_queue": queue,
             "db": db,
-        }
+            "trace_id": get_trace_id(),
+        },
+        "recursion_limit": settings.agent_graph_recursion_limit,
+        "metadata": run_metadata(
+            conversation_id=approval.conversation_id,
+            extra={"approval_id": approval_id, "biz_type": "write_approval"},
+        ),
+        "tags": run_tags(),
     }
     graph = get_graph()
     try:
-        result = await graph.ainvoke(
-            Command(resume=_build_resume_value(decision, reason, action_count)),
-            config,
+        result = await asyncio.wait_for(
+            graph.ainvoke(
+                Command(resume=_build_resume_value(decision, reason, action_count)),
+                config,
+            ),
+            timeout=settings.agent_resume_timeout_seconds,
         )
+    except asyncio.TimeoutError:
+        error = f"审批恢复执行超时（>{settings.agent_resume_timeout_seconds}s）"
+        logger.error(f"[Approval] {error}: approval_id={approval_id} trace_id={get_trace_id()}")
+        metrics.incr(K_APPROVAL_PREFIX.format("resume_timeout"))
+        await _mark_task_error(db, approval, error)
+        if queue is not None:
+            await put_content(queue, "审批已处理，但恢复执行超时，请稍后查看任务结果")
+        return
     except Exception as e:
         logger.exception(f"[Approval] 审批恢复图执行失败: approval_id={approval_id}")
         await _mark_task_error(db, approval, f"审批恢复执行失败：{str(e)[:120]}")
@@ -312,8 +340,10 @@ async def resume_graph(
         if queue is not None:
             await put_content(queue, task_answer)
 
+    metrics.incr(K_APPROVAL_PREFIX.format(decision))
     logger.info(
-        f"[Approval] 审批恢复完成: approval_id={approval_id}, decision={decision}"
+        f"[Approval] 审批恢复完成: approval_id={approval_id}, decision={decision}, "
+        f"trace_id={get_trace_id()}"
     )
 
 
@@ -384,17 +414,31 @@ async def wait_for_final(approval_id: str, queue) -> None:
 # =============================================================================
 
 async def _find_running_task(db, conversation_id: str) -> Optional[TaskExecution]:
-    """查找会话最近的 running 状态任务记录。"""
-    result = await db.execute(
-        select(TaskExecution)
-        .where(
-            TaskExecution.conversation_id == conversation_id,
-            TaskExecution.status == "running",
+    """
+    查找会话最近的 running 状态任务记录。
+
+    阶段 4 加固：原实现无异常兜底，DB 抖动会让「落审批单/写审计」整段失败
+    （审批单创建失败 = 写操作无审批凭证）。这里改为失败返回 None 并回滚会话，
+    保证审批单仍能创建（仅丢失任务关联），不影响审批主链路。
+    """
+    try:
+        result = await db.execute(
+            select(TaskExecution)
+            .where(
+                TaskExecution.conversation_id == conversation_id,
+                TaskExecution.status == "running",
+            )
+            .order_by(TaskExecution.created_at.desc())
+            .limit(1)
         )
-        .order_by(TaskExecution.created_at.desc())
-        .limit(1)
-    )
-    return result.scalars().first()
+        return result.scalars().first()
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        logger.warning(f"[Approval] 查询任务记录失败（非致命）: {e}")
+        return None
 
 
 async def _get_approval(db, approval_id: str) -> Optional[ApprovalRequest]:

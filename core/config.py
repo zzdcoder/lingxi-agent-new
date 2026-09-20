@@ -82,13 +82,13 @@ class Settings(BaseSettings):
     agent_llm_timeout_seconds: int = 60            # 单次 LLM 推理超时（秒）
 
     # ============================================================
-    # 工具注册（启动时扫描 @tool 装饰器工具并同步工具注册表，设计文档 §7.8 / §8.3）
+    # 工具注册（启动时扫描 @tool 装饰器工具并同步工具注册表
     # ============================================================
     agent_tool_scan_packages: str = "tools"        # 扫描 @tool 装饰器工具的包（逗号分隔，相对项目根目录）
     tool_registry_sync_on_start: bool = True       # 启动时是否自动同步工具注册表（失败降级不阻塞启动）
 
     # ============================================================
-    # 工具熔断器（设计文档 §7.7）
+    # 工具熔断器
     # ============================================================
     agent_circuit_failure_threshold: int = 5       # 连续失败阈值：连续失败达此值触发熔断（status=2）
     agent_circuit_failure_ratio: float = 0.5       # 时间窗口失败率阈值：窗口内失败率超过且达到最小调用量时熔断
@@ -97,6 +97,42 @@ class Settings(BaseSettings):
     agent_circuit_cooldown_seconds: int = 60       # 熔断冷却期（秒），到期后进入半开探测
     agent_circuit_half_open_max_trials: int = 3    # 半开探测最大放行次数（成功即恢复，失败即重新熔断）
     agent_circuit_enabled: bool = True             # 熔断器总开关（false 时仅统计不熔断）
+    agent_circuit_flush_interval_seconds: float = 1.0  # 熔断计数批量落库间隔（秒）：后台合并写回，降低每调用一次 DB 写
+    agent_probe_enabled: bool = True               # 熔断恢复定时探测总开关（false 时熔断工具只能人工恢复）
+    agent_probe_interval_seconds: int = 300        # 熔断工具扫描探测间隔（秒），默认每 5 分钟一轮
+    agent_probe_timeout_seconds: float = 30.0      # 单个工具探测调用的超时上限（秒）
+    agent_probe_exclude_tools: str = "ask_user"    # 定时探测排除的工具名（逗号分隔）：交互式工具重放会再次触发 interrupt，禁止自动重放
+
+    # ============================================================
+    # 观测与加固（阶段 4，设计文档 §15）
+    # ============================================================
+    trace_id_header: str = "X-Trace-Id"            # 响应头中的链路追踪 ID 字段名
+    agent_metrics_enabled: bool = True             # 进程内指标采集总开关
+    langsmith_tracing: bool = False                # LangSmith 链路追踪开关（需配合 LANGSMITH_API_KEY 环境变量）
+    langsmith_project: str = "lingxi-agent"        # LangSmith 项目名（控制台过滤维度）
+    langsmith_endpoint: str = "https://api.smith.langchain.com"  # LangSmith 服务端点（自建填自托管地址）
+
+    # 超时体系（三层工具/LLM/任务 之外的补全：整体请求 / 汇聚 LLM / 恢复执行）
+    agent_request_timeout_seconds: int = 180       # 单次 /api/agent/chat 主图执行整体超时（秒）
+    agent_merge_timeout_seconds: int = 60          # merge 汇总节点 LLM 调用超时（秒）
+    agent_merge_llm_retries: int = 1               # merge 汇总 LLM 失败重试次数（不含首次）
+    agent_resume_timeout_seconds: int = 300        # 审批/追问恢复图执行的整体超时（秒）
+    agent_graph_recursion_limit: int = 100         # 主图 / 任务 Agent 递归步数上限（防死循环）
+
+    # SSE 背压与丢帧保护（防慢客户端拖垮服务端）
+    agent_sse_queue_maxsize: int = 1000            # SSE 事件队列容量（0 表示无界，不推荐）
+    agent_sse_put_timeout_seconds: float = 2.0     # 队列满时投递的最长等待时间（超时丢弃并记录）
+
+    # ============================================================
+    # 意图识别分层优化（设计文档 §16）
+    # ============================================================
+    intent_gate_enabled: bool = True               # 规则快速通道总开关（关闭后全部走 LLM 分类）
+    intent_slash_enabled: bool = True              # 斜杠命令本地处理总开关（关闭后当普通文本走 LLM）
+    intent_slash_shortcut: bool = True             # 斜杠命令是否短路图执行（False 则仍进图但跳过意图 LLM）
+    intent_trivial_keywords: str = ""              # 寒暄关键词表覆盖（空串表示用 intent_gate 默认表）
+    intent_escalation_model: str = "qwen-plus"     # 低置信度升级重判模型（空串或与主模型相同则跳过）
+    intent_llm_cache_confidence: float = 0.85      # LLM 结果进入进程内缓存的置信度门槛
+    intent_embed_threshold: float = 0.86           # 向量就近判定阈值（低于则回落 LLM）
 
     @property
     def agent_db_allowed_table_list(self) -> list[str]:

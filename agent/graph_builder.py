@@ -9,6 +9,11 @@ intent_router → 条件路由（knowledge / chat / task_agent）→ merge → f
 - merge 节点有多条入边，LangGraph 在所有前驱完成后才执行（barrier 自动汇聚）；
 - task_agent 节点采用惰性注册：任务节点模块（agent/nodes/task_node.py）尚不可用时自动跳过，
   保证阶段 1 主图（知识库/聊天）可独立运行。
+
+**观测与加固（阶段 4，设计文档 §15）**：
+- 全部节点挂载 `agent.observability.node_trace`：记录调用量 / 耗时 / 异常，消除零日志盲区；
+- merge 汇总 LLM 补配超时（agent_merge_timeout_seconds）与有限重试，避免汇聚点挂死拖垮整条链路；
+- finalize 节点将 `final_response` / `rag_answer` 快照回写 task_execution（补齐 §8.1 审计字段）。
 """
 import logging
 from typing import Optional, Union
@@ -19,6 +24,12 @@ from langgraph.graph import StateGraph, START, END
 
 from agent.state import AgentState
 from core.config import settings
+from agent.observability import (
+    K_INTENT_PREFIX,
+    get_trace_id,
+    metrics,
+    node_trace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,31 +68,100 @@ def _import_node_modules() -> dict:
 # 节点实现
 # =============================================================================
 
+@node_trace(NODE_INTENT_ROUTER)
 async def intent_router_node(
     state: AgentState, config: RunnableConfig | None = None
 ) -> dict:
     """
-    意图识别节点：调用 IntentRouter 进行多标签分类。
+    意图识别节点：分层判定（规则门控 → 决策缓存 → 向量就近 → LLM 兜底）。
+
+    §16 优化：规则层命中时**完全不调用 LLM**（斜杠命令、寒暄、数据库强信号、
+    短追问继承），LLM 只负责真正需要语义理解的长尾输入。
 
     :param state: 图状态
     :param config: 运行配置
     :return: 状态增量（intents / intent_reason / intent_confidence）
     """
     from agent.intent_router import IntentRouter
+    from agent.intent_gate import KIND_NONE, KIND_SLASH, gate as _gate
 
     user_input = state["messages"][-1].content
     model = state.get("model", "qwen-turbo")
+
+    # 斜杠命令短路：不进 LLM、不进知识库/任务分支，直接由 chat 分支输出指令说明。
+    # （Hermes 第一层「命令路由」的等价实现；命令名不在内置表内时 gate 返回 NONE。）
+    if settings.intent_gate_enabled and settings.intent_slash_enabled:
+        decision = _gate(user_input, last_intents=state.get("last_intents"))
+        if decision.kind == KIND_SLASH:
+            metrics.incr(f"{K_INTENT_PREFIX}slash")
+            handoff = _slash_handoff(decision.slash_name or "", decision.slash_args or "")
+            logger.info(
+                f"[Agent-意图] 斜杠命令短路 /{decision.slash_name} "
+                f"trace_id={get_trace_id()}"
+            )
+            # 把指令说明写入 state.reason，chat 分支据此作答（见 chat_node 的 slash 分支）
+            return {
+                "intents": ["chat"],
+                "intent_reason": decision.reason,
+                "intent_confidence": 1.0,
+                "slash_command": decision.slash_name,
+                "slash_args": decision.slash_args,
+                "slash_handoff": handoff,
+            }
+        if decision.kind != KIND_NONE:
+            # 规则层其它命中（寒暄/强信号/追问继承）：直接给确定性意图，省掉 LLM
+            metrics.incr(f"{K_INTENT_PREFIX}{decision.rule}")
+            result = IntentRouter._to_result(decision)
+            logger.info(
+                f"[Agent-意图] 规则命中 rule={decision.rule} intents={result.intents} "
+                f"trace_id={get_trace_id()}"
+            )
+            for intent in result.intents:
+                metrics.incr(f"{K_INTENT_PREFIX}{intent}")
+            return {
+                "intents": result.intents,
+                "intent_reason": result.reason,
+                "intent_confidence": result.confidence,
+            }
+
     router = IntentRouter(model=model)
-    result = await router.classify(user_input)
+    result = await router.classify(
+        user_input,
+        query_embedding=state.get("query_embedding"),
+        last_intents=state.get("last_intents"),
+    )
     logger.info(
         f"[Agent-意图] intents={result.intents}, "
-        f"confidence={result.confidence:.2f}, reason={result.reason[:80]}"
+        f"confidence={result.confidence:.2f}, reason={result.reason[:80]} "
+        f"trace_id={get_trace_id()}"
     )
+    # 意图分布观测（多为粗粒度标签，避免高基数）
+    for intent in result.intents:
+        metrics.incr(f"{K_INTENT_PREFIX}{intent}")
     return {
         "intents": result.intents,
         "intent_reason": result.reason,
         "intent_confidence": result.confidence,
     }
+
+
+# 斜杠命令说明表（与 agent/intent_gate.SLASH_COMMANDS 对齐，仅用于回执文案）
+_SLASH_HELP: dict[str, str] = {
+    "clear": "「清空上下文」请使用前台按钮或 `/api/conversations` 接口，本服务不在服务端清除会话数据。",
+    "new": "「新建会话」请在前台点击「新建对话」，本服务会自动分配新的会话 ID。",
+    "stop": "如需中止当前生成，请直接关闭应答卡片或刷新页面；服务端会随连接断开释放资源。",
+    "help": "可用指令：`/help`、`/status`、`/clear`、`/new`、`/stop`。直接在输入框用自然语言提问也可以。",
+    "status": "服务状态查询请访问 `GET /health?detailed=true`；运行指标请访问 `GET /api/agent/metrics`。",
+}
+
+
+def _slash_handoff(name: str, args: str) -> str:
+    """生成斜杠命令的本地回执（免 LLM，保证指令类输入零延迟）。"""
+    tip = _SLASH_HELP.get(name)
+    if tip:
+        return tip
+    return f"暂不支持的指令 `/{name}`。{_SLASH_HELP['help']}"
+
 
 
 def route_by_intents(state: AgentState) -> Union[str, list[str]]:
@@ -101,13 +181,19 @@ def route_by_intents(state: AgentState) -> Union[str, list[str]]:
     if intents == {"task", "knowledge_base"}:
         # 并行分支：task_agent 未注册时退化为仅知识库
         if _is_node_registered(NODE_TASK_AGENT):
-            return [NODE_KNOWLEDGE, NODE_TASK_AGENT]
-        return NODE_KNOWLEDGE
+            target = [NODE_KNOWLEDGE, NODE_TASK_AGENT]
+        else:
+            target = NODE_KNOWLEDGE
+        logger.info(f"[Agent-路由] {sorted(intents)} -> {target} trace_id={get_trace_id()}")
+        return target
     if "task" in intents:
-        return NODE_TASK_AGENT if _is_node_registered(NODE_TASK_AGENT) else NODE_CHAT
-    if "knowledge_base" in intents:
-        return NODE_KNOWLEDGE
-    return NODE_CHAT
+        target = NODE_TASK_AGENT if _is_node_registered(NODE_TASK_AGENT) else NODE_CHAT
+    elif "knowledge_base" in intents:
+        target = NODE_KNOWLEDGE
+    else:
+        target = NODE_CHAT
+    logger.info(f"[Agent-路由] {sorted(intents)} -> {target} trace_id={get_trace_id()}")
+    return target
 
 
 _registered_nodes: set = set()
@@ -123,6 +209,7 @@ def _is_node_registered(name: str) -> bool:
     return name in _registered_nodes
 
 
+@node_trace(NODE_MERGE)
 async def merge_node(
     state: AgentState, config: RunnableConfig | None = None
 ) -> dict:
@@ -148,29 +235,51 @@ async def merge_node(
     if rag and task:
         from langchain_core.prompts import ChatPromptTemplate
         from langchain_openai import ChatOpenAI
-        from core.config import settings
         from prompt.prompt_storage import MERGE_ANSWERS_PROMPT
 
-        try:
-            llm = ChatOpenAI(
-                model=state.get("model", "qwen-turbo"),
-                openai_api_key=settings.api_key,
-                openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                temperature=0.3,
-            )
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", MERGE_ANSWERS_PROMPT),
-                ("human", "用户问题：{question}\n知识库结论：{rag}\n任务执行结果：{task}"),
-            ])
-            question = state["messages"][-1].content
-            resp = await (prompt | llm).ainvoke({
-                "question": question, "rag": rag, "task": task,
-            })
-            return {"final_response": resp.content}
-        except Exception as e:
-            logger.warning(f"[Agent-汇总] LLM 合并失败，回退拼接: {e}")
-            return {"final_response": f"{rag}\n\n{task}"}
+        question = state["messages"][-1].content
+        # 超时 + 有限重试：汇聚点为 DAG 必经之路，挂死会拖垮整条链路，
+        # 期间 LLM 抖动（偶发超时/5xx）以重试自愈，重试耗尽才降级为字符串拼接。
+        attempts = max(0, settings.agent_merge_llm_retries) + 1
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                llm = ChatOpenAI(
+                    model=state.get("model", "qwen-turbo"),
+                    openai_api_key=settings.api_key,
+                    openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    temperature=0.3,
+                    timeout=settings.agent_merge_timeout_seconds,
+                )
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", MERGE_ANSWERS_PROMPT),
+                    ("human", "用户问题：{question}\n知识库结论：{rag}\n任务执行结果：{task}"),
+                ])
+                resp = await (prompt | llm).ainvoke({
+                    "question": question, "rag": rag, "task": task,
+                })
+                logger.info(
+                    f"[Agent-汇总] LLM 合并完成 attempt={attempt} "
+                    f"trace_id={get_trace_id()}"
+                )
+                return {"final_response": resp.content}
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[Agent-汇总] LLM 合并失败 attempt={attempt}/{attempts}: {e} "
+                    f"trace_id={get_trace_id()}"
+                )
+                metrics.incr("agent.merge.llm_retry")
+        logger.warning(
+            f"[Agent-汇总] LLM 合并最终失败，回退拼接: {last_error} "
+            f"trace_id={get_trace_id()}"
+        )
+        return {"final_response": f"{rag}\n\n{task}"}
 
+    logger.info(
+        f"[Agent-汇总] 单分支结果透传: 有知识库={bool(rag)}, 有任务={bool(task)} "
+        f"trace_id={get_trace_id()}"
+    )
     return {"final_response": rag or task or "暂无可用结果"}
 
 
@@ -200,21 +309,81 @@ async def _recover_knowledge_branch(
         return None
 
 
+@node_trace(NODE_FINALIZE)
 async def finalize_node(
     state: AgentState, config: RunnableConfig | None = None
 ) -> dict:
     """
-    收尾节点：确保 final_response 产出（任务审计快照落库由 T2-5 扩展）。
+    收尾节点：保证 final_response 产出，并将结果快照回写任务审计记录。
 
-    - 若 merge 已产出 final_response，直接透传；
-    - 否则（如异常路径）兜底为错误信息。
+    落库内容（设计文档 §8.1）：
+    - `result`：final_response（含 merge 合并润色结果）；
+    - `rag_answer`：知识库分支产出（并行场景快照，供审计/回溯）。
+
+    说明：知识库/聊天单分支路由时不创建任务记录，此处自然跳过，不报错。
     """
+    # 审计快照回写（best-effort：失败仅告警，不影响响应产出）
+    await _persist_final_snapshot(config, state)
+
     final = state.get("final_response")
     if not final:
         error = state.get("error")
         final = f"处理失败：{error}" if error else "暂无可用结果"
+        logger.info(
+            f"[Agent-收尾] 无 final_response，兜底输出 error={state.get('error')} "
+            f"trace_id={get_trace_id()}"
+        )
         return {"final_response": final}
     return {}
+
+
+async def _persist_final_snapshot(
+    config: RunnableConfig | None, state: AgentState
+) -> None:
+    """
+    将最终回答与知识库分支快照写入 task_execution（补齐审计字段）。
+
+    定位策略：优先使用状态中的 task_execution_id；缺失时取该会话最近一条
+    running 记录（任务分支已在其中写 tool_calls / task_answer）。
+    """
+    db = (config or {}).get("configurable", {}).get("db") if config else None
+    if db is None:
+        return
+    conversation_id = state.get("conversation_id")
+    task_id = state.get("task_execution_id")
+    if not conversation_id and not task_id:
+        return
+    try:
+        from sqlalchemy import select
+
+        from models.task_model import TaskExecution
+
+        stmt = select(TaskExecution)
+        if task_id:
+            stmt = stmt.where(TaskExecution.id == task_id)
+        else:
+            stmt = stmt.where(
+                TaskExecution.conversation_id == conversation_id,
+                TaskExecution.status == "running",
+            )
+        result = await db.execute(
+            stmt.order_by(TaskExecution.created_at.desc()).limit(1)
+        )
+        record = result.scalars().first()
+        if record is None:
+            return
+        if state.get("final_response"):
+            record.result = state["final_response"]
+        if state.get("rag_answer"):
+            record.rag_answer = state["rag_answer"]
+        await db.commit()
+        logger.debug(f"[Agent-收尾] 审计快照已回写: task_id={record.id}")
+    except Exception as e:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        logger.warning(f"[Agent-收尾] 审计快照回写失败（非致命）: {e}")
 
 
 # =============================================================================

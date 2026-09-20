@@ -34,7 +34,9 @@ from api.routes import tools as tools_routes
 from models.metadata_model import MetadataDefinition
 from utils.captcha import cleanup_expired_captchas
 
-# 配置全局日志：输出到控制台，级别 INFO，带时间戳和模块名
+# 配置全局日志：输出到控制台，级别 INFO，带时间戳和模块名。
+# 注意：trace_id 字段**不由此处声明**，而是由 observability.install_trace_logging()
+# 在过滤器装配成功后注入（避免观测初始化失败导致全量日志崩溃）。
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -43,6 +45,21 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 load_dotenv(".env.dev")
+
+# 观测初始化（阶段 4）：
+# ① trace_id 注入所有既有 logger；② LangSmith 追踪开关。
+# 必须在任何可能造成请求处理前完成，且不因失败阻塞启动。
+try:
+    from agent.observability import init_tracing, install_trace_logging
+
+    install_trace_logging(level=logging.INFO)
+    init_tracing(
+        settings.langsmith_tracing,
+        project=settings.langsmith_project,
+        endpoint=settings.langsmith_endpoint,
+    )
+except Exception as e:  # 观测自身异常不得阻塞启动
+    print(f"[观测] 初始化失败（降级为无观测模式）: {e}")
 
 # 配置 ChromaDB 日志级别
 logging.getLogger("chromadb").setLevel(logging.INFO)
@@ -119,6 +136,45 @@ async def lifespan(app: FastAPI):
 
     cache_task = asyncio.create_task(cache_cleanup_loop())
 
+    # 启动熔断器计数批量落库后台任务（内存计数合并写回 tool_registry）
+    async def circuit_flush_runner():
+        try:
+            from agent.tools.circuit_breaker import flush_loop
+            await flush_loop(AsyncSessionLocal)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"[熔断器] 后台批量落库任务退出异常: {e}")
+
+    circuit_task = asyncio.create_task(circuit_flush_runner())
+
+    # 启动熔断恢复定时探测（APScheduler）：每 N 秒扫描熔断工具并重放探测恢复。
+    # 独立调度器对象，随 lifespan 启动/关闭；多 worker 部署需额外保证单点（当前单进程）。
+    scheduler = None
+    if settings.agent_probe_enabled:
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            from apscheduler.triggers.interval import IntervalTrigger
+
+            from agent.tools.probe import scan_and_probe
+
+            scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+            scheduler.add_job(
+                scan_and_probe,
+                trigger=IntervalTrigger(seconds=settings.agent_probe_interval_seconds),
+                id="tool_circuit_probe",
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
+            scheduler.start()
+            logger.info(
+                f"熔断恢复定时探测已启动（间隔 {settings.agent_probe_interval_seconds}s）"
+            )
+        except Exception as e:
+            scheduler = None
+            logger.warning(f"熔断恢复定时探测启动失败（熔断工具将只能人工恢复）: {e}")
+
     # 初始化审批检查点（MySQL，失败降级为无审批模式）
     # 必须早于主图预热：主图编译需要携带 checkpointer
     try:
@@ -137,9 +193,25 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # 熔断器退出前冲刷待落库计数，避免最后窗口内计数丢失
+    try:
+        from agent.tools.circuit_breaker import breaker
+        async with AsyncSessionLocal() as session:
+            await breaker.flush(session)
+    except Exception as e:
+        logger.warning(f"[熔断器] 退出冲刷异常: {e}")
+
     # 取消后台任务
     cleanup_task.cancel()
     cache_task.cancel()
+    circuit_task.cancel()
+
+    # 关闭熔断恢复定时探测调度器
+    if scheduler is not None:
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.warning(f"熔断恢复定时探测调度器关闭异常: {e}")
     try:
         await cleanup_task
     except asyncio.CancelledError:
@@ -204,5 +276,27 @@ app.include_router(tools_routes.router, prefix="/api")
 
 
 @app.get("/health", tags=["健康检查"])
-async def health_check():
-    return {"status": "ok"}
+async def health_check(detailed: bool = False):
+    """
+    健康检查。
+
+    :param detailed: 为 true 时返回**依赖级别的详细体检**（阶段 4 观测）：
+        业务库连通性、LangGraph 检查点（决定审批模式是否生效）、主图编译状态、
+        工具注册/熔断分布、混合检索器与语义缓存初始化状态。
+        生产建议由监控系统周期性拉取 `?detailed=true`，对 `status != ok` 告警。
+
+    :return: 健康快照；精简模式保持向后兼容（{"status": "ok"}）
+    """
+    if not detailed:
+        return {"status": "ok"}
+    try:
+        from agent.health import collect_health
+
+        from agent.observability import get_trace_id
+
+        snapshot = await collect_health(AsyncSessionLocal)
+        snapshot["trace_id"] = get_trace_id()
+        return snapshot
+    except Exception as e:
+        logger.warning(f"健康巡检失败: {e}")
+        return {"status": "degraded", "detail": f"健康巡检失败: {str(e)[:200]}"}

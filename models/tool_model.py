@@ -87,6 +87,7 @@ class ToolRegistry(Base):
     circuit_open_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="熔断打开时间")
     circuit_open_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="熔断到期时间（到期进入半开探测）")
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="最近一次失败原因（脱敏）")
+    last_error_args: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True, comment="最近一次系统级失败的工具入参（脱敏，供定时探测重放验证恢复）")
     last_call_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近一次调用时间")
     last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近一次成功时间")
     avg_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="平均耗时（毫秒，指数平滑）")

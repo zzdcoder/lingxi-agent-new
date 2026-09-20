@@ -22,7 +22,7 @@ from typing import Any, List, Optional
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langgraph.errors import GraphInterrupt, GraphRecursionError
@@ -30,11 +30,14 @@ from langgraph.errors import GraphInterrupt, GraphRecursionError
 from core.config import settings
 from prompt.prompt_storage import TASK_AGENT_SYSTEM_PROMPT
 from models.task_model import TaskExecution
+from rag.memory_mysql import MySQLChatMessageHistory
 from agent.state import AgentState
 from agent.streaming import get_sse_queue, put_content, put_status
 from agent.tools.db_tools import DbToolExecutor
 from agent.tools.knowledge_tool import KnowledgeToolExecutor
 from agent.tools.manager import bind_active_tools
+from tools.clarify_tool import ASK_USER_TOOL_NAME
+from agent.observability import get_trace_id, metrics, node_trace
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +45,17 @@ logger = logging.getLogger(__name__)
 # create_agent 无 max_iterations 参数，超限保护统一走 langgraph 的 recursion_limit
 #（默认 9999，此处收敛为小值），达到上限抛 GraphRecursionError 由节点层转友好错误。
 # 按每轮 1 次模型 + N 个工具估算，100 步约等于 25~50 轮往返，足够正常任务且防死循环。
+# 阶段 4：改为配置驱动（agent_graph_recursion_limit），保留该常量作为取不到配置时的兜底。
 AGENT_MAX_RECURSION_LIMIT: int = 100
 
 
+def _recursion_limit() -> int:
+    """读取递归上限（配置优先，非法值回落常量）。"""
+    value = getattr(settings, "agent_graph_recursion_limit", None)
+    return value if isinstance(value, int) and value > 0 else AGENT_MAX_RECURSION_LIMIT
+
+
+@node_trace("task_agent")
 async def task_agent_node(
     state: AgentState, config: RunnableConfig | None = None
 ) -> dict:
@@ -100,8 +111,16 @@ async def task_agent_node(
 
         # 3. 执行任务（恢复执行时从检查点继续，审批决策自动路由）
         # 注入 recursion_limit 覆盖 create_agent 默认值，防模型-工具死循环
-        logger.info(f"[Agent-任务] 开始执行: task_execution_id={task_execution_id}")
-        invoke_config = {**config, "recursion_limit": AGENT_MAX_RECURSION_LIMIT}
+        # 注入 recursion_limit 覆盖 create_agent 默认值，防模型-工具死循环。
+        # 注：config 可能为 None（离线/单测场景），必须兜底，否则 {**None} 抛 TypeError。
+        logger.info(
+            f"[Agent-任务] 开始执行: task_execution_id={task_execution_id}, "
+            f"approval_mode={approval_mode}, trace_id={get_trace_id()}"
+        )
+        invoke_config = {
+            **(config or {}),
+            "recursion_limit": _recursion_limit(),
+        }
         if approval_mode:
             # 审批模式：不设整体墙钟超时（用户审批可能挂起较久，审批等待超时由
             # 审批侧 APPROVAL_WAIT_TIMEOUT 语义负责），仍受工具级/LLM 超时与递归上限保护
@@ -129,15 +148,21 @@ async def task_agent_node(
             task_answer=task_answer,
             tool_calls=_merge_tool_calls(executor, kb_executor),
         )
+        # 6. 对话消息落库（保证重新进入会话时任务轮次不丢失）
+        await _save_conversation_messages(db, conversation_id, user_input, task_answer)
+        tool_calls = _merge_tool_calls(executor, kb_executor)
+        cost_ms = int((time.perf_counter() - start) * 1000)
+        metrics.observe("agent.task.latency_ms", cost_ms)
+        metrics.observe("agent.task.tool_calls", len(tool_calls))
         logger.info(
             f"[Agent-任务] 完成: task_execution_id={task_execution_id}, "
-            f"耗时={int((time.perf_counter() - start) * 1000)}ms, "
-            f"工具调用={len(_merge_tool_calls(executor, kb_executor))} 次"
+            f"耗时={cost_ms}ms, 工具调用={len(tool_calls)} 次, "
+            f"trace_id={get_trace_id()}"
         )
         return {
             "task_answer": task_answer,
             "task_execution_id": task_execution_id,
-            "tool_calls": _merge_tool_calls(executor, kb_executor),
+            "tool_calls": tool_calls,
         }
     except GraphInterrupt:
         # 审批中断：持久化已发生的工具调用审计后向上传播（等待审批恢复）
@@ -156,6 +181,7 @@ async def task_agent_node(
             db, task_execution_id, status="failed",
             error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
         )
+        await _save_conversation_messages(db, conversation_id, user_input, error_msg)
         return {"task_answer": None, "error": error_msg}
     except asyncio.TimeoutError:
         # Agent 循环整体超时（非审批模式兜底）
@@ -166,6 +192,7 @@ async def task_agent_node(
             db, task_execution_id, status="failed",
             error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
         )
+        await _save_conversation_messages(db, conversation_id, user_input, error_msg)
         return {"task_answer": None, "error": error_msg}
     except Exception as e:
         logger.exception(f"[Agent-任务] 执行失败: {e}")
@@ -177,6 +204,7 @@ async def task_agent_node(
             db, task_execution_id, status="failed",
             error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
         )
+        await _save_conversation_messages(db, conversation_id, user_input, error_msg)
         return {"task_answer": None, "error": error_msg}
 
 
@@ -208,6 +236,10 @@ async def _build_task_agent(
         timeout=settings.agent_llm_timeout_seconds,
     )
     tools = await bind_active_tools(db, executor, kb_executor, approval_mode)
+    if not approval_mode:
+        # 追问工具依赖 langgraph interrupt（需 checkpointer），非审批模式不可用，
+        # 剔除避免模型绑定后调用报错（退化回"如实告知用户信息不足"）
+        tools = [t for t in tools if t.name != ASK_USER_TOOL_NAME]
 
     kwargs: dict = {}
     if approval_mode:
@@ -335,3 +367,32 @@ async def _update_task_record(
     except Exception as e:
         await db.rollback()
         logger.warning(f"[Agent-任务] 更新审计记录失败（非致命）: {e}")
+
+
+async def _save_conversation_messages(
+    db, conversation_id: str, user_input: str, answer: str
+) -> None:
+    """任务轮次的对话消息落库（best-effort，失败不阻塞主流程）。
+
+    与聊天/知识库节点一致写入 conversation_message，保证重新进入会话时
+    任务轮次不丢失；审批中断路径不调用（恢复完成后由终结路径统一写入一次，
+    避免中断/恢复重入导致重复记录）。
+
+    :param db: 数据库会话
+    :param conversation_id: 会话 ID（=thread_id）
+    :param user_input: 用户提问
+    :param answer: Agent 最终回答（成功为 task_answer，失败为错误提示）
+    """
+    if not conversation_id:
+        return
+    try:
+        mysql_history = MySQLChatMessageHistory(
+            session=db, conversation_id=conversation_id
+        )
+        await mysql_history.add_message(HumanMessage(content=user_input))
+        if answer:
+            await mysql_history.add_message(AIMessage(content=answer))
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.warning(f"[Agent-任务] 对话消息落库失败（非致命）: {e}")

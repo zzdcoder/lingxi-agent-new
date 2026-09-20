@@ -17,6 +17,7 @@
 import asyncio
 import functools
 import logging
+import time
 from typing import Any, Callable, List, Optional
 
 from langchain_core.tools import BaseTool, StructuredTool
@@ -24,8 +25,9 @@ from langchain_core.tools import BaseTool, StructuredTool
 from core.config import settings
 from models.tool_model import ToolRegistry, ToolStatus
 from agent.tools.circuit_breaker import breaker
-from agent.tools.db_tools import DbToolError
+from agent.tools.db_tools import DbToolSystemError
 from agent.tools.registrar import get_decorated_tools
+from agent.observability import K_TOOL_PREFIX, metrics
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,7 @@ def with_tool_timeout(handler: Callable, timeout: float):
 
     - functools.wraps 保留原 handler 签名，供 StructuredTool.from_function
       推断参数 schema（否则 wrapper(**kwargs) 会退化 schema，模型无法生成参数）；
-    - 超时抛 DbToolError（ToolException 子类），经 handle_tool_error 转为
+    - 超时抛 DbToolSystemError（ToolException 子类，系统级故障触发熔断），经 handle_tool_error 转为
       ToolMessage 送回 Agent 循环（模型可感知超时并应对），而非中断循环。
     """
     @functools.wraps(handler)
@@ -55,7 +57,7 @@ def with_tool_timeout(handler: Callable, timeout: float):
         try:
             return await asyncio.wait_for(handler(*args, **kwargs), timeout=timeout)
         except asyncio.TimeoutError:
-            raise DbToolError(f"工具调用超时（>{timeout}s）") from None
+            raise DbToolSystemError(f"工具调用超时（>{timeout}s）") from None
     return wrapped
 
 
@@ -181,10 +183,27 @@ def _resolve_handler(
 
 
 def _breaker_wrap(db, tool_name: str, handler: Callable):
-    """熔断器包裹：每次调用经 ToolCircuitBreaker 判定/上报。"""
+    """
+    熔断器包裹：每次调用经 ToolCircuitBreaker 判定/上报。
+
+    阶段 4 观测：工具级调用量 / 成功率 / 耗时在此统一埋点——工具是任务链路里
+    最容易出问题的一环（表白名单、超时、熔断、外部依赖），必须可度量。
+    """
     @functools.wraps(handler)
     async def wrapped(*args: Any, **kwargs: Any) -> Any:
-        return await breaker.call(db, tool_name, handler, *args, **kwargs)
+        start = time.perf_counter()
+        try:
+            result = await breaker.call(db, tool_name, handler, *args, **kwargs)
+            metrics.incr(K_TOOL_PREFIX.format(f"{tool_name}.success"))
+            return result
+        except Exception:
+            metrics.incr(K_TOOL_PREFIX.format(f"{tool_name}.failed"))
+            raise
+        finally:
+            cost_ms = (time.perf_counter() - start) * 1000
+            metrics.timing(f"agent.tool.{tool_name}.latency_ms", cost_ms)
+            logger.debug(f"[工具管理] 工具 {tool_name} 调用结束 耗时={cost_ms:.0f}ms")
+
     return wrapped
 
 

@@ -24,6 +24,11 @@ class AgentState(TypedDict, total=False):
     intents: list                        # 多意图列表，如 ["task","knowledge_base"] / ["chat"]
     intent_reason: Optional[str]         # LLM 分类理由（可观测）
     intent_confidence: Optional[float]   # 置信度
+    last_intents: Optional[list]         # 上一轮意图（会话内），供短追问继承（§16）
+    slash_command: Optional[str]         # 命中的斜杠命令名（§16 规则层短路）
+    slash_args: Optional[str]            # 斜杠命令参数
+    slash_handoff: Optional[str]         # 斜杠命令本地回执文案（免 LLM 直接输出）
+    query_embedding: Optional[list]      # query 稠密向量（知识库分支预计算，供意图层复用，§16）
 
     # ---- 知识库问答 ----
     context_docs: list                   # 检索到的文档

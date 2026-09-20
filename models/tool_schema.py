@@ -31,6 +31,7 @@ class ToolOut(BaseModel):
     circuit_open_at: Optional[datetime] = None
     circuit_open_until: Optional[datetime] = None
     last_error: Optional[str] = None
+    last_error_args: Optional[Dict[str, Any]] = None
     last_call_at: Optional[datetime] = None
     last_success_at: Optional[datetime] = None
     avg_latency_ms: int = 0

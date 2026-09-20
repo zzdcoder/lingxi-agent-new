@@ -8,7 +8,7 @@
 import logging
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
@@ -18,6 +18,7 @@ from models.approval_schema import ApprovalDecisionIn, ApprovalOut
 from models.user_model import User
 from utils.auth import get_current_user
 from agent.approval import approval_service
+from agent.observability import bind_trace_id, get_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,10 @@ async def submit_decision(
     :param current_user: 当前用户（审批人）
     """
     try:
+        # 阶段 4 观测：决策是新的一次请求，绑定独立 trace_id；
+        # asyncio.create_task 会复制当前 contextvars，后台恢复任务自动继承该标识，
+        # 使「决策请求日志 ↔ 后台恢复日志」可逐条对照。
+        trace_id = bind_trace_id()
         result = await db.execute(
             select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
         )
@@ -67,12 +72,14 @@ async def submit_decision(
         )
         logger.info(
             f"[Approval] 前台审批决策已受理: approval_id={approval_id}, "
-            f"decision={body.decision.value}, approved_by={current_user.username}"
+            f"decision={body.decision.value}, approved_by={current_user.username}, "
+            f"trace_id={trace_id}"
         )
         return {
             "code": 0,
             "approval_id": approval_id,
             "status": body.decision.value,
+            "trace_id": trace_id,
             "message": "审批已受理，结果将经会话流式推送",
         }
     except ConversationException:
@@ -107,6 +114,11 @@ async def list_conversation_approvals(
             .where(
                 ApprovalRequest.conversation_id == conversation_id,
                 ApprovalRequest.requester_id == current_user.username,
+                # 仅写审批单（存量数据 biz_type 为默认 write_approval，双重兼容）
+                or_(
+                    ApprovalRequest.biz_type.is_(None),
+                    ApprovalRequest.biz_type == "write_approval",
+                ),
             )
             .order_by(ApprovalRequest.created_at.desc())
             .limit(50)

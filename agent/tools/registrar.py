@@ -181,7 +181,7 @@ def _signature_to_json_schema(func) -> Optional[Dict[str, Any]]:
 
 def _spec_to_row(spec: ToolSpec) -> ToolRegistry:
     """ToolSpec → ToolRegistry 记录（parameters 由执行方法签名推导）。"""
-    handler_func = getattr(_EXECUTOR_CLASS, spec.handler, None) if _EXECUTOR_CLASS else None
+    handler_func = _resolve_handler_func(spec.handler)
     return ToolRegistry(
         name=spec.name,
         description=spec.description,
@@ -199,16 +199,32 @@ def _spec_to_row(spec: ToolSpec) -> ToolRegistry:
     )
 
 
-def _get_executor_class():
-    """惰性获取 DbToolExecutor 类（避免注册器与执行器循环依赖）。"""
+def _get_executor_classes() -> list:
+    """惰性获取执行器类列表（db 工具 + 知识库检索工具），避免注册器与执行器循环依赖。"""
+    classes = []
     try:
         from agent.tools.db_tools import DbToolExecutor
-        return DbToolExecutor
+        classes.append(DbToolExecutor)
     except Exception:
-        return None
+        pass
+    try:
+        from agent.tools.knowledge_tool import KnowledgeToolExecutor
+        classes.append(KnowledgeToolExecutor)
+    except Exception:
+        pass
+    return classes
 
 
-_EXECUTOR_CLASS = _get_executor_class()
+def _resolve_handler_func(handler: str):
+    """按 handler 名在全部执行器类上查找方法（db 工具 / 知识库检索工具）。"""
+    for cls in _EXECUTOR_CLASSES:
+        fn = getattr(cls, handler, None)
+        if fn is not None:
+            return fn
+    return None
+
+
+_EXECUTOR_CLASSES = _get_executor_classes()
 
 
 # =============================================================================

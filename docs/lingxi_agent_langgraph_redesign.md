@@ -22,6 +22,8 @@
 12. [影响范围与改动清单](#12-影响范围与改动清单)
 13. [分阶段实施计划](#13-分阶段实施计划)
 14. [风险与注意事项](#14-风险与注意事项)
+15. [观测与加固（阶段 4）](#15-观测与加固阶段-4)
+16. [意图识别分层优化](#16-意图识别分层优化准确率--耗时--llm-调用次数)
 
 ***
 
@@ -47,7 +49,7 @@
 | 决策点          | 结论                                                                    |
 | ------------ | --------------------------------------------------------------------- |
 | 审批触发条件       | 仅当「路由到任务执行」且「LLM 决策是对数据库某张表做**删除或修改**」时触发审批；查询/插入不触发                  |
-| 审批人确定方式      | **前台会话用户本人审批**（JWT 身份，仅发起人可提交决策；越权 403），不再对接飞书审批流 |
+| 审批人确定方式      | **前台会话用户本人审批**（JWT 身份，仅发起人可提交决策；越权 403），不再对接飞书审批流                     |
 | 接口兼容策略       | **新增接口，保留旧接口**（`/api/conversations/chat` 维持不变，新增 `/api/agent/chat`）   |
 | 任务执行工具范围（初期） | 只读查询、数据插入、数据更新（触发审批）、数据删除（触发审批），全部基于**结构化参数 + 表/列白名单**，禁止 LLM 直接拼 SQL |
 
@@ -130,19 +132,20 @@ POST /api/conversations/chat   (SSE)
 
 ### 3.1 依赖版本矩阵（已写入 requirements.txt）
 
-| 包                          | 版本     | 说明 / 兼容性说明                                               |
-| -------------------------- | ------ | -------------------------------------------------------- |
-| langchain-core             | 1.6.1  | 最新稳定版，提供 Message / Prompt / Document 等核心抽象               |
-| langchain                  | 1.3.10 | 锁定原因：1.4.0 依赖已被官方 **yanked** 的 `langgraph==1.2.11`，安装会失败 |
-| langchain-openai           | 1.6.0  | ChatOpenAI 官方适配（通义千问 DashScope 兼容接口）                     |
-| langchain-qdrant           | 1.1.0  | QdrantVectorStore 集成，沿用现有向量库                             |
-| langgraph                  | 1.2.10 | 锁定原因：1.2.11 已被官方 **yanked**（broken），1.2.10 为最新可用稳定版      |
-| langgraph-checkpoint       | 4.2.0  | 图状态持久化基础库（由 langgraph 自动拉取）                              |
-| langgraph-checkpoint-mysql | 3.0.0  | MySQL 检查点保存器，用于跨请求恢复审批中断点                                |
-| openai                     | 3.8.0  | 最新稳定版（embedding\_deal.py 直连使用，旧 1.x 语法已废弃）               |
-| ~~lark-oapi~~              | —      | 已移除（审批入口由飞书改为前台对话窗口，见 §5.6 变更记录）                       |
-| qdrant-client              | 1.19.0 | 向量库客户端                                                   |
-| langsmith                  | 0.12.1 | 链路追踪                                                     |
+| 包                          | 版本        | 说明 / 兼容性说明                                               |
+| -------------------------- | --------- | -------------------------------------------------------- |
+| langchain-core             | 1.6.1     | 最新稳定版，提供 Message / Prompt / Document 等核心抽象               |
+| langchain                  | 1.3.10    | 锁定原因：1.4.0 依赖已被官方 **yanked** 的 `langgraph==1.2.11`，安装会失败 |
+| langchain-openai           | 1.6.0     | ChatOpenAI 官方适配（通义千问 DashScope 兼容接口）                     |
+| langchain-qdrant           | 1.1.0     | QdrantVectorStore 集成，沿用现有向量库                             |
+| langgraph                  | 1.2.10    | 锁定原因：1.2.11 已被官方 **yanked**（broken），1.2.10 为最新可用稳定版      |
+| langgraph-checkpoint       | 4.2.0     | 图状态持久化基础库（由 langgraph 自动拉取）                              |
+| langgraph-checkpoint-mysql | 3.0.0     | MySQL 检查点保存器，用于跨请求恢复审批中断点                                |
+| openai                     | 3.8.0     | 最新稳定版（embedding\_deal.py 直连使用，旧 1.x 语法已废弃）               |
+| ~~lark-oapi~~              | —         | 已移除（审批入口由飞书改为前台对话窗口，见 §5.6 变更记录）                         |
+| qdrant-client              | 1.19.0    | 向量库客户端                                                   |
+| langsmith                  | 0.12.1    | 链路追踪                                                     |
+| apscheduler                | >=3.10,<4 | 定时任务调度（熔断恢复探测，§7.7.6）                                    |
 
 > 说明：`langchain-community` 官方已宣布 sunset（停止维护），本项目未使用，已从依赖中移除，避免安全隐患。
 
@@ -207,9 +210,11 @@ lingxi-agent/
 │   │   └── task_node.py                # 任务执行节点（create_agent + HITL 中间件）
 │   ├── tools/
 │   │   ├── __init__.py
-│   │   ├── registry.py                 # 工具注册表（名称/风险等级/审批开关）
-│   │   ├── db_tools.py                 # 数据库工具（结构化参数 + 白名单 + 参数化执行）
+│   │   ├── agent_tool.py               # 工具统一收敛点（DbToolExecutor / KnowledgeToolExecutor / ClarifyTool + ToolSpec 注册表）
+│   │   ├── registry.py                 # 工具注册表（薄封装，实现见 agent_tool.py）
+│   │   ├── db_tools.py                 # 数据库工具（薄封装，实现见 agent_tool.py）
 │   │   ├── circuit_breaker.py          # 工具熔断器（状态机 + 自动/人工熔断，§7.7）
+│   │   ├── probe.py                    # 熔断恢复定时探测（APScheduler 扫描重放，§7.7.6）
 │   │   ├── registrar.py                # 启动注册（@tool 扫描 + ToolSpec upsert，§7.8）
 │   │   └── manager.py                  # 运行时绑定（查生效工具 + 超时/熔断包装，§7.9）
 │   ├── approval/
@@ -279,6 +284,11 @@ class AgentState(TypedDict, total=False):
 
 ### 5.2 意图识别（IntentRouter）
 
+> **2026-09-18 优化**：本节为 v1 的**基础形态**（LLM 结构化输出 + 降级）。
+> 现已演进为**四层递进判定**（规则门控 → 决策缓存 → 向量就近 → LLM 兜底），
+> 完整设计见 [§16 意图识别分层优化](#16-意图识别分层优化准确率--耗时--llm-调用次数)。
+> 下文描述的结构化输出与归一化规则在 §16 中**全部保留**，仅在其前面增加了零 LLM 成本的快通道。
+
 - 采用 `ChatOpenAI.with_structured_output()`（官方最新结构化输出 API，非废弃的 `output_parser` 手工解析）；
 - **多标签分类**：同一输入可能同时命中「任务执行 + 知识库问答」，输出意图**列表**而非单一意图：
 
@@ -300,6 +310,7 @@ class IntentResult(BaseModel):
   - `chat` 与其它意图并存时**丢弃 chat**（chat 仅作兜底，不参与并行）；
   - 异常输入（如同时命中 3 个）→ 按 `task > knowledge_base > chat` 优先级收敛。
 - **降级策略**：LLM 调用失败、输出非法、置信度 < 0.5 时，默认路由到 `chat`，保证服务可用性；
+  置信度落在 `[0.5, 0.75)` 时先用 `intent_escalation_model` **升级重判**一次（§16.5.5-A2）；
 - **安全策略**：命中 `task` 的输入，在进入任务执行前会再次由任务 Agent 判断是否真的需要写操作，双重确认降低误判。任务 Agent 的写工具全部必填 `user_intent_quote` 参数（用户原话中表达写意图的片段），缺失/空白或未命中写意图关键词时工具直接拒绝，引导模型反问用户（见 5.5.2）。
 
 ### 5.3 知识库问答节点（KnowledgeNode）
@@ -341,18 +352,18 @@ class KnowledgeService:
 
 #### 5.5.1 工具清单（初期）
 
-| 工具名           | 能力              | 风险等级 | 是否触发审批       |
-| ------------- | --------------- | ---- | ------------ |
-| `list_tables` | 列出可操作的表（白名单）    | 只读   | 否            |
-| `query_data`  | 结构化条件查询（SELECT） | 只读   | 否            |
-| `search_knowledge` | 检索知识库文档（RAG-as-tool，任务执行需文档依据时调用） | 只读 | 否 |
-| `insert_data` | 新增记录（INSERT）    | 写    | 否（可配置，默认不审批） |
-| `update_data` | 修改记录（UPDATE）    | 写    | **是**        |
-| `delete_data` | 删除记录（DELETE）    | 写    | **是**        |
+| 工具名                | 能力                                | 风险等级 | 是否触发审批       |
+| ------------------ | --------------------------------- | ---- | ------------ |
+| `list_tables`      | 列出可操作的表（白名单）                      | 只读   | 否            |
+| `query_data`       | 结构化条件查询（SELECT）                   | 只读   | 否            |
+| `search_knowledge` | 检索知识库文档（RAG-as-tool，任务执行需文档依据时调用） | 只读   | 否            |
+| `insert_data`      | 新增记录（INSERT）                      | 写    | 否（可配置，默认不审批） |
+| `update_data`      | 修改记录（UPDATE）                      | 写    | **是**        |
+| `delete_data`      | 删除记录（DELETE）                      | 写    | **是**        |
 
-> 工具通过注册表 `agent/tools/registry.py` 声明，每个工具带有 `requires_approval` 标记，未来扩展新工具只需在注册表声明，无需改动图逻辑。
+> 工具统一收敛在 `agent/tools/agent_tool.py`（按类别以类组织：`DbToolExecutor` / `KnowledgeToolExecutor` / `ClarifyTool` + `ToolSpec` 注册表，原 `registry.py` / `db_tools.py` / `knowledge_tool.py` / `tools/clarify_tool.py` 均为薄封装）。每个工具带有 `requires_approval` 标记，未来扩展新工具只需在注册表声明，无需改动图逻辑。
 > 写工具（`insert_data`/`update_data`/`delete_data`）签名均含必填参数 `user_intent_quote`，二次确认写操作意图（见 5.5.2）。
-> `search_knowledge` 由独立执行器 `agent/tools/knowledge_tool.py` 提供，`username` 服务端注入（权限过滤），`k` clamp 到 [1,10]，返回上下文双重长度截断防止撑爆 Agent 上下文。
+> `search_knowledge` 由独立执行器 `KnowledgeToolExecutor`（`agent/tools/agent_tool.py`）提供，`username` 服务端注入（权限过滤），`k` clamp 到 [1,10]，返回上下文双重长度截断防止撑爆 Agent 上下文。
 
 #### 5.5.2 结构化参数与安全执行
 
@@ -362,9 +373,9 @@ class KnowledgeService:
 - **写操作二次确认（双保险）**：所有写工具（`insert_data` / `update_data` / `delete_data`）必填 `user_intent_quote`（用户原话中表达该写操作意图的原文片段）。校验规则：
   1. 缺失 / 空白 → 直接拒绝（错误消息引导模型向用户确认，而非直接执行）；
   2. 超长（>200 字符）→ 截断；
-  3. 未命中写意图关键词（如 更新 / 修改 / 删除 / 新增 等，词表见 `agent/tools/db_tools.py:WRITE_INTENT_KEYWORDS`）→ 视为缺少用户明确授权，拒绝并引导模型反问用户。
-  该参数为函数必选参数，LangChain `StructuredTool` 的 pydantic schema 在工具调用层即拦截缺参；handler 内校验作为二道防线。同时进入 `user_intent_quote` 一并落审计，审批卡片展示该引用供审批人对照用户原话。
-- **只读工具**：`list_tables` / `query_data` 由 `DbToolExecutor` 提供；`search_knowledge`（知识库检索）由 `KnowledgeToolExecutor`（`agent/tools/knowledge_tool.py`）提供——`username` 服务端从会话上下文注入（不暴露为工具参数，防止模型伪造身份越权检索私有文档），`k` clamp 到 [1,10] 防检索成本失控，返回上下文按「单文档 800 字 / 总量 4000 字符」双重截断防撑爆 Agent 上下文；工具调用进入 `tool_calls` 审计（与数据库工具合并取并集落库）；
+  3. 未命中写意图关键词（如 更新 / 修改 / 删除 / 新增 等，词表见 `agent/tools/agent_tool.py:WRITE_INTENT_KEYWORDS`）→ 视为缺少用户明确授权，拒绝并引导模型反问用户。
+     该参数为函数必选参数，LangChain `StructuredTool` 的 pydantic schema 在工具调用层即拦截缺参；handler 内校验作为二道防线。同时进入 `user_intent_quote` 一并落审计，审批卡片展示该引用供审批人对照用户原话。
+- **只读工具**：`list_tables` / `query_data` 由 `DbToolExecutor` 提供；`search_knowledge`（知识库检索）由 `KnowledgeToolExecutor`（均在 `agent/tools/agent_tool.py`）提供——`username` 服务端从会话上下文注入（不暴露为工具参数，防止模型伪造身份越权检索私有文档），`k` clamp 到 [1,10] 防检索成本失控，返回上下文按「单文档 800 字 / 总量 4000 字符」双重截断防撑爆 Agent 上下文；工具调用进入 `tool_calls` 审计（与数据库工具合并取并集落库）；
 - **审计**：每次工具调用（含参数、结果摘要、`user_intent_quote`）写入 `task_execution` 表。
 
 #### 5.5.3 任务执行节点流程
@@ -377,9 +388,11 @@ class KnowledgeService:
 6. 审批通过 → 恢复执行写工具 → 汇总结果；审批拒绝 → 终止并告知用户；
 7. 任务结束，生成人类可读的执行报告作为回答。
 
+> 变更记录（2026-09-17）：强化 `TASK_AGENT_SYSTEM_PROMPT` 通用引导——表名/字段不确定时**必须先** `list_tables` 获取精确表名（禁止猜表名/凭猜测执行）；不确定相关信息或任务缺少依据时**先** `search_knowledge` 检索知识库，依知识库内容决定继续执行 / 补充询问 / 说明无法完成；检索到内容后以其为决策依据，知识库无相关内容时如实告知不编造。对应修复任务模型臆造 `users` 等错误表名的问题。
+
 #### 5.5.4 工具异常处理与循环兜底（P0 落地）
 
-> 变更记录：任务 Agent 由「工具异常直接中断循环」升级为「异常转 ToolMessage 送回循环（模型自愈）+ 递归上限防死循环」。涉及 `agent/tools/db_tools.py`（`DbToolError` 基类）与 `agent/nodes/task_node.py`（工具绑定与循环配置）。超时体系（§变更二）同步落地：新增 `agent_tool_timeout_seconds` / `agent_llm_timeout_seconds` 配置，任务级整体超时语义回归 `agent_task_timeout_seconds`。
+> 变更记录：任务 Agent 由「工具异常直接中断循环」升级为「异常转 ToolMessage 送回循环（模型自愈）+ 递归上限防死循环」。涉及 `agent/tools/agent_tool.py`（`DbToolError` 基类）与 `agent/nodes/task_node.py`（工具绑定与循环配置）。超时体系（§变更二）同步落地：新增 `agent_tool_timeout_seconds` / `agent_llm_timeout_seconds` 配置，任务级整体超时语义回归 `agent_task_timeout_seconds`。
 
 企业级 Agent 的标准做法是**错误进入循环而非中断循环**。基于 `create_agent` 的三层兜底（`langchain.agents.create_agent` 无 `max_iterations` 参数，迭代上限统一走 langgraph 递归机制）：
 
@@ -445,6 +458,50 @@ SSE 已断开时前端经 GET /api/approval/{id} 轮询兜底。
 - **多 action 批次决策**：模型平行 tool calling 时，一次中断可能含**多个待审批写操作**（如同轮 `update_data` + `delete_data`）。单次中断落一张审批单，`actions` 字段保存全部操作（脱敏），`approval_type`/`target_table`/`tool_params` 保存首个 action 供卡片头部展示；恢复时 `decisions` 数量与挂起工具数**一一对应**（LangChain HITL 中间件校验数量不一致会抛 `ValueError`），决策为批次级——同意/拒绝一次覆盖全部操作；
 - 审批人 = 当前会话用户（JWT 身份），仅发起人本人可审批；越权提交返回 403。
 
+#### 5.6.1 任务追问（澄清式 HITL，2026-09-17 新增；2026-09-17 升级多问题批量追问 + 取消）
+
+> 需求：任务节点执行时 LLM 掌握的信息不足（查询条件不明确、数据主键缺失、执行范围不清、多义表述等），应**中断追问**用户；用户在前台作答提交后，LLM 继续处理原任务。升级能力：LLM 可将多个缺失的关键信息合并为**一批（一次最多 5 个具体、独立的问题）**，前台逐题作答（问题数 / 进度 / 下一步 / 提交）或**取消**；取消后任务终止，LLM 如实告知用户已取消提供相关信息，并给出修复建议。
+
+**实现方案**：复用审批的中断/恢复基础设施与 `approval_request` 表（泛化为"人工介入单"，`biz_type` 区分写审批/追问），升级 `ask_user` 追问工具为批量问题：
+
+```
+任务 Agent（create_agent，审批模式下绑定 ask_user 工具）
+  ├─ Agent 决策调用 ask_user(questions=["q1", "q2", ...])（@tool 工具，内部触发 langgraph interrupt()）
+  ├─ interrupt({type: "clarification", questions: [...]})   ← 一次中断可携带一批问题（≤5）
+  ├─ 中断状态持久化（thread_id=conversation_id，MySQL 检查点）
+        │
+        ▼
+┌───────────── 执行包装层（api/routes/agent.py _handle_clarify_interrupt）─┐
+│  ① 落库追问单（approval_request，biz_type=clarification，status=pending）│
+│  ② SSE 推送 event=clarification_required + questions 列表 + 卡片载荷    │
+│    （前端渲染多问题向导卡片：N/总数 进度 + 下一步 + 提交 + 取消，见 §7.6）  │
+└──────────────────────────────┬──────────────────────────────────────────┘
+                               ▼
+┌───────────── 前台对话窗口 ─────────────────────────────────────────────┐
+│  用户逐题作答 → 提交：POST /api/agent/clarify/{id}/answer （answers=[...]）│
+│  或 取消：POST /api/agent/clarify/{id}/cancel                           │
+│  （JWT 鉴权，仅发起人）                                                  │
+└──────────────────────────────┬──────────────────────────────────────────┘
+                               ▼
+追问服务：越权校验 → 原子抢占状态机（pending→answered / pending→canceled，幂等）
+                               ▼
+提交答案 → Command(resume={"answers": [...]}) 恢复同一 thread 执行
+取消     → Command(resume={"canceled": True}) 恢复 + 任务记录标记 canceled 终止
+  ├─ 任务节点重入，ask_user 工具的 interrupt() 返回批量答案或取消信号
+  ├─ 批量答案：Agent 依据补充信息继续执行 → 完成任务，结果经 SSE 推送
+  └─ 取消：Agent 如实告知用户已取消提供相关信息 → 给出处理结果或修复建议
+```
+
+**关键点**：
+
+- **工具注册**：`ask_user(questions: list[str])` 为 `@tool` 装饰器工具（定义于 `agent/tools/agent_tool.py`，经薄封装 `tools/clarify_tool.py` re-export 保持 `@tool` 扫描发现），启动时经 `sync_tool_registry` 自动入库 tool_registry（`requires_approval=0`，追问本身不需审批；工具描述变更随启动同步刷新）；
+- **检查点依赖**：`interrupt()` 必须启用 checkpointer 才能工作，因此 `ask_user` 仅在审批模式（checkpointer 可用）下由任务节点绑定，非审批模式剔除（`task_node.py` 按工具名过滤，退化回"如实告知用户信息不足"）；单批问题上限 `_MAX_QUESTIONS=5`；
+- **提示词约束**：`TASK_AGENT_SYSTEM_PROMPT` 约束"信息不足先 search_knowledge 检索，仍缺失才 ask_user；可一批追问最多 5 个具体、独立的问题；收到取消信号时如实告知并给出修复建议"（知识库检索仍优先于追问）；
+- **追问单**复用审批表：`biz_type=clarification` + `approval_type="clarification"`，`tool_params.questions` 存问题列表（兼容旧 `tool_params.question`），批量回答存 `callback_payload.answers`（单问题兼容 `answer` 列），取消标记 `callback_payload.canceled=true`，`approved_by` 存回答人/取消人（审计）；
+- **状态机**：pending→answered / pending→canceled 单向流转（原子抢占），重复提交/取消被拦截；恢复重入时任务节点复用 running 任务记录（与审批一致）；
+- **取消语义**：恢复图执行后 ask_user 返回取消信号，LLM 生成"已取消提供相关信息 + 现有信息尽力处理 + 补充哪些信息可重试"的回答；任务执行记录标记 `canceled`（终止态），对话消息照常落库；
+- **列表隔离**：`GET /api/approval` 按 `biz_type` 过滤（`biz_type IS NULL OR = 'write_approval'`），追问单不混入审批列表；刷新后追问卡片经 `GET /api/agent/clarify` 重建。
+
 ### 5.7 记忆与消息持久化
 
 - 图内 `messages` 为工作态；每次请求从 MySQL 加载历史（复用 `MySQLChatMessageHistory`），结束后写入新增消息；
@@ -500,15 +557,29 @@ intent_router（多标签）
 
 ```mermaid
 flowchart TD
-    A[用户输入] --> B[意图识别节点<br/>LLM + 多标签结构化输出]
-    B --> C{意图组合}
+    A[用户输入] --> A0{"Tier-0 规则门控<br/>§16 intent_gate.gate"}
+    A0 -->|斜杠命令 /cmd| A1[本地指令回执<br/>零 LLM 零落库]
+    A0 -->|寒暄/纯标点| A2[chat 直达 conf 0.95]
+    A0 -->|DB 强信号| A3[task 直达 conf 1.0]
+    A0 -->|显式指名知识库| A4[kb 直达 conf 1.0]
+    A0 -->|短追问继承| A5[继承上一轮意图]
+    A0 -->|未命中| A6{"Tier-1/2<br/>决策缓存 + 向量就近"}
+    A6 -->|命中| A7[复用判定<br/>零 LLM]
+    A6 -->|未命中| B["Tier-3 意图识别节点<br/>LLM + 多标签结构化输出<br/>(低置信升级重判)"]
+    A1 --> I[汇总节点 merge]
+    A2 --> I
+    A3 --> I
+    A4 --> I
+    A5 --> I
+    A7 --> C{意图组合}
+    B --> C
     C -->|仅 knowledge_base| D[知识库问答子图]
     C -->|仅 task| E[任务执行子图]
     C -->|仅 chat| F[普通聊天节点]
     C -->|task + knowledge_base| G[知识库问答子图]
     C -->|task + knowledge_base| H[任务执行子图]
     C -->|异常/低置信度| F
-    D --> I[汇总节点 merge]
+    D --> I
     E --> I
     F --> I
     G --> I
@@ -518,6 +589,8 @@ flowchart TD
 ```
 
 > 说明：`G`（知识库）与 `H`（任务）在同一 superstep 并行执行；`merge` 节点有多条入边，LangGraph 自动在其所有前驱完成后才执行（barrier）。
+> **§16 变更**：`A0` 与 `A6` 为新增的零 LLM 快通道，命中时**不进入** `B`（LLM 分类）；
+> `A1`~`A5`、`A7` 的判定结果直接等效于 `B` 的 `intents`，后续路由逻辑完全复用，无分支删改。
 
 ### 6.2 知识库问答子图（复用现有检索流程）
 
@@ -884,7 +957,7 @@ async def submit_decision(
 ### 7.4 数据库工具（结构化参数 + 白名单）
 
 ```python
-# agent/tools/db_tools.py（设计示意）
+# agent/tools/agent_tool.py（设计示意，DbToolExecutor 类）
 from sqlalchemy import text
 from core.database import async_engine
 
@@ -912,21 +985,21 @@ class DbToolExecutor:
 
 #### 7.5.1 卡片重点展示数据
 
-| 区块     | 字段                 | 来源                        | 说明                                                                 |
-| -------- | -------------------- | --------------------------- | -------------------------------------------------------------------- |
-| 头部     | 操作类型             | `approval_type`             | insert（蓝）/ update（橙）/ delete（红），附风险等级标识              |
-| 头部     | 目标表               | `target_table`              | 明示写操作作用对象                                                   |
-| 头部     | 状态角标             | `status`                    | 待审批（黄）/ 已同意（绿）/ 已拒绝（灰）                             |
-| 明细     | 操作列表（多 action）   | `actions`                   | 一次中断含多个写操作时展示操作列表（每项含类型徽章+目标表+明细）；单 action 可缺省 |
-| 明细     | 修改内容             | `tool_params.values`        | update：字段→新值 键值对表格                                         |
-| 明细     | 影响范围（条件）     | `tool_params.filters`       | update/delete：WHERE 条件键值对，明示"将影响哪些行"                  |
-| 明细     | 插入内容             | `tool_params.values`        | insert：字段→值 键值对表格                                           |
-| 上下文   | 用户原始请求         | 会话最后一条用户消息        | 帮助用户回忆审批对应的任务上下文                                     |
-| 上下文   | 发起人 / 发起时间    | `requester_id` / `created_at` | 审计信息                                                           |
-| 操作     | 同意执行 / 拒绝按钮  | —                           | 仅 `status=pending` 时可点；审批人 = 发起人本人（JWT）               |
-| 操作     | 拒绝原因（可选）     | `reason`                    | 拒绝时可选填，回传后写入 `decision_reason` 并透传给 LLM 生成拒绝说明 |
-| 回显     | 审批人 / 审批时间    | `approved_by` / `updated_at` | 审批后卡片状态翻转回显                                              |
-| 提示     | 等待超时说明         | —                           | 超时（默认 2h）后 SSE 结束等待，可经轮询接口获取结果                 |
+| 区块  | 字段             | 来源                            | 说明                                             |
+| --- | -------------- | ----------------------------- | ---------------------------------------------- |
+| 头部  | 操作类型           | `approval_type`               | insert（蓝）/ update（橙）/ delete（红），附风险等级标识        |
+| 头部  | 目标表            | `target_table`                | 明示写操作作用对象                                      |
+| 头部  | 状态角标           | `status`                      | 待审批（黄）/ 已同意（绿）/ 已拒绝（灰）                         |
+| 明细  | 操作列表（多 action） | `actions`                     | 一次中断含多个写操作时展示操作列表（每项含类型徽章+目标表+明细）；单 action 可缺省 |
+| 明细  | 修改内容           | `tool_params.values`          | update：字段→新值 键值对表格                             |
+| 明细  | 影响范围（条件）       | `tool_params.filters`         | update/delete：WHERE 条件键值对，明示"将影响哪些行"           |
+| 明细  | 插入内容           | `tool_params.values`          | insert：字段→值 键值对表格                              |
+| 上下文 | 用户原始请求         | 会话最后一条用户消息                    | 帮助用户回忆审批对应的任务上下文                               |
+| 上下文 | 发起人 / 发起时间     | `requester_id` / `created_at` | 审计信息                                           |
+| 操作  | 同意执行 / 拒绝按钮    | —                             | 仅 `status=pending` 时可点；审批人 = 发起人本人（JWT）        |
+| 操作  | 拒绝原因（可选）       | `reason`                      | 拒绝时可选填，回传后写入 `decision_reason` 并透传给 LLM 生成拒绝说明 |
+| 回显  | 审批人 / 审批时间     | `approved_by` / `updated_at`  | 审批后卡片状态翻转回显                                    |
+| 提示  | 等待超时说明         | —                             | 超时（默认 2h）后 SSE 结束等待，可经轮询接口获取结果                 |
 
 #### 7.5.2 卡片状态流转（前端视角）
 
@@ -951,13 +1024,13 @@ approval_required(pending) ──用户点击同意/拒绝──► 按钮禁用
 
 > 变更记录：以下为 §7.5/§7.6 规范在前端 `lingxi-agent-portal`（React + TS + Vite）的实现落地，2026-09-14 同步设计。
 
-| 文件 | 职责 |
-| ---- | ---- |
-| `src/types/index.ts` | 新增 `ApprovalData`/`ApprovalStatus`/`ApprovalDecision` 类型；`Message` 扩展 `approval`（卡片数据）与 `approvalPending`（提交中）字段 |
-| `src/services/llm.ts` | 新增审批 API：`listApprovals`（按会话查审批单，刷新重建卡片）、`submitApprovalDecision`（决策提交）、`getApprovalStatus`（SSE 断连轮询兜底），均自动携带 JWT |
-| `src/components/ApprovalCard.tsx` | 审批卡片组件（六区块：头部操作类型/目标表/状态角标，明细 values+filters，上下文发起人/时间，操作同意/拒绝+拒绝原因，回显审批人/意见，提示超时说明）。决策提交由卡片内部直接调用 `submitApprovalDecision`，提交中禁用按钮、失败展示错误、成功等待 SSE `approval_decided` 回显翻转 |
-| `src/components/MessageBubble.tsx` / `MessageList.tsx` | 消息存在 `approval` 数据时优先渲染 `ApprovalCard` 替代普通气泡 |
-| `src/hooks/useChat.ts` | SSE `approval_required` → 将审批卡片载荷挂载到当前 assistant 消息（普通气泡暂停输出）；`approval_decided` → 翻转卡片状态（含审批人）；`content` → 审批后的执行结果/最终回答继续输出；加载历史/切换会话时经 `listApprovals` 按创建时间重建审批卡片 |
+| 文件                                                     | 职责                                                                                                                                                                          |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/types/index.ts`                                   | 新增 `ApprovalData`/`ApprovalStatus`/`ApprovalDecision` 类型；`Message` 扩展 `approval`（卡片数据）与 `approvalPending`（提交中）字段                                                            |
+| `src/services/llm.ts`                                  | 新增审批 API：`listApprovals`（按会话查审批单，刷新重建卡片）、`submitApprovalDecision`（决策提交）、`getApprovalStatus`（SSE 断连轮询兜底），均自动携带 JWT                                                           |
+| `src/components/ApprovalCard.tsx`                      | 审批卡片组件（六区块：头部操作类型/目标表/状态角标，明细 values+filters，上下文发起人/时间，操作同意/拒绝+拒绝原因，回显审批人/意见，提示超时说明）。决策提交由卡片内部直接调用 `submitApprovalDecision`，提交中禁用按钮、失败展示错误、成功等待 SSE `approval_decided` 回显翻转 |
+| `src/components/MessageBubble.tsx` / `MessageList.tsx` | 消息存在 `approval` 数据时优先渲染 `ApprovalCard` 替代普通气泡                                                                                                                               |
+| `src/hooks/useChat.ts`                                 | SSE `approval_required` → 将审批卡片载荷挂载到当前 assistant 消息（普通气泡暂停输出）；`approval_decided` → 翻转卡片状态（含审批人）；`content` → 审批后的执行结果/最终回答继续输出；加载历史/切换会话时经 `listApprovals` 按创建时间重建审批卡片       |
 
 - **状态流转**（前端视角）：`approval_required` 插入卡片（pending，按钮可点）→ 点击同意/拒绝 → 按钮禁用 +「决策已受理」提示 → SSE `approval_decided` 翻转卡片（已同意/已拒绝 + 审批人）→ `content` 输出任务结果；
 - **刷新/断线恢复**：`loadConversationMessages` 并行拉取消息与审批单列表，`reconcileApprovalMessages` 按 `created_at` 将审批卡片合并进消息流（终态只读回显，pending 可交互）；
@@ -993,14 +1066,41 @@ data: {
 data: {"event": "status", "status": "approval_decided", "approval_id": "xxx",
        "decision": "approved", "approved_by": "zhangsan"}
 
-// 心跳（审批等待期，防连接超时）
+// 任务追问触发：携带批量问题与卡片载荷（前端据此渲染多问题向导卡片：进度/下一步/提交/取消，见 §5.6.1）
+data: {
+  "event": "status",
+  "status": "clarification_required",
+  "clarify_id": "xxx",
+  "questions": ["请提供需要删除的用户账号", "请确认删除范围（仅本人数据或全部）"],
+  "clarification": {
+    "id": "xxx",
+    "question": "请提供需要删除的用户账号",
+    "questions": ["请提供需要删除的用户账号", "请确认删除范围（仅本人数据或全部）"],
+    "count": 2,
+    "status": "pending",
+    "requester_id": "zhangsan",
+    "created_at": "2026-09-17 10:00:00",
+    "answers": [],
+    "canceled": false
+  }
+}
+
+// 追问回答受理回显：后台恢复前先推送，前端翻转追问卡片为 answered 并展示答案列表
+data: {"event": "status", "status": "clarification_answered",
+       "clarify_id": "xxx", "answers": ["zhangsan", "仅本人数据"], "answered_by": "zhangsan"}
+
+// 追问取消回显：后台恢复前先推送，前端翻转追问卡片为 canceled（任务随后终止，LLM 给出处理建议）
+data: {"event": "status", "status": "clarification_canceled",
+       "clarify_id": "xxx", "canceled_by": "zhangsan"}
+
+// 心跳（审批/追问等待期，防连接超时）
 data: {"event": "ping"}
 
 // 完成
 data: {"event": "done"}
 ```
 
-> 前端处理要点：收到 `approval_required` 即在消息流插入审批卡片并进入等待态（此时连接保持，`ping` 心跳保活）；收到 `approval_decided` 翻转卡片状态；随后 `content` 帧为任务执行结果或拒绝说明；`done` 结束本轮流。
+> 前端处理要点：收到 `approval_required` 即在消息流插入审批卡片并进入等待态（此时连接保持，`ping` 心跳保活）；收到 `approval_decided` 翻转卡片状态；随后 `content` 帧为任务执行结果或拒绝说明；`done` 结束本轮流。追问同理：`clarification_required` 插入追问卡片（`questions.length > 1` 时渲染多问题向导：N/总数 进度 + 下一步 + 提交 + 取消按钮）、`clarification_answered` 翻转 answered 并展示答案列表、`clarification_canceled` 翻转 canceled，随后 `content` 帧为 Agent 补充处理结果或取消说明 + 修复建议。
 
 ### 7.7 企业级工具熔断治理（新增）
 
@@ -1012,38 +1112,44 @@ data: {"event": "done"}
 
 - **减少影响面**：不熔断整个 Agent 或整条链路，仅让"坏工具"退出服务，其余工具与分支不受影响；
 - **快速失败（fail-fast）**：OPEN 期间直接拒绝（抛 `CircuitOpenError`），不再等待超时拖垮请求；
-- **自动恢复**：冷却期后进入半开探测，验证工具恢复后自动回到生效状态（status=1）。
+- **自动恢复**：熔断后由 APScheduler 定时任务（默认每 5 分钟一轮）扫描熔断工具，按沉淀的失败入参重放探测（只读工具），探测成功即自动回到生效状态（status=1）。
+
+> 变更记录：2026-09-17（方案 Z）。熔断职责收窄为"只负责熔断 + 沉淀失败入参"；恢复机制由"冷却期被动半开"改为"定时任务主动探测"；触发口径由"所有异常计数"修正为"仅系统级故障计数"，与 §7.7.2 对齐。
 
 #### 7.7.2 熔断器状态机与触发时机
 
-状态机（`circuit_state` 列，`CLOSED / OPEN / HALF_OPEN`）：
+状态机（`circuit_state` 列，`CLOSED / OPEN / HALF_OPEN`；**HALF_OPEN 已废弃**——字段保留仅为兼容存量数据，新逻辑不再进入）：
 
 ```
 CLOSED（关闭/正常）
-  │ 连续失败 ≥ failure_threshold，或 窗口调用量 ≥ min_calls 且失败率 ≥ failure_ratio
+  │ 连续失败 ≥ failure_threshold，或 窗口调用量 ≥ min_calls 且失败率 ≥ failure_ratio（仅系统级故障计数）
   ▼
-OPEN（打开/熔断）→ 同步 tool_registry.status = 2
-  │ 冷却期（cooldown_seconds）到期
-  ▼
-HALF_OPEN（半开/探测）
-  │ 放行 ≤ half_open_max_trials 个探测请求
-  ├─ 任一探测成功 → CLOSED（status=1，计数器清零，自动恢复）
-  └─ 任一探测失败 → OPEN（status=2，重新计时冷却期）
+OPEN（打开/熔断）→ 同步 tool_registry.status = 2，沉淀失败入参 last_error_args
+  │ 定时探测任务（APScheduler，默认 5 分钟一轮）扫描 status=2 的只读工具
+  ├─ 按沉淀入参重放探测成功 → CLOSED（status=1，计数器清零，auto_recover）
+  └─ 探测失败 → 保持 OPEN（记录 last_error，进入下一轮探测）
 ```
 
 **自动熔断触发时机**（CLOSED 下判定 `_should_trip`）：
 
-| 触发条件 | 默认值 | 说明 |
-| ---- | ---- | ---- |
-| 连续失败次数 ≥ `failure_threshold` | 5 | 快速响应：连续 N 次失败立即熔断 |
+| 触发条件                                       | 默认值      | 说明                      |
+| ------------------------------------------ | -------- | ----------------------- |
+| 连续失败次数 ≥ `failure_threshold`               | 5        | 快速响应：连续 N 次系统级失败立即熔断    |
 | 窗口调用量 ≥ `min_calls` 且失败率 ≥ `failure_ratio` | 10 / 0.5 | 小样本防误熔断：窗口内调用量足够时按失败率判定 |
+
+**熔断触发口径（仅系统级故障计数）**：
+
+- **计入熔断**：系统级故障——`DbToolSystemError`（超时 / 连接异常 / 底层执行失败，继承 `DbToolError`）与 `asyncio.TimeoutError`；
+- **不计入熔断**：参数/业务错误（`DbToolError` 等）仅记录 `last_error`（供模型修正参数自愈），不累计失败、不沉淀入参、不触发熔断——避免 LLM 参数生成偶发错误误熔断核心工具；
+- **失败入参沉淀**：熔断触发时将最近一次系统级失败的入参经 `_sanitize_args` 脱敏后写入 `last_error_args`（JSON 列）——排除敏感键（token/密码等）、单值递归截断 256 字符、整体限长 4096 字符（超限标记 `_truncated` 不沉淀，探测时跳过留人工恢复）；
+- `agent_circuit_enabled=false` 时仅统计不熔断。
 
 **熔断影响面与恢复**：
 
 - OPEN 期间：任务节点不再绑定该工具（`load_active_tools` 只查 `status=1`）；已绑定的存量调用经熔断器**快速失败**，`CircuitOpenError`（`ToolException` 子类）经 `handle_tool_error` 转为 ToolMessage 送回 Agent 循环——模型收到"工具暂时不可用"后**换工具或如实告知用户**，而非中断整个任务；
-- 冷却期（默认 60s）到期自动进入 HALF_OPEN，放行最多 `half_open_max_trials`（3）个探测请求（防雪崩），任一成功即自动恢复 status=1；任一失败即重新熔断；
+- **自动恢复交给定时探测**（§7.7.6）：移除 HALF_OPEN 被动半开——任务级工具绑定是构建时的快照（§7.9），熔断后新任务绑不上该工具，被动半开在短任务模式下拿不到探测流量；改为 APScheduler 定时按沉淀入参主动重放探测，成功即 `auto_recover` 恢复 status=1，失败保持熔断进入下一轮；
 - 熔断判定与计数**持久化在 tool_registry 表**（跨请求、跨重启可恢复）；进程内维护 TTL=1s 的决策缓存，避免每次调用查库；
-- 只统计**业务异常**（`ToolException` 子类等），超时/参数错误等可控错误不计入熔断计数（避免正常波动误熔断）；`agent_circuit_enabled=false` 时仅统计不熔断。
+- **性能模型（内存判定 + 批量落库）**：判定依据与计数在进程内缓存行上即时完成（熔断触发/定时恢复等**状态迁移实时落库**，保证快速失败与恢复的时效性）；纯计数（total/success/fail/window/latency）标记 dirty，由 app lifespan 挂载的后台任务每 `agent_circuit_flush_interval_seconds`（默认 1s）批量 UPDATE 合并写回，进程退出前冲刷一次防计数丢失——每次工具调用的 DB 写从"1 SELECT + 1 UPDATE + 1 COMMIT"降为"接近 0（纯内存）"。
 
 #### 7.7.3 人工治理（运维操作）
 
@@ -1064,10 +1170,37 @@ HALF_OPEN（半开/探测）
 每个工具在绑定处统一注入（`agent/tools/manager.py`）：
 
 ```
-handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超时抛 DbToolError
+handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超时抛 DbToolSystemError（系统级故障，计入熔断）
         → breaker.call(db, tool_name, ...)                 # 熔断保护：判定/计数/快速失败
         → StructuredTool.from_function(handle_tool_error=tool_error_content)  # 异常转 ToolMessage
 ```
+
+#### 7.7.5 计数列 None 防御加固
+
+> 变更记录：2026-09-17。熔断器计数列（`total_calls` / `success_calls` / `fail_calls` / `consecutive_failures` / `window_calls` / `window_failures` / `avg_latency_ms` / `half_open_trials`）统一经 `_int()` 归一化后再做运算，兼容手动构造行（如 mock 测试）或历史脏数据导致的 `None` 运算异常（`None + 1` 抛 TypeError 被静默吞掉、计数不生效）。真实 DB 行经 INSERT 默认值（列 `default=0`）恒为非空，本加固不改变熔断语义，仅增强健壮性。
+
+#### 7.7.6 定时探测自动恢复（APScheduler）
+
+> 变更记录：2026-09-17（方案 Z）。熔断恢复由"冷却期被动半开"改为"APScheduler 定时主动探测"：短任务模式下熔断工具绑不到新任务（§7.9 绑定快照），被动半开拿不到线上探测流量，恢复完全交由定时任务按沉淀入参主动重放验证。核心代码：`agent/tools/probe.py`（探测服务）、`app/main.py`（lifespan 挂载调度器）、`agent/tools/circuit_breaker.py::auto_recover`（恢复落库）。
+
+**调度配置**（`core/config.py`）：
+
+| 配置                             | 默认值  | 说明                   |
+| ------------------------------ | ---- | -------------------- |
+| `agent_probe_enabled`          | true | 熔断恢复定时探测总开关          |
+| `agent_probe_interval_seconds` | 300  | 扫描探测间隔（秒），默认每 5 分钟一轮 |
+| `agent_probe_timeout_seconds`  | 30.0 | 单个工具探测调用超时上限（秒）      |
+
+**探测流程**（`probe.py::scan_and_probe`，`AsyncIOScheduler + IntervalTrigger` 每 5 分钟触发）：
+
+1. 扫描 `tool_registry` 中 `status=2`（熔断）且 `risk_level='read'`（只读工具）的行——写工具涉及数据变更，自动重放有副作用，**留人工恢复**（§7.7.3）；
+2. 逐行重放：复用 `manager._resolve_handler` 解析 handler（DbToolExecutor / KnowledgeToolExecutor / @tool 对象），以沉淀的 `last_error_args` 作为入参调用，整体受 `agent_probe_timeout_seconds` 超时保护；无入参或带 `_truncated` 标记的行跳过（留人工）；
+3. 探测成功 → `breaker.auto_recover(db, tool_name)`：关闭熔断器、计数器清零、status 置 1、remark="定时探测成功，自动恢复"，实时写回；
+4. 探测失败 → 记录 `last_error="定时探测失败：..."` 并提交，工具保持熔断状态，进入下一轮探测。
+
+**运行保障**：任务 `max_instances=1 + coalesce=True + misfire_grace_time=30` 防重入与堆积；调度器启动失败仅降级记日志（`scheduler=None`），不阻塞服务启动；多进程部署（uvicorn --workers>1）时各进程独立扫描，熔断状态正确性不受影响（已知权衡：各进程内存计数互相覆盖，仅统计值偏差）。
+
+**数据表变更**：`tool_registry` 新增 `last_error_args` 列（JSON，最近一次系统级失败的脱敏入参，供定时探测重放）；`Base.metadata.create_all` 不会给已有表加列，存量库需手动 `ALTER TABLE tool_registry ADD COLUMN last_error_args JSON NULL`。
 
 ### 7.8 工具启动注册机制（新增）
 
@@ -1076,7 +1209,7 @@ handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超
 **注册来源（两路合并）**：
 
 1. **@tool 装饰器工具**：`discover_decorated_tools()` 遍历 `agent_tool_scan_packages`（默认 `tools`）及其子模块，以 `isinstance(obj, BaseTool)` 判定（`@tool` 返回 `StructuredTool` 实例），提取名称 / 描述 / 参数 JSON Schema（`args_schema.model_json_schema()`）；结果进程级缓存（`get_decorated_tools`，运行时绑定复用）；
-2. **ToolSpec 注册表**：`agent/tools/registry.py` 中声明的内置工具（`REGISTRY`，db 工具 + `search_knowledge`），参数 Schema 由执行器方法签名推导（`_signature_to_json_schema`，支持 Optional/list/dict/默认值）。
+2. **ToolSpec 注册表**：`agent/tools/agent_tool.py` 中声明的内置工具（`REGISTRY`，db 工具 + `search_knowledge`），参数 Schema 由执行器方法签名推导（`_signature_to_json_schema`，支持 Optional/list/dict/默认值）。
 
 **幂等 upsert**（`sync_tool_registry`，按 `name` 唯一键）：
 
@@ -1084,6 +1217,8 @@ handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超
 - **已存在工具**：仅刷新元数据（描述 / 参数 / 分类 / 风险 / 审批开关 / 来源 / 熔断配置快照），**保留 `status / circuit_state / 计数`**——人工下线的 0、熔断中的 2 不被代码热升级重置，运维决策不丢；
 - 代码已移除的工具**不自动删除**（保留审计记录，可人工下线）；
 - 返回 `ToolSyncResult`（扫描/新增/更新/错误统计），供启动日志与观测。
+
+> 变更记录：2026-09-17。`_spec_to_row` 的参数 Schema 推导由「仅 DbToolExecutor 类」扩展为「DbToolExecutor + KnowledgeToolExecutor 双执行器类按 handler 名查找」，修复 `search_knowledge`（handler 位于 KnowledgeToolExecutor）注册时 parameters 列为空的问题；运行时绑定逻辑不受影响（`_resolve_handler` 本就双执行器解析）。
 
 ### 7.9 运行时绑定（查询生效工具 bind_tools，新增）
 
@@ -1114,28 +1249,31 @@ handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超
 | error                     | text           | 错误信息                                                       |
 | created\_at / updated\_at | datetime       | 时间戳                                                        |
 
-### 8.2 approval\_request（审批单）
+### 8.2 approval\_request（人工介入单：写审批 / 任务追问）
 
-> 变更记录：`feishu_instance_code` 废弃（保留列避免存量库迁移，代码不再写入）；`requester_id` 语义调整为**系统用户名**；新增 `decision_reason`（前台拒绝原因）；新增 `actions`（多 action 批次决策，2026-09-14）。
+> 变更记录：`feishu_instance_code` 废弃（保留列避免存量库迁移，代码不再写入）；`requester_id` 语义调整为**系统用户名**；新增 `decision_reason`（前台拒绝原因）；新增 `actions`（多 action 批次决策，2026-09-14）；泛化为"人工介入单"新增 `biz_type` 与 `answer` 列（任务追问 HITL，2026-09-17）。
 
-| 字段                        | 类型             | 说明                                                    |
-| ------------------------- | -------------- | ----------------------------------------------------- |
-| id                        | varchar(36) PK | UUID                                                  |
-| task\_execution\_id       | varchar(36)    | 关联任务                                                 |
-| conversation\_id          | varchar(36)    | 关联会话（= thread\_id）                                  |
-| requester\_id             | varchar(64)    | 发起人（系统用户名，JWT username）                          |
-| approval\_type            | varchar(32)    | update / delete / insert（首个 action）                |
-| target\_table             | varchar(64)    | 目标表（首个 action）                                      |
-| tool\_params              | JSON           | 首个待执行工具参数（脱敏，values/filters 分键，供审批卡片渲染）       |
+| 字段                        | 类型             | 说明                                                                                    |
+| ------------------------- | -------------- | ------------------------------------------------------------------------------------- |
+| id                        | varchar(36) PK | UUID                                                                                  |
+| biz\_type                 | varchar(32)    | 业务类型：`write_approval`（写操作审批，默认）/ `clarification`（任务追问）                                |
+| task\_execution\_id       | varchar(36)    | 关联任务                                                                                  |
+| conversation\_id          | varchar(36)    | 关联会话（= thread\_id）                                                                    |
+| requester\_id             | varchar(64)    | 发起人（系统用户名，JWT username）                                                               |
+| approval\_type            | varchar(32)    | update / delete / insert（首个 action）；追问单为 `clarification`                              |
+| target\_table             | varchar(64)    | 目标表（首个 action）                                                                        |
+| tool\_params              | JSON           | 首个待执行工具参数（脱敏，values/filters 分键）；追问单存 `{"question": "..."}`                            |
 | actions                   | JSON           | 全部待审批操作列表（脱敏，`[{approval_type,target_table,tool_params}]`；单 action 为单元素列表，供决策数量与明细渲染） |
-| status                    | varchar(32)    | pending / approved / rejected / canceled                |
-| feishu\_instance\_code    | varchar(128)   | **废弃**（历史列，不再写入）                                  |
-| approved\_by              | varchar(64)    | 审批人（前台提交决策的 JWT username）                           |
-| decision\_reason          | varchar(255)   | 审批意见（前台可选填写，默认空）                                  |
-| callback\_payload         | JSON           | 审计载荷（前台模式存决策请求体摘要）                                |
-| created\_at / updated\_at | datetime       | 时间戳                                                    |
+| status                    | varchar(32)    | 审批单：pending / approved / rejected / canceled；追问单：pending / answered                   |
+| feishu\_instance\_code    | varchar(128)   | **废弃**（历史列，不再写入）                                                                      |
+| approved\_by              | varchar(64)    | 审批人 / 追问回答人（前台提交的 JWT username）                                                       |
+| decision\_reason          | varchar(255)   | 审批意见（前台可选填写，默认空）                                                                      |
+| answer                    | varchar(500)   | 追问回答（biz\_type=clarification 时使用）                                                     |
+| callback\_payload         | JSON           | 审计载荷（前台模式存决策请求体摘要）                                                                    |
+| created\_at / updated\_at | datetime       | 时间戳                                                                                   |
 
 > 索引：`idx_appr_instance(instance_code)`（废弃后可不再新建）、`idx_appr_conv(conversation_id, status)`（支撑"按会话查 pending 审批单"卡片重建）。
+> 存量库迁移：`ALTER TABLE approval_request ADD COLUMN biz_type VARCHAR(32) NOT NULL DEFAULT 'write_approval', ADD COLUMN answer VARCHAR(500) NULL;`
 > 新表由 `Base.metadata.create_all` 在启动时自动创建（沿用现有机制）。
 
 ### 8.3 tool\_registry（工具注册表，新增）
@@ -1144,37 +1282,38 @@ handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超
 
 **状态语义（status 列）**：`1=生效`（允许绑定给 Agent）、`0=失效`（人工下线）、`2=熔断`（熔断器打开，自动或人工触发）。
 
-| 字段 | 类型 | 说明 |
-| ---- | ---- | ---- |
-| id | varchar(36) PK | UUID |
-| name | varchar(128) UK | 工具名（Agent 调用名，唯一键） |
-| description | text | 工具能力描述（供 LLM 选择工具） |
-| parameters | JSON | 工具参数 JSON Schema（管理台展示 / 参数级校验） |
-| category | varchar(64) | 工具分类：db / knowledge / search / custom |
-| risk\_level | varchar(16) | 风险等级：read / write |
-| requires\_approval | smallint | 是否触发人工审批：1/0 |
-| status | smallint | **1=生效 0=失效 2=熔断**（索引） |
-| source | varchar(255) | 工具来源：`executor:<方法名>` / `module:<模块>:<属性>`（运行时解析执行函数用） |
-| version | varchar(32) | 工具版本（工具变更时递增） |
-| failure\_threshold | int | 连续失败阈值（默认 5） |
-| failure\_ratio | float | 窗口失败率阈值快照（默认 0.5） |
-| window\_seconds | int | 失败率统计窗口（秒，默认 60） |
-| cooldown\_seconds | int | 熔断冷却期（秒，默认 60） |
-| half\_open\_max\_trials | int | 半开探测最大放行次数（默认 3，防雪崩） |
-| circuit\_state | varchar(16) | 熔断状态：CLOSED / OPEN / HALF\_OPEN |
-| consecutive\_failures | int | 连续失败次数 |
-| total\_calls / success\_calls / fail\_calls | int | 累计调用 / 成功 / 失败次数 |
-| window\_failures / window\_calls | int | 当前窗口失败 / 调用次数 |
-| window\_start\_at | datetime | 当前统计窗口开始时间 |
-| half\_open\_trials | int | 半开已放行探测次数 |
-| circuit\_open\_at | datetime | 熔断打开时间 |
-| circuit\_open\_until | datetime | 熔断到期时间（到期进入半开探测） |
-| last\_error | text | 最近一次失败原因（脱敏） |
-| last\_call\_at / last\_success\_at | datetime | 最近调用 / 成功时间 |
-| avg\_latency\_ms | int | 平均耗时（毫秒，指数平滑 EMA） |
-| remark | varchar(255) | 备注（熔断原因 / 下线原因等，审计） |
-| created\_by | varchar(64) | 创建人（默认 system） |
-| created\_at / updated\_at | datetime | 创建 / 更新时间 |
+| 字段                                          | 类型              | 说明                                                             |
+| ------------------------------------------- | --------------- | -------------------------------------------------------------- |
+| id                                          | varchar(36) PK  | UUID                                                           |
+| name                                        | varchar(128) UK | 工具名（Agent 调用名，唯一键）                                             |
+| description                                 | text            | 工具能力描述（供 LLM 选择工具）                                             |
+| parameters                                  | JSON            | 工具参数 JSON Schema（管理台展示 / 参数级校验）                                |
+| category                                    | varchar(64)     | 工具分类：db / knowledge / search / custom                          |
+| risk\_level                                 | varchar(16)     | 风险等级：read / write                                              |
+| requires\_approval                          | smallint        | 是否触发人工审批：1/0                                                   |
+| status                                      | smallint        | **1=生效 0=失效 2=熔断**（索引）                                         |
+| source                                      | varchar(255)    | 工具来源：`executor:<方法名>` / `module:<模块>:<属性>`（运行时解析执行函数用）         |
+| version                                     | varchar(32)     | 工具版本（工具变更时递增）                                                  |
+| failure\_threshold                          | int             | 连续失败阈值（默认 5）                                                   |
+| failure\_ratio                              | float           | 窗口失败率阈值快照（默认 0.5）                                              |
+| window\_seconds                             | int             | 失败率统计窗口（秒，默认 60）                                               |
+| cooldown\_seconds                           | int             | 熔断冷却期（秒，默认 60）                                                 |
+| half\_open\_max\_trials                     | int             | 半开探测最大放行次数（默认 3，防雪崩）                                           |
+| circuit\_state                              | varchar(16)     | 熔断状态：CLOSED / OPEN / HALF\_OPEN（**HALF\_OPEN 已废弃**，字段保留兼容存量数据） |
+| consecutive\_failures                       | int             | 连续失败次数                                                         |
+| total\_calls / success\_calls / fail\_calls | int             | 累计调用 / 成功 / 失败次数                                               |
+| window\_failures / window\_calls            | int             | 当前窗口失败 / 调用次数                                                  |
+| window\_start\_at                           | datetime        | 当前统计窗口开始时间                                                     |
+| half\_open\_trials                          | int             | 半开已放行探测次数（已废弃，保留兼容）                                            |
+| circuit\_open\_at                           | datetime        | 熔断打开时间                                                         |
+| circuit\_open\_until                        | datetime        | 熔断到期时间（**仅作展示**，恢复已改由定时探测驱动，§7.7.6）                            |
+| last\_error                                 | text            | 最近一次失败原因（脱敏）                                                   |
+| last\_error\_args                           | JSON            | 最近一次系统级失败的工具入参（脱敏，供定时探测重放验证恢复，§7.7.2）                          |
+| last\_call\_at / last\_success\_at          | datetime        | 最近调用 / 成功时间                                                    |
+| avg\_latency\_ms                            | int             | 平均耗时（毫秒，指数平滑 EMA）                                              |
+| remark                                      | varchar(255)    | 备注（熔断原因 / 下线原因等，审计）                                            |
+| created\_by                                 | varchar(64)     | 创建人（默认 system）                                                 |
+| created\_at / updated\_at                   | datetime        | 创建 / 更新时间                                                      |
 
 > 索引：`idx_tool_status(status)`（支撑启动注册与运行时"查生效工具"）、`idx_tool_category(category)`（管理台按分类过滤）。
 > 写入时机：① 启动时由 `registrar.sync_tool_registry` 幂等 upsert；② 运行时由熔断器（`_open_circuit` 置 status=2）与工具管理 API（人工流转）更新。
@@ -1185,18 +1324,24 @@ handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超
 
 ### 9.1 新增接口
 
-| 方法   | 路径                                     | 说明                            | 鉴权          |
-| ---- | -------------------------------------- | ----------------------------- | ----------- |
-| POST | `/api/agent/chat`                      | 智能对话（意图路由 + 知识库/任务/聊天），SSE 流式 | JWT         |
-| POST | `/api/approval/{approval_id}/decision` | 前台审批决策（approved/rejected + 可选原因），受理后后台恢复图执行 | JWT（仅发起人） |
-| GET  | `/api/approval?conversation_id=xxx`    | 按会话查询审批单列表（刷新后重建审批卡片）         | JWT（仅发起人）   |
-| GET  | `/api/agent/tasks/{task_execution_id}` | 查询任务执行状态与结果（轮询兜底）             | JWT         |
-| GET  | `/api/approval/{approval_id}`          | 查询审批单状态（轮询兜底）                 | JWT         |
-| GET  | `/api/tools`                           | 工具列表（按 status/category/keyword 过滤，管理台） | JWT         |
-| GET  | `/api/tools/{name}`                    | 工具详情（含熔断状态与调用统计）              | JWT         |
-| PATCH | `/api/tools/{name}/status`            | 调整工具状态（1↔0、1→2、2→1、2→0，运维熔断/恢复/下线） | JWT         |
+| 方法    | 路径                                       | 说明                                                    | 鉴权        |
+| ----- | ---------------------------------------- | ----------------------------------------------------- | --------- |
+| POST  | `/api/agent/chat`                        | 智能对话（意图路由 + 知识库/任务/聊天），SSE 流式                         | JWT       |
+| POST  | `/api/approval/{approval_id}/decision`   | 前台审批决策（approved/rejected + 可选原因），受理后后台恢复图执行           | JWT（仅发起人） |
+| GET   | `/api/approval?conversation_id=xxx`      | 按会话查询审批单列表（仅写审批，刷新后重建审批卡片）                            | JWT（仅发起人） |
+| GET   | `/api/agent/tasks/{task_execution_id}`   | 查询任务执行状态与结果（轮询兜底）                                     | JWT       |
+| GET   | `/api/approval/{approval_id}`            | 查询审批单状态（轮询兜底）                                         | JWT       |
+| GET   | `/api/tools`                             | 工具列表（按 status/category/keyword 过滤，管理台）                | JWT       |
+| GET   | `/api/tools/{name}`                      | 工具详情（含熔断状态与调用统计）                                      | JWT       |
+| PATCH | `/api/tools/{name}/status`               | 调整工具状态（1↔0、1→2、2→1、2→0，运维熔断/恢复/下线）                    | JWT       |
+| POST  | `/api/agent/clarify/{clarify_id}/answer` | 提交追问答案（批量 answers / 兼容单 answer，受理后后台恢复图执行，LLM 继续处理任务） | JWT（仅发起人） |
+| POST  | `/api/agent/clarify/{clarify_id}/cancel` | 取消追问（pending→canceled，恢复图执行告知 LLM 已取消并给出修复建议，任务标记终止）  | JWT（仅发起人） |
+| GET   | `/api/agent/clarify?conversation_id=xxx` | 按会话查询追问单列表（刷新后重建追问卡片）                                 | JWT（仅发起人） |
+| GET   | `/api/agent/metrics`                     | 观测快照：进程内计数器与耗时聚合（阶段 4，§15.5）                          | JWT       |
 
 > 变更记录：原 `POST /api/approval/callback`（飞书事件回调，无 JWT）随飞书对接移除而废弃。
+> 阶段 4 新增：`GET /api/agent/metrics`（§15.5）；`GET /health?detailed=true`（依赖体检，§15.4）。
+> SSE 响应新增 `X-Trace-Id` 响应头（字段名可配置），前端/网关可据此串联服务端日志（§15.2）。
 
 请求体（`/api/agent/chat`）与现有 `ChatRequest` 对齐：
 
@@ -1243,9 +1388,40 @@ AGENT_CIRCUIT_FAILURE_THRESHOLD=5          # 连续失败阈值：连续失败�
 AGENT_CIRCUIT_FAILURE_RATIO=0.5            # 窗口失败率阈值：窗口内失败率超过且达到最小调用量时熔断
 AGENT_CIRCUIT_MIN_CALLS=10                 # 失败率判定所需的最小窗口调用量（防小样本误熔断）
 AGENT_CIRCUIT_WINDOW_SECONDS=60            # 失败率统计窗口（秒）
-AGENT_CIRCUIT_COOLDOWN_SECONDS=60          # 熔断冷却期（秒），到期后进入半开探测
-AGENT_CIRCUIT_HALF_OPEN_MAX_TRIALS=3       # 半开探测最大放行次数（成功即恢复，失败即重新熔断）
+AGENT_CIRCUIT_COOLDOWN_SECONDS=60          # 熔断冷却期（秒）（已废弃：恢复改由定时探测驱动，字段保留兼容）
+AGENT_CIRCUIT_HALF_OPEN_MAX_TRIALS=3       # 半开探测最大放行次数（已废弃：半开恢复移除，字段保留兼容）
+AGENT_CIRCUIT_FLUSH_INTERVAL_SECONDS=1      # 熔断计数批量落库间隔（秒）：后台合并写回，降低每调用一次 DB 写
+AGENT_PROBE_ENABLED=true                    # 熔断恢复定时探测总开关（§7.7.6，新增）
+AGENT_PROBE_INTERVAL_SECONDS=300            # 扫描探测间隔（秒），默认每 5 分钟一轮（§7.7.6，新增）
+AGENT_PROBE_TIMEOUT_SECONDS=30.0            # 单个工具探测调用超时上限（秒）（§7.7.6，新增）
+AGENT_PROBE_EXCLUDE_TOOLS=ask_user          # 定时探测排除的工具（逗号分隔）：交互式工具重放会再次触发 interrupt，不可自动恢复（§15.6-13）
+
+# ---- 意图识别分层优化（§16，新增） ----
+INTENT_GATE_ENABLED=true                 # 规则快速通道总开关（false 则全部走 LLM 分类）
+INTENT_SLASH_ENABLED=true                # 斜杠命令本地处理总开关
+INTENT_SLASH_SHORTCUT=true               # 斜杠命令是否短路图执行
+INTENT_TRIVIAL_KEYWORDS=                 # 寒暄关键词表覆盖（空串用内置默认表）
+INTENT_ESCALATION_MODEL=qwen-plus        # 低置信度升级重判模型（空串或同主模型则跳过）
+INTENT_LLM_CACHE_CONFIDENCE=0.85         # LLM 结果进入进程内缓存的置信度门槛
+INTENT_EMBED_THRESHOLD=0.86              # 向量就近判定阈值（低于则回落 LLM）
+
+# ---- 观测与加固（§15，阶段 4 新增） ----
+TRACE_ID_HEADER=X-Trace-Id                  # 响应头中的链路追踪 ID 字段名
+AGENT_METRICS_ENABLED=true                  # 进程内指标采集总开关（关闭后 /api/agent/metrics 返回 enabled=false）
+LANGSMITH_TRACING=true                      # LangSmith 链路追踪开关（需配合 LANGSMITH_API_KEY 环境变量）
+LANGSMITH_PROJECT=lingxi-agent              # LangSmith 项目名（控制台过滤维度）
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com  # LangSmith 服务端点（自建填自托管地址）
+AGENT_REQUEST_TIMEOUT_SECONDS=180           # 单次 /api/agent/chat 主图执行整体超时（秒）
+AGENT_MERGE_TIMEOUT_SECONDS=60              # merge 汇总节点 LLM 调用超时（秒）
+AGENT_MERGE_LLM_RETRIES=1                   # merge 汇总 LLM 失败重试次数（不含首次，耗尽降级为拼接）
+AGENT_RESUME_TIMEOUT_SECONDS=300            # 审批/追问恢复图执行整体超时（秒）
+AGENT_GRAPH_RECURSION_LIMIT=100             # 主图 / 任务 Agent 递归步数上限（防死循环）
+AGENT_SSE_QUEUE_MAXSIZE=1000                # SSE 事件队列容量（0=无界，不推荐）
+AGENT_SSE_PUT_TIMEOUT_SECONDS=2.0           # 队列满时投递最长等待（秒），超时丢弃并告警
 ```
+
+> **超时体系全景**（阶段 4 后共六层，从外到内）：单次请求 `180s` → Agent 循环墙钟 `120s`（非审批模式）→ 单步 LLM `60s` / 汇聚 LLM `60s` → 单次工具 `30s` → 语句级 `120s`；恢复链路独立 `300s`，递归步数上限 `100`。
+> 注：日志格式化串不含 `%(trace_id)s` 占位声明——该字段由 `install_trace_logging()` 在过滤器装配成功后动态注入，保证观测初始化失败时日志不崩溃（§15.2）。
 
 > 变更记录：原 FEISHU_* 五项配置随飞书对接移除而废弃（`core/config.py` 中相应字段与 `agent/approval/feishu_client.py`、`callback.py` 一并清理）。
 
@@ -1253,15 +1429,15 @@ AGENT_CIRCUIT_HALF_OPEN_MAX_TRIALS=3       # 半开探测最大放行次数（�
 
 ## 11. 安全设计
 
-| 风险点         | 措施                                                     |
-| ----------- | ------------------------------------------------------ |
-| SQL 注入      | 工具仅接收结构化参数，语句全部绑定参数化执行；禁止 LLM 拼接 SQL                   |
-| 越权访问数据      | 表/列白名单 + 权限过滤（复用现有 metadata.auth\_option 机制）+ 查询 LIMIT |
-| 任务 Agent 失控 | 工具集最小化、每次调用审计落库、超时保护、审批门兜底                             |
+| 风险点         | 措施                                                                           |
+| ----------- | ---------------------------------------------------------------------------- |
+| SQL 注入      | 工具仅接收结构化参数，语句全部绑定参数化执行；禁止 LLM 拼接 SQL                                         |
+| 越权访问数据      | 表/列白名单 + 权限过滤（复用现有 metadata.auth\_option 机制）+ 查询 LIMIT                       |
+| 任务 Agent 失控 | 工具集最小化、每次调用审计落库、超时保护、审批门兜底                                                   |
 | 审批决策接口伪造/越权 | JWT 鉴权 + 发起人本人校验（requester\_id 比对，越权 403）+ 原子抢占状态机（重复提交/重复恢复幂等拦截）+ 决策请求体审计落库 |
-| 提示词注入       | 意图识别与工具描述中显式声明"仅处理授权范围内的数据库操作"；知识库内容注入的防御沿用现有提示词分层隔离   |
-| 敏感信息泄露      | 日志与审计中不记录完整参数值（脱敏），审批表单仅展示必要摘要                         |
-| 并发/重复审批     | 审批单状态机（pending→approved/rejected 单向流转）+ 恢复时再次校验状态      |
+| 提示词注入       | 意图识别与工具描述中显式声明"仅处理授权范围内的数据库操作"；知识库内容注入的防御沿用现有提示词分层隔离                         |
+| 敏感信息泄露      | 日志与审计中不记录完整参数值（脱敏），审批表单仅展示必要摘要                                               |
+| 并发/重复审批     | 审批单状态机（pending→approved/rejected 单向流转）+ 恢复时再次校验状态                            |
 
 ***
 
@@ -1271,56 +1447,89 @@ AGENT_CIRCUIT_HALF_OPEN_MAX_TRIALS=3       # 半开探测最大放行次数（�
 
 ### 12.1 新增文件（无风险）
 
-| 文件                                                | 内容                   |
-| ------------------------------------------------- | -------------------- |
-| `agent/**`                                        | 图状态、节点、工具、审批、知识服务适配层 |
-| `models/task_model.py` / `task_schema.py`         | 任务表与 Schema          |
-| `models/approval_model.py` / `approval_schema.py` | 审批表与 Schema          |
-| `api/routes/agent.py` / `approval.py`             | 新接口路由                |
-| `models/tool_model.py` / `tool_schema.py`         | 工具注册表（tool_registry）ORM 与 Schema（§8.3，新增） |
-| `agent/tools/circuit_breaker.py`                  | 企业级工具熔断器（状态机 + 自动/人工熔断 + 快速失败，§7.7，新增） |
-| `agent/tools/registrar.py`                        | 启动注册（扫描 @tool 工具 + ToolSpec → 幂等 upsert，§7.8，新增） |
-| `agent/tools/manager.py`                          | 运行时绑定（查询 status=1 生效工具 + 超时/熔断包装，§7.9，新增） |
-| `api/routes/tools.py`                             | 工具管理 API（列表 / 详情 / 状态变更，§9.1，新增） |
-| `scripts/mock_circuit_breaker_test.py`            | 熔断器状态机 mock 测试脚本（CLOSED→OPEN→HALF_OPEN 全流程验证，§7.7，新增） |
-| `docs/lingxi_agent_langgraph_redesign.md`         | 本文档                  |
+| 文件                                                | 内容                                                                                                                                                                         |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent/**`                                        | 图状态、节点、工具、审批、知识服务适配层                                                                                                                                                       |
+| `models/task_model.py` / `task_schema.py`         | 任务表与 Schema                                                                                                                                                                |
+| `models/approval_model.py` / `approval_schema.py` | 审批表与 Schema                                                                                                                                                                |
+| `api/routes/agent.py` / `approval.py`             | 新接口路由                                                                                                                                                                      |
+| `models/tool_model.py` / `tool_schema.py`         | 工具注册表（tool_registry）ORM 与 Schema（§8.3，新增）                                                                                                                                  |
+| `agent/tools/circuit_breaker.py`                  | 企业级工具熔断器（仅系统级故障熔断 + 入参沉淀 + 快速失败 + 定时探测恢复，§7.7，新增）                                                                                                                          |
+| `agent/tools/probe.py`                            | 熔断恢复定时探测（APScheduler 扫描 status=2 只读工具按入参重放，§7.7.6，新增）                                                                                                                      |
+| `agent/tools/registrar.py`                        | 启动注册（扫描 @tool 工具 + ToolSpec → 幂等 upsert，§7.8，新增）                                                                                                                           |
+| `agent/tools/manager.py`                          | 运行时绑定（查询 status=1 生效工具 + 超时/熔断包装，§7.9，新增）                                                                                                                                  |
+| `api/routes/tools.py`                             | 工具管理 API（列表 / 详情 / 状态变更，§9.1，新增）                                                                                                                                           |
+| `scripts/mock_circuit_breaker_test.py`            | 熔断器 mock 测试脚本（仅系统故障熔断 / 入参脱敏沉淀 / 快速失败 / 定时探测恢复全流程验证，§7.7，新增）                                                                                                               |
+| `agent/observability.py`（阶段 4）                    | 观测内核：trace_id ContextVar 贯穿 / 日志 TraceIdFilter / LangSmith 追踪开关与 run metadata / 进程内 MetricsRegistry / `node_trace` 节点追踪装饰器 / `call_with_timeout` 统一超时包装（§15.2、§15.3、§15.5） |
+| `agent/health.py`（阶段 4）                           | 依赖体检：业务库连通性 / 检查点可用性 / 主图编译 / 工具熔断分布 / 检索与缓存单例（§15.4）                                                                                                                      |
+| `scripts/smoke_observability.py`（阶段 4）            | 观测与加固离线冒烟脚本：trace_id 继承 / 指标计算 / SSE 背压丢帧 / 节点追踪 / 健康巡检降级 / 路由降级（§15.7）                                                                                                    |
+| `agent/intent_gate.py`（§16）                       | 意图规则门控内核：斜杠命令表与解析 / 寒暄门控（`is_trivial` 剩余实质字符判定） / 数据库强信号与知识库指名识别 / 短追问继承 / 向量就近原型判定 / 决策缓存与序列化（§16.5）                                                                      |
+| `scripts/smoke_intent_gate.py`（§16）               | 意图分层判定离线冒烟：9 组共 45 项断言（不依赖 LLM / MySQL / Qdrant / embedding API，§16.7）                                                                                                     |
+| `docs/lingxi_agent_langgraph_redesign.md`         | 本文档                                                                                                                                                                        |
 
 ### 12.2 修改文件（改动极小，需评审确认）
 
-| 文件                                | 改动点                                                                                                                                                                                                                  | 影响范围               |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `requirements.txt`                | 已改：新增 langgraph 生态、openai 3.x；升级 langchain 系列；**移除 lark-oapi**（前台审批，见 §5.6）                                                                                                                                         | 依赖安装（由用户执行）        |
-| `core/config.py`                  | 新增任务执行配置项（纯新增字段，默认值兜底）；**移除 FEISHU_\* 配置**，新增 `APPROVAL_WAIT_TIMEOUT`                                                                                                                                                 | 无行为影响              |
-| `.env.dev`                        | 移除飞书配置占位                                                                                                                                                                                                             | 仅本地开发              |
-| `app/main.py`                     | lifespan 中初始化 Agent 图（含 MySQL 检查点）；注册 2 个新路由                                                                                                                                                                         | 启动流程扩展，失败降级不影响现有功能 |
-| `app/main.py`（工具治理）           | lifespan 中 `create_all` 后同步工具注册表（`sync_tool_registry`，失败降级不阻塞启动）；注册 `api/routes/tools.py` 路由（§7.8/§9.1） | 启动流程扩展，无行为影响 |
-| `core/config.py`（工具治理）        | 新增 `AGENT_TOOL_SCAN_PACKAGES` / `TOOL_REGISTRY_SYNC_ON_START` / `AGENT_CIRCUIT_*` 系列配置（纯新增字段，默认值兜底，§10） | 无行为影响 |
-| `agent/nodes/task_node.py`（工具治理） | `_build_task_agent` 改为 `async def`，工具绑定由固定注册表改为 `await bind_active_tools(db, ...)`（查询 tool_registry status=1 生效工具，§7.9）；超时/错误处理逻辑迁至 `agent/tools/manager.py` | 工具集由数据库驱动，行为增强 |
-| `models/__init__.py`（工具治理）    | 导出 `ToolRegistry` / `ToolStatus` / `ToolCircuitState` | 无行为影响 |
-| `prompt/prompt_storage.py`        | 新增意图识别/任务执行提示词（纯追加）                                                                                                                                                                                                  | 无                  |
-| `rag/rag_conversation_service.py` | 新增 2\~3 个**公开薄方法**（如 `retrieve_context_public`、`get_compressed_history_public`），内部委托现有私有方法；移除 BM25 索引管理器初始化/重建，`rebuild_hybrid_index` 改为 `invalidate_kb_semantic_cache`（仅失效语义缓存），检索链路预计算稠密+稀疏双向量并全链路传递               | 检索行为不变，仅实现载体变化     |
-| `rag/hybrid_retriever.py`         | 移除内存 `BM25Indexer`/持久化/同步机制，BM25 路改为 Qdrant **稀疏向量**查询（`query_points` + `using="sparse"`，查询侧与写入侧共用 text-embedding-v4 生成的稀疏向量，支持 `precomputed_sparse` 预计算复用）；RRF 双路融合与 Cross-Encoder 重排保留                             | 检索行为不变，依赖更少        |
-| `embeddings/embedding_deal.py`    | 集合同时配置**稠密 + 稀疏**向量（兼容存量无名稠密向量，增量补充 sparse 配置）；`save_to_vectors` 双向量写入，同 `doc_id` 先删后插（Qdrant 删点即删全部向量）；`DashScopeEmbedding` 基于 text-embedding-v4 一次调用双输出（`embed_documents_with_sparse` / `embed_query_with_sparse`） | 写入侧新增稀疏向量，检索侧无需感知  |
-| `api/routes/file_process.py`      | 移除 BM25 索引重建步骤，改为知识库变更后失效语义缓存（失败仅告警不阻断）                                                                                                                                                                              | 同 doc_id 自动先删后插    |
-| `rag/memory_mysql.py`             | 如需可暴露历史加载公开方法（可选）                                                                                                                                                                                                    | 仅新增方法              |
-
-### 12.3 明确不改动
-
-- `rag/semantic_cache.py`、`rag/memory_mysql.py`、`ingestion/**`、`utils/**`（原样保留）
-- `rag/hybrid_retriever.py`、`embeddings/embedding_deal.py` 已完成 **BM25→text-embedding-v4 稀疏向量**改造（见 §12.2）；`rag/bm25_index_manager.py` 已删除
-- `api/routes/conversation.py`、`auth.py`、`metadata.py`、`attachments.py`、`cache.py`（旧接口原样保留）
+| 文件                                   | 改动点                                                                                                                                                                                                                  | 影响范围                              |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| `requirements.txt`                   | 已改：新增 langgraph 生态、openai 3.x；升级 langchain 系列；**移除 lark-oapi**（前台审批，见 §5.6）                                                                                                                                          | 依赖安装（由用户执行）                       |
+| `core/config.py`                     | 新增任务执行配置项（纯新增字段，默认值兜底）；**移除 FEISHU_\* 配置**，新增 `APPROVAL_WAIT_TIMEOUT`                                                                                                                                                | 无行为影响                             |
+| `.env.dev`                           | 移除飞书配置占位                                                                                                                                                                                                             | 仅本地开发                             |
+| `app/main.py`                        | lifespan 中初始化 Agent 图（含 MySQL 检查点）；注册 2 个新路由                                                                                                                                                                         | 启动流程扩展，失败降级不影响现有功能                |
+| `app/main.py`（工具治理）                  | lifespan 中 `create_all` 后同步工具注册表（`sync_tool_registry`，失败降级不阻塞启动）；注册 `api/routes/tools.py` 路由（§7.8/§9.1）                                                                                                              | 启动流程扩展，无行为影响                      |
+| `core/config.py`（工具治理）               | 新增 `AGENT_TOOL_SCAN_PACKAGES` / `TOOL_REGISTRY_SYNC_ON_START` / `AGENT_CIRCUIT_*` 系列配置（纯新增字段，默认值兜底，§10）                                                                                                              | 无行为影响                             |
+| `agent/nodes/task_node.py`（工具治理）     | `_build_task_agent` 改为 `async def`，工具绑定由固定注册表改为 `await bind_active_tools(db, ...)`（查询 tool_registry status=1 生效工具，§7.9）；超时/错误处理逻辑迁至 `agent/tools/manager.py`                                                         | 工具集由数据库驱动，行为增强                    |
+| `models/__init__.py`（工具治理）           | 导出 `ToolRegistry` / `ToolStatus` / `ToolCircuitState`                                                                                                                                                                | 无行为影响                             |
+| `prompt/prompt_storage.py`           | 新增意图识别/任务执行提示词（纯追加）；2026-09-17 强化任务引导：表名不确定先 `list_tables`、缺依据先查知识库再决策                                                                                                                                               | 无                                 |
+| `rag/rag_conversation_service.py`    | 新增 2\~3 个**公开薄方法**（如 `retrieve_context_public`、`get_compressed_history_public`），内部委托现有私有方法；移除 BM25 索引管理器初始化/重建，`rebuild_hybrid_index` 改为 `invalidate_kb_semantic_cache`（仅失效语义缓存），检索链路预计算稠密+稀疏双向量并全链路传递               | 检索行为不变，仅实现载体变化                    |
+| `rag/hybrid_retriever.py`            | 移除内存 `BM25Indexer`/持久化/同步机制，BM25 路改为 Qdrant **稀疏向量**查询（`query_points` + `using="sparse"`，查询侧与写入侧共用 text-embedding-v4 生成的稀疏向量，支持 `precomputed_sparse` 预计算复用）；RRF 双路融合与 Cross-Encoder 重排保留                             | 检索行为不变，依赖更少                       |
+| `embeddings/embedding_deal.py`       | 集合同时配置**稠密 + 稀疏**向量（兼容存量无名稠密向量，增量补充 sparse 配置）；`save_to_vectors` 双向量写入，同 `doc_id` 先删后插（Qdrant 删点即删全部向量）；`DashScopeEmbedding` 基于 text-embedding-v4 一次调用双输出（`embed_documents_with_sparse` / `embed_query_with_sparse`） | 写入侧新增稀疏向量，检索侧无需感知                 |
+| `api/routes/file_process.py`         | 移除 BM25 索引重建步骤，改为知识库变更后失效语义缓存（失败仅告警不阻断）                                                                                                                                                                              | 同 doc_id 自动先删后插                   |
+| `rag/memory_mysql.py`                | 如需可暴露历史加载公开方法（可选）                                                                                                                                                                                                    | 仅新增方法                             |
+| `app/main.py`（阶段 4）                  | 观测初始化（`install_trace_logging` + `init_tracing`，失败仅打印不阻塞启动）；`/health` 新增 `?detailed=true` 依赖体检模式（精简响应保持兼容）                                                                                                            | 启动流程扩展，无行为影响                      |
+| `core/config.py`（阶段 4）               | 新增追踪 / 指标 / 三层超时 / SSE 背压 / 递归上限 / 探测排除等配置（纯新增字段，默认值兜底，§10）                                                                                                                                                          | 无行为影响                             |
+| `.env.dev`（阶段 4）                     | 补齐观测与加固配置项、工具治理与缺失的任务执行超时配置（`AGENT_TOOL_TIMEOUT_SECONDS` / `AGENT_LLM_TIMEOUT_SECONDS` 此前未在示例环境中配置）                                                                                                                  | 仅本地开发                             |
+| `agent/streaming.py`（阶段 4）           | SSE 队列改为**有界**（`create_sse_queue`）+ 投递限时丢帧（`_safe_put`）+ 新增 `put_frame`；补齐此前缺失的日志埋点                                                                                                                                  | 慢客户端不再拖垮内存，接口向后兼容                 |
+| `agent/graph_builder.py`（阶段 4）       | 6 个节点挂 `node_trace`；merge LLM 加超时与重试；路由/汇总/收尾补日志；新增 `_persist_final_snapshot` 回写 §8.1 的 `result` / `rag_answer`                                                                                                      | 可观测性增强，新增审计写不等式                   |
+| `agent/nodes/*`（阶段 4）                | 任务节点：`{**(config or {})}` 修 `config=None` 崩溃 + 递归上限配置化 + trace_id 日志 + 耗时/工具数埋点；聊天节点：LLM 超时；知识库节点：流式生成超时并保留部分回答                                                                                                      | 行为增强，消除崩溃路径                       |
+| `agent/approval/*`（阶段 4）             | 恢复调用统一超时 + 递归上限 + LangSmith 元数据；`_find_running_task` 异常兜底回滚；**修复 `put_status` 未导入缺陷**（会导致审批回显 NameError 并中断恢复）；追问/审批计数与 trace_id 日志                                                                                  | 修复真实缺陷 + 链路加固                     |
+| `agent/tools/manager.py`（阶段 4）       | `_breaker_wrap` 增加工具级成功/失败/耗时埋点                                                                                                                                                                                      | 仅新增观测，无行为影响                       |
+| `agent/tools/probe.py`（阶段 4）         | 定时探测排除交互式工具（`agent_probe_exclude_tools`）+ 每轮绑定 trace_id + 探测计数                                                                                                                                                       | 修复「ask_user 永不可自动恢复」              |
+| `agent/tools/agent_tool.py`（阶段 4）    | 新增 `_clamp_questions()`：追问问题数服务端硬约束（此前仅提示词约束）                                                                                                                                                                        | 防御性加固                             |
+| `api/routes/agent.py`（阶段 4）          | 请求入口绑定 trace_id 并回写 `X-Trace-Id`；主图整体超时兜底；sentinel 限时投递；新增 `GET /api/agent/metrics`                                                                                                                                  | 新增接口 + 链路加固                       |
+| `api/routes/approval.py`（阶段 4）       | 决策接口绑定 trace_id 并写入响应体                                                                                                                                                                                               | 仅新增观测字段                           |
+| `agent/intent_router.py`（§16）        | **重构为四层递进**：`classify` 新增可选 `query_embedding` / `last_intents` 参数；新增 `_fast_path`（规则+缓存）/ `_vector_path`（向量就近）/ `_llm_classify` / `_escalate`（升级重判）；新增来源层与耗时观测；`_to_result` / `_log_*` 辅助                            | 接口向后兼容（新参数均可选）；LLM 路径逻辑与归一化规则完全保留 |
+| `agent/graph_builder.py`（§16）        | `intent_router_node` 前置规则门控（斜杠命令短路 / 规则命中直出确定性意图）；新增 `_SLASH_HELP` 与 `_slash_handoff`（本地回执文案）；新增 `agent.intent.slash` 计数                                                                                             | 新增短路分支，无既有分支删除                    |
+| `agent/nodes/chat_node.py`（§16）      | 新增斜杠回执**零 LLM 直达**（24 字分片流式，不构造 Prompt）；assistant 消息落库附带 `additional_kwargs["lingxi_intents"]`；新增 `_extract_last_intents` / `_intent_metadata`                                                                       | 消息增加额外元数据，旧数据解析失败自动跳过             |
+| `agent/nodes/knowledge_node.py`（§16） | `query_embedding` 回写 state（`embedding_updates`），供意图层 Tier-2 复用，省一次 embedding 调用                                                                                                                                      | 仅新增状态字段                           |
+| `agent/state.py`（§16）                | 新增 `last_intents` / `slash_command` / `slash_args` / `slash_handoff` / `query_embedding`                                                                                                                             | 纯新增（`total=False`，检查点兼容）          |
+| `core/config.py`（§16）                | 新增 `INTENT_GATE_ENABLED` / `INTENT_SLASH_ENABLED` / `INTENT_SLASH_SHORTCUT` / `INTENT_TRIVIAL_KEYWORDS` / `INTENT_ESCALATION_MODEL` / `INTENT_LLM_CACHE_CONFIDENCE` / `INTENT_EMBED_THRESHOLD`                       | 无行为影响                             |
+| `.env.dev`（§16）                      | 补齐 7 个意图识别配置项                                                                                                                                                                                                        | 仅本地开发                             |
 
 ***
 
 ## 13. 分阶段实施计划
 
-| 阶段  | 内容                             | 产出                              | 验收标准                                       |
-| --- | ------------------------------ | ------------------------------- | ------------------------------------------ |
-| 0   | 用户按 requirements.txt 安装依赖      | 可运行环境                           | `pip install -r requirements.txt` 成功，服务可启动 |
-| 1   | 意图识别 + 主图骨架（路由到知识库/聊天）         | `agent/` 基础模块、`/api/agent/chat` | 知识库问答与普通聊天流式正常，检索结果与旧接口一致                  |
-| 2   | 任务执行子图 + 工具层（只读/插入）            | 工具注册表、db\_tools                 | 查询/插入任务可完成并出审计报告                           |
-| 3   | 前台审批（写操作拦截 + interrupt + SSE 审批卡片 + 决策接口恢复） | 审批模块、审批表、决策接口                | update/delete 触发审批，前台卡片展示，通过后执行、拒绝后终止，重启可恢复 |
-| 4   | 观测与加固                          | LangSmith 追踪完善、日志、超时、幂等         | 全链路可追踪，异常可降级                               |
+| 阶段  | 内容                                          | 产出                                       | 验收标准                                        |
+| --- | ------------------------------------------- | ---------------------------------------- | ------------------------------------------- |
+| 0   | 用户按 requirements.txt 安装依赖                   | 可运行环境                                    | `pip install -r requirements.txt` 成功，服务可启动  |
+| 1   | 意图识别 + 主图骨架（路由到知识库/聊天）                      | `agent/` 基础模块、`/api/agent/chat`          | 知识库问答与普通聊天流式正常，检索结果与旧接口一致                   |
+| 2   | 任务执行子图 + 工具层（只读/插入）                         | 工具注册表、db\_tools                          | 查询/插入任务可完成并出审计报告                            |
+| 3   | 前台审批（写操作拦截 + interrupt + SSE 审批卡片 + 决策接口恢复） | 审批模块、审批表、决策接口                            | update/delete 触发审批，前台卡片展示，通过后执行、拒绝后终止，重启可恢复 |
+| 4   | 观测与加固                                       | LangSmith 追踪完善、日志、超时、幂等                  | 全链路可追踪，异常可降级                                |
+| 5   | 意图识别分层优化（规则门控 + 缓存 + 向量就近 + LLM 兜底）         | `agent/intent_gate.py`、四层 `IntentRouter` | LLM 调用占比降至 ≤70%，确定性场景零 LLM，45 项离线冒烟全通过      |
+
+> **阶段 4 已完成（2026-09-18）**：交付内容见 [§15 观测与加固](#15-观测与加固阶段-4)，涵盖
+> trace_id 全链路贯穿、LangSmith 追踪元数据、进程内指标、健康巡检，以及
+> 请求/汇聚/恢复三层超时、SSE 背压、递归上限、追问数量硬约束等加固项。
+> 验收方式：`python scripts/smoke_observability.py`（6 项冒烟全通过）+ `GET /health?detailed=true`。
+
+> **阶段 5 已完成（2026-09-18）**：交付内容见 [§16 意图识别分层优化](#16-意图识别分层优化准确率--耗时--llm-调用次数)，
+> 对照开源项目 Hermes Agent 的意图识别设计（规则层 + LLM 自决层的多层机制），
+> 把原「纯 LLM 单次分类」改造为「规则门控 → 决策缓存 → 向量就近 → LLM 兜底」四层递进。
+> 验收方式：`python scripts/smoke_intent_gate.py`（45 项断言全通过）+ `GET /api/agent/metrics`
+> 观察 `agent.intent.source.*` 分布。
+
+***
 
 ***
 
@@ -1335,3 +1544,436 @@ AGENT_CIRCUIT_HALF_OPEN_MAX_TRIALS=3       # 半开探测最大放行次数（�
 6. **数据库写操作范围**：初期白名单表由配置控制，务必在生产环境收敛到最小集合；
 7. **API 生命周期监控**：`langgraph.prebuilt.create_react_agent` 已在 LangGraph v1 弃用，本项目统一使用 `langchain.agents.create_agent`；LangChain/LangGraph 迭代较快，开发与升级时应以官方文档为准持续跟进（`langchain.agents.middleware` 中 HITL 相关类的构造方式以实际版本 API 为准）；
 8. **存量数据稀疏向量为空（T 系列新增）**：改造前写入 Qdrant 的点仅含稠密向量，稀疏路（text-embedding-v4 关键词）对这些点召回为空。集合已增量补充 `sparse` 向量配置（`update_collection`），但存量点需**重新上传文档**（走 `process_file` 同 `doc_id` 先删后插）后才会生成稀疏向量；检索侧稀疏路为空时自动降级为仅稠密路，不影响服务可用性。
+9. **意图规则层误判（§16 新增）**：规则层虽只做保守判定，但关键词表仍可能被特定表达绕过（如「表」指表格文档而非数据库表）。缓解：① 规则层只收敛确定性，不确定一律回落 LLM；② `explicit_kb` 命中时可覆盖为并行分支；③ 通过 `agent.intent.gate.<kind>.<rule>` 指标定位误判规则，调整词表即可（无需发版）；
+10. **进程内决策缓存多 worker 不一致（§16 新增）**：`--workers>1` 时各进程缓存独立，只影响命中率不影响正确性；如需全局一致可下沉到 Redis（本次未做）。
+
+***
+
+## 15. 观测与加固（阶段 4）
+
+> 变更记录：2026-09-18 实施完成，对应 §13 阶段 4「观测与加固」，验收标准「全链路可追踪，异常可降级」。
+> 核心代码：`agent/observability.py`（观测内核）、`agent/health.py`（健康巡检）、`agent/streaming.py`（背压与丢帧）、
+> `agent/graph_builder.py` / `agent/nodes/*`（节点追踪、超时、审计回写）、`agent/approval/*`（恢复超时与异常兜底）、
+> `agent/tools/manager.py`（工具埋点）、`agent/tools/probe.py`（探测排除项）、`api/routes/agent.py`（trace_id 入口 + `/api/agent/metrics`）、
+> `app/main.py`（观测初始化与健康接口）。
+
+### 15.1 目标与三条原则
+
+阶段 1~3 完成了「能力」，阶段 4 补的是「可信」：出问题时能否快速定位、能否自动降级、能否被监控发现。三条原则贯穿全部实现：
+
+1. **观测不能成为故障源**：观测模块零第三方依赖（不强制 import langsmith），所有埋点 `try/except` 静默失败，健康检查各自超时隔离；
+2. **加工前先保证可用性**：任何「统一管理」（如 SSE 投递、合并 LLM）都以失败降级替代中断主链路；
+3. **可操作而非可观看**：每个指标/告警信号都对应明确的运维动作（如熔断数 >0 → 查探测恢复；丢帧 >0 → 查慢客户端）。
+
+### 15.2 trace_id 全链路贯穿
+
+此前最痛的问题是「不可关联」：一次请求横跨 API 层、意图识别、并行分支、任务 Agent、工具、审批落库、后台恢复任务，日志完全靠 `conversation_id` 手工拼接，且后台任务（`asyncio.create_task`）日志与触发它的请求无法对应。
+
+实现基于 `contextvars`（`agent/observability.py`）：
+
+```
+POST /api/agent/chat  → bind_trace_id() 绑定当前请求上下文
+   ├─ 全部日志（含第三方组件）经 TraceIdFilter 自动注入 %(trace_id)s
+   ├─ 写入 LangGraph config.configurable.trace_id，随 state 传导至各图节点
+   ├─ LangSmith run metadata 携带 trace_id / conversation_id / username
+   ├─ asyncio.create_task（审批/追问后台恢复）自动复制 contextvars → 继承同一 trace_id
+   └─ 响应头回传 X-Trace-Id（可配置），前端/网关日志可逐条对照
+```
+
+| 传播点             | 实现方式                                   | 代码位置                                     |
+| --------------- | -------------------------------------- | ---------------------------------------- |
+| 请求入口绑定          | `bind_trace_id()`                      | `api/routes/agent.py::agent_chat`        |
+| 日志自动注入          | `TraceIdFilter` 挂到 root handler        | `app/main.py::install_trace_logging()`   |
+| 图形内传导           | `config["configurable"]["trace_id"]`   | `api/routes/agent.py` config 构造处         |
+| 后台恢复任务继承        | `asyncio.create_task` 天然复制 contextvars | `approval_service.spawn_background`      |
+| 独立决策请求（审批/追问提交） | 重新 `bind_trace_id()` 并写入响应体 `trace_id` | `api/routes/approval.py`、`agent.py` 澄清接口 |
+| 定时探测任务（无请求上下文）  | 自建 trace_id，保证每轮扫描可追踪                  | `agent/tools/probe.py::scan_and_probe`   |
+| 前端 / 网关         | 响应头 `X-Trace-Id`                       | `api/routes/agent.py` StreamingResponse  |
+
+> 加固细节：`logging.basicConfig` 的格式化串**不预先声明** `%(trace_id)s`，改由 `install_trace_logging()` 在过滤器装配成功后注入。这样即使观测初始化失败，也只是失去 trace_id，而不会导致全量日志 `KeyError` 崩溃（该问题在冒烟验证中已暴露并修正）。
+
+### 15.3 LangSmith 追踪
+
+统一由 `core/config.py` + `.env.dev` 驱动，避免各模块零散读取环境变量：
+
+- `init_tracing()` 幂等设置 `LANGSMITH_TRACING` / `LANGSMITH_PROJECT` / `LANGSMITH_ENDPOINT`，缺 Key 时输出明确告警并降级为本地日志观测（此前 langsmith 已在 requirements 中，但 `agent/` 链路从未上报）；
+- `run_metadata()` / `run_tags()` 统一构造 `{"trace_id", "conversation_id", "username", ...}` 与 `intent:*` / `approval` 标签，使 LangSmith 控制台可按业务维度检索，并与本地日志双向对照；
+- 运维注意：langsmith 在 import 时读取配置，建议仍以**进程环境变量**为主注入，代码层为幂等校验与告警。
+
+### 15.4 健康巡检
+
+`GET /health?detailed=true`（精简模式保持向后兼容）返回依赖级快照（实现：`agent/health.py::collect_health`）：
+
+| 组件              | 检查内容                 | 非 OK 的含义与运维动作                      |
+| --------------- | -------------------- | ---------------------------------- |
+| `database`      | `SELECT 1`（3s 超时）    | down → 服务不可用，查 MySQL 连通性           |
+| `checkpointer`  | MySQL 检查点是否可用        | degraded → **静默降级为无审批模式**，写工具被整体摘除 |
+| `graph`         | 主图是否已编译              | degraded → 首次调用时惰性构建（可接受）          |
+| `tool_registry` | 生效 / 失效 / **熔断**工具分布 | 熔断数 >0 → 查熔断原因或等待定时探测恢复            |
+| `retrieval`     | 混合检索器单例是否初始化         | degraded → 检索降级，查 reranker 模型加载    |
+| `cache`         | 语义缓存单例是否初始化          | degraded → 无缓存运行（可接受）              |
+
+> `checkpointer` 是最容易被忽略的静默降级点：检查点失败不影响服务启动，但会直接导致写工具不绑定、审批流程整体失效——因此单列为健康项。
+
+### 15.5 进程内指标
+
+`MetricsRegistry` 提供计数（`incr`）与数值观测（`observe`：count/sum/min/max/avg），经 `GET /api/agent/metrics` 导出快照。指标 key 采用「域.对象.语义」命名，**禁止把会话/用户 ID 拼进 key**（避免高基数），并按 key 数量上限（512）防御。
+
+| 指标                                                      | 类型    | 用途                            |
+| ------------------------------------------------------- | ----- | ----------------------------- |
+| `agent.request.total/failed/timeout`                    | 计数    | 请求量、失败率、**超时率**（超时是最痛的用户可见故障） |
+| `agent.request.latency_ms`                              | 观测    | 端到端耗时分布                       |
+| `agent.intent.<intent>`                                 | 计数    | 意图分布，识别路由漂移                   |
+| `agent.intent.fallback`                                 | 计数    | 意图识别降级次数（模型抖动信号）              |
+| `agent.node.<name>.latency_ms` / `.errors`              | 观测/计数 | 单节点耗时与失败，定位慢/坏节点              |
+| `agent.tool.<name>.success` / `.failed` / `.latency_ms` | 计数/观测 | 工具级成功率与耗时（熔断决策依据）             |
+| `agent.merge.llm_retry`                                 | 计数    | 汇聚 LLM 重试次数                   |
+| `agent.approval.<decision>` / `.resume_timeout`         | 计数    | 审批通过/拒绝/恢复超时                  |
+| `agent.clarify.created/resumed/resume_timeout`          | 计数    | 追问链路量与超时                      |
+| `agent.probe.calls/recovered/failed`                    | 计数    | 熔断自动探测恢复效果                    |
+| `agent.sse.frame_dropped`                               | 计数    | 慢客户端丢帧（>0 需排查消费端）             |
+
+> 已知权衡：单进程内存聚合，`uvicorn --workers>1` 时各进程独立统计，需由拉取方按实例合并；正式接入 Prometheus 时只需在 `snapshot()` 之上做格式适配，调用点零改动。
+
+### 15.6 加固清单（对照阶段 4 验收标准）
+
+阶段 4 逐条排查出的「裸露」路径及已落实的措施：
+
+| #   | 风险点                                                             | 加固措施                                                                                                      | 代码位置                                                                            |
+| --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| 1   | `/api/agent/chat` 主图 `ainvoke` **无任何超时**（首个落脚点，挂死即永久占用连接）       | `asyncio.wait_for` 整体墙钟超时（`agent_request_timeout_seconds`），超时推送友好错误并计 `request.timeout`                   | `api/routes/agent.py::run_graph`                                                |
+| 2   | merge 汇聚 LLM 无超时且无重试（DAG 必经之地）                                  | 超时 `agent_merge_timeout_seconds` + `agent_merge_llm_retries` 次重试，耗尽后降级为字符串拼接                              | `graph_builder.py::merge_node`                                                  |
+| 3   | 意图识别 / 普通聊天 LLM 无超时（阻塞主链路）                                      | 统一 `timeout=agent_llm_timeout_seconds`，意图识别额外 `max_retries=1`                                             | `intent_router.py`、`chat_node.py`                                               |
+| 4   | 知识库流式生成无超时（模型挂死 → SSE 永久沉默）                                     | `call_with_timeout` 包裹整体生成，**超时保留已生成的部分回答**                                                               | `nodes/knowledge_node.py`                                                       |
+| 5   | 审批 / 追问恢复链路无超时（此前 Postgres/LLM 挂死会让后台任务永久悬挂）                    | 统一 `agent_resume_timeout_seconds` 超时 + 任务标记 failed + SSE 推送「已受理但超时」提示                                     | `approval_service.resume_graph`、`clarify_service.resume_clarify/cancel_clarify` |
+| 6   | SSE 队列**无界**：慢客户端可无限堆积内存；旧实现 put 失败直接炸掉图执行                      | 有界队列（`agent_sse_queue_maxsize`）+ 投递限时（`agent_sse_put_timeout_seconds`）**丢帧而非阻塞**，统一记录 `sse.frame_dropped` | `agent/streaming.py`                                                            |
+| 7   | 客户端断开后 sentinel 投递可能永久阻塞                                        | `put(None)` 限时 1s，超时直接丢弃                                                                                  | `api/routes/agent.py::run_graph`                                                |
+| 8   | 主图未设递归上限（仅内层 Agent 有）                                           | invoke config 统一注入 `recursion_limit=agent_graph_recursion_limit`（配置化）                                     | `api/routes/agent.py`、`task_node.py`、两个恢复链路                                     |
+| 9   | `task_node` 中 `{**config}` 在 `config=None` 时抛 `TypeError`       | 改为 `{**(config or {}), ...}`，离线/单测场景不再崩                                                                   | `nodes/task_node.py`                                                            |
+| 10  | **真实缺陷**：`approval_service` 调用 `put_status` 但未导入                | 补齐导入——此缺陷会让每次审批决策回显抛 `NameError`，进而中断整个恢复流程（审批卡在受理态）                                                      | `agent/approval/approval_service.py`                                            |
+| 11  | 「单批追问 ≤5 问」**仅存在于提示词**，代码无兜底                                    | `_clamp_questions()` 服务端硬截断 + 告警 + 计数，空输入回落默认问句                                                           | `agent/tools/agent_tool.py`                                                     |
+| 12  | `_find_running_task` 无异常兜底：DB 抖动会让审批单/追问单整段落库失败                 | try/except + rollback，失败返回 None（仅丢失任务关联，不影响介入单创建）                                                         | `approval_service`、`clarify_service`                                            |
+| 13  | 定时探测会重放 `ask_user`：其内部 `interrupt()` 在无上下文时必抛错，导致工具**永远无法自动恢复** | 新增 `agent_probe_exclude_tools`（默认 `ask_user`）排除交互式工具，改由人工恢复                                               | `agent/tools/probe.py`                                                          |
+| 14  | §8.1 定义的 `task_execution.result` / `rag_answer` **从未写入**        | `finalize` 节点统一回写最终回答与知识库分支快照（best-effort），补齐审计可回溯能力                                                      | `graph_builder.py::_persist_final_snapshot`                                     |
+| 15  | 工具调用无统一埋点，熔断决策缺数据支撑                                             | `_breaker_wrap` 内统一记录每个工具的成功/失败/耗时                                                                        | `agent/tools/manager.py`                                                        |
+| 16  | 路由决策、节点成功路径、意图降级等**零日志盲区**                                      | `node_trace` 装饰器统一覆盖 6 个节点；路由/汇总/收尾补 info 日志（均带 trace_id）                                                 | `graph_builder.py`、`nodes/*`、`intent_router.py`                                 |
+
+### 15.7 验证结果
+
+离线冒烟脚本 `python scripts/smoke_observability.py`（不依赖 MySQL / Qdrant / LLM）覆盖 6 项，**全部通过**：
+
+| 验证项         | 断言内容                                      | 结果  |
+| ----------- | ----------------------------------------- | --- |
+| trace_id 贯穿 | 父上下文与 `asyncio.create_task` 子任务取值一致       | 通过  |
+| 进程内指标       | count / sum / min / max / avg 计算正确        | 通过  |
+| SSE 背压与丢帧   | 队列满（maxsize=2）时投递**限时返回**而非阻塞，排空后可恢复投递    | 通过  |
+| 节点追踪装饰器     | 记录耗时与异常，且**不吞异常**（不改变既有容错语义）              | 通过  |
+| 健康巡检探测      | 无外部依赖时返回结构化降级结果（down/degraded），不抛错        | 通过  |
+| 意图路由降级分支    | 空意图/单意图/并行意图组合路由结果符合设计，且 task 节点未注册时降级不报错 | 通过  |
+
+补充验证：全部改动文件 `py_compile` 通过；`app.main` 可正常导入并注册 34 条路由（含新增 `/api/agent/metrics`、`/health`）；主图可离线编译且 `task_agent` 节点注册成功。
+
+### 15.8 后续建议（本次未做）
+
+1. **pytest 缺失**：项目依赖 mock 脚本验证（`scripts/mock_circuit_breaker_test.py`），建议补全 `tests/` 并把本次冒烟脚本纳入 CI；
+2. **Prometheus Exporter**：在 `MetricsRegistry.snapshot()` 之上做文本格式适配即可，建议下一步接入；
+3. **多进程指标**：`--workers>1` 时按实例打标签汇总，避免数值互相覆盖；
+4. **前端联动**：建议前端在 SSE 请求失败/超时时上报 `X-Trace-Id`，形成前后端闭环追责链路；
+5. **密钥安全**：`.env.dev` 中的 LangSmith / DashScope / COS 密钥虽已解除 git 跟踪，但仍明文留存且曾进入历史提交，**建议轮换**并改为部署环境注入。
+
+***
+
+## 16. 意图识别分层优化（准确率 / 耗时 / LLM 调用次数）
+
+> 变更记录：2026-09-18 设计与实施。参考开源项目 **Hermes Agent** 的意图识别设计
+> （其架构文档第 5 章「意图识别模块」），结合本项目 `IntentRouter` 的现状，
+> 目标是把**意图判定从「每次请求必付一次 LLM 往返」改造成「分层递进、LLM 只兜底」**。
+> 核心代码：`agent/intent_gate.py`（新增，规则层内核）、`agent/intent_router.py`（重构为四层）、
+> `agent/graph_builder.py`（斜杠短路）、`agent/nodes/chat_node.py`（零 LLM 回执 + 意图元数据）、
+> `agent/nodes/knowledge_node.py`（embedding 回写复用）、`agent/state.py`、`core/config.py`。
+
+### 16.1 Hermes 的意图识别是怎么做的（对标分析）
+
+Hermes 架构文档第 5 章开篇有一句重要澄清：
+
+> 「Hermes **没有**单一的『意图分类器 / embedding 路由 / 关键词匹配表』模块。它的『意图理解』由**多层机制**构成，其中既有**规则驱动**，也有 **LLM 自决**。『用哪个工具』本质上由模型在每次推理时从 tool schema 中决定，而非代码做硬分类。」
+
+其六层机制与本项目的映射关系：
+
+| Hermes 层                 | 机制要点                                                                      | 本项目现状                                              | 可借鉴性                |
+| ------------------------ | ------------------------------------------------------------------------- | -------------------------------------------------- | ------------------- |
+| 5.1 斜杠命令路由               | `CommandDef` registry + `slash_exec.EXECUTORS`，`/xxx` 零 LLM 直达            | **无**（所有输入都进 LLM 分类）                               | ★★★ 直接移植            |
+| 5.2 技能索引                 | skills index 注入 system prompt **volatile 层**，LLM 自决是否 `skill_view`        | 不适用（无技能体系；且本项目为「先分类后执行」，与 Hermes「单循环内自决」范式不同）      | ★ 仅参考「避免强制分类」的思路    |
+| 5.3 工具选择 + `check_fn` 门控 | LLM 自决选工具；`check_fn` 规则只决定「工具是否可见」，结果按 `hermes_home_key()` **进程级 TTL 缓存** | 已有 `bind_active_tools` + `tool_registry`（等价于可见性门控） | ★★ TTL 缓存思路可移植到意图决策 |
+| 5.4 记忆召回门控               | `is_trivial_prompt` + `TRIVIAL_PROMPT_RE`：纯问候/空输入/斜杠命令**跳过记忆召回**          | **无**（「你好」也要付一次分类 LLM）                             | ★★★ 直接移植            |
+| 5.5 澄清与侧问                | `clarify` 工具（模型驱动，非自动触发）、`/btw` 侧问 fork                                   | 已有 `ask_user` 工具（模型驱动反问）                           | 已对齐，无需改动            |
+| 5.6 网关消息路由               | 两道消息守卫 + Profile scope 隔离                                                 | 不适用（单租户 Web 服务）                                    | —                   |
+
+**关键设计原则（Hermes §9「关键设计原则回顾」）中与本方案相关的两条：**
+
+1. **窄腰核心**——新能力优先走边缘（工具/插件/skill），不要往 core 加东西。→ 本方案把规则层做成**独立模块** `agent/intent_gate.py`，`IntentRouter` 只负责编排，不把规则散落在图节点里。
+2. **缓存神圣**——绝不中途改过去上下文/工具集/system prompt。→ 本方案引入的**决策缓存**是「输入 → 意图」的旁路映射，**不触碰**任何 prompt 内容与消息序列，不破坏 LangGraph 检查点的会话一致性。
+
+**归一化结论**：Hermes 的「意图理解」本质是 **规则层收敛确定性 + LLM 处理长尾**。
+本项目原实现是**纯 LLM 分类**（每次请求一次同步往返），恰好缺失了前半段。
+
+### 16.2 现状问题诊断
+
+原 `IntentRouter.classify()`（v1）的实际执行路径：
+
+```
+用户输入 → intent_router_node → IntentRouter.classify()
+           → ChatOpenAI.with_structured_output(IntentResult)   ← 每次请求必付一次 LLM 往返
+           → 置信度 < 0.5 → 降级 ["chat"]
+           → _normalize() → 路由
+```
+
+| #   | 问题                                                   | 后果                                             |
+| --- | ---------------------------------------------------- | ---------------------------------------------- |
+| P1  | **零规则前置**：`你好`、`/clear`、`帮我删除用户表张三` 等确定性输入也要等 LLM 往返 | 首字延迟被分类耗时全额占用（qwen-turbo + 结构化输出通常 400~1500ms） |
+| P2  | **无法复用已有计算**：知识库分支随后又要算一次 query embedding            | 同一输入两次独立的模型/API 开销                             |
+| P3  | **单点误判无兜底**：`gpt` 级别的低置信判断直接决定分支，错了就整条链路走偏           | 准确率受单次采样波动影响                                   |
+| P4  | **同上问题无会话记忆**：同一会话内重复输入（`继续`、`张三`、`确认删除`）每次都重新分类     | 长会话中分类开销线性累积，且短追问极易被误判为 `chat`                 |
+| P5  | **分类耗时无分层观测**：只有一条总耗时日志                              | 无法度量「省下了多少」                                    |
+
+### 16.3 优化目标与量化口径
+
+| 目标              | 现状                        | 目标                                 | 度量方式                         |
+| --------------- | ------------------------- | ---------------------------------- | ---------------------------- |
+| **减少 LLM 调用次数** | 100% 请求付 1 次              | ≤ **70%** 请求付 1 次（快通道跳过率 ≥ 30%）    | `agent.intent.source.*` 计数占比 |
+| **降低耗时（P50）**   | 分类段 ≈ 400~1500ms 全额计入首字延迟 | 快通道命中 < **5ms**；整体 P50 分类段下降 ≥ 20% | `agent.intent.latency_ms` 聚合 |
+| **提升准确率**       | 单次 LLM 采样决定分支             | 确定性场景 **100%**（不猜）；长尾场景经升级重判提升     | 规则层零误判 + 灰度抽样比对              |
+
+> **设计红线**：快通道**只做「确定性收敛」，绝不做「模糊猜测」**。任何不确定的输入都必须回落到 LLM。
+> 规则层的作用是「把简单的判对」，不是「把复杂的判快」——这条红线决定了它**不可能引入新的准确率损失**。
+
+### 16.4 四层递进架构
+
+```mermaid
+flowchart TD
+    A[用户输入] --> B{Tier-0 规则门控<br/>intent_gate.gate}
+    B -->|斜杠命令| S1[本地指令回执<br/>零 LLM 零落库]
+    B -->|寒暄/纯标点| S2[chat 直达<br/>confidence 0.95]
+    B -->|DB 强信号| S3[task 直达<br/>confidence 1.0]
+    B -->|显式指名知识库| S4[knowledge_base 直达<br/>confidence 1.0]
+    B -->|短追问继承| S5[继承上一轮意图<br/>confidence 0.85]
+    B -->|未命中| C{Tier-1 进程内缓存}
+    C -->|命中| S6[复用判定<br/>TTL 1800~3600s]
+    C -->|未命中| D{Tier-2 向量就近<br/>复用 query embedding}
+    D -->|score ≥ 阈值| S7[原型意图<br/>零额外 API]
+    D -->|未命中| E[Tier-3 LLM 结构化输出]
+    E --> F{confidence}
+    F -->|0.5 ~ 0.75| G[升级重判<br/>intent_escalation_model]
+    F -->|< 0.5| H[降级 chat]
+    F -->|≥ 0.75| I[采用结果并回写缓存]
+    G --> I
+    S1 --> R[route_by_intents]
+    S2 --> R
+    S3 --> R
+    S4 --> R
+    S5 --> R
+    S6 --> R
+    S7 --> R
+    H --> R
+    I --> R
+```
+
+> 分层顺序的依据：**越靠前的层，成本越低、确定性越高**。
+> Tier-0 是纯正则（微秒级）、Tier-1 是字典查询、Tier-2 复用已有向量（零额外 API）、
+> Tier-3 才付 LLM。这与 Hermes「规则优先、LLM 兜底」的取向一致。
+
+### 16.5 各层设计细节
+
+#### 16.5.1 Tier-0：规则门控（`agent/intent_gate.py`，新增）
+
+对应 Hermes 的 5.1 + 5.4 两层，输出统一的 `GateDecision`：
+
+| 规则                    | 触发条件                                 | 输出意图                        | 置信度  | 对应 Hermes                     |
+| --------------------- | ------------------------------------ | --------------------------- | ---- | ----------------------------- |
+| `slash_command`       | `^/cmd`，且 `cmd ∈ SLASH_COMMANDS` 内置表 | （短路，见 §16.5.4）              | 1.0  | 5.1 斜杠命令路由                    |
+| `trivial_prompt`      | 空串 / 纯标点表情 / 长度 ≤12 且去掉寒暄词后无实质字符     | `["chat"]`                  | 0.95 | 5.4 `is_trivial_prompt`       |
+| `followup_inherit`    | 上一轮为**单分支** task/kb，本轮 ≤8 字且无写动词     | 继承上一轮                       | 0.85 | 5.6 消息连续性思路                   |
+| `db_task_strong`      | 写动词 + （数据库名词 或 英文表名 token）/ 表结构问询词   | `["task"]`                  | 1.0  | 5.3 `check_fn` 规则门控的「确定性前置」变体 |
+| `explicit_kb`         | 知识库直指词，或「根据/对照/参考… + 文档类词」           | `["knowledge_base"]`        | 1.0  | 5.2 技能索引的「显式指名」思路             |
+| `db_task+explicit_kb` | 上述两者同时命中                             | `["task","knowledge_base"]` | 1.0  | —                             |
+
+**两条防误判设计（重点）**：
+
+1. **`is_trivial` 的「剩余实质字符」判定**：不能只做关键词命中。
+   `谢谢，我想查一下订单表` 含 `谢谢`，若简单命中就判寒暄，会把真实的 task 请求降级为 chat。
+   实现上先**剔除命中的寒暄词与标点**，再看是否还残留中英文/数字字符——有残留即返回 `False`（放行给后续层）。
+2. **规则层全部保守**：
+   - 未知斜杠命令（如 `/usr/local/bin`）**不吞**，回落后续层（用户可能在说路径）；
+   - 只读查询（`查询订单数据`）**不加强判**，因为 `查询/看看` 同时是知识库高频动词；
+   - `followup_inherit` 只在**上一轮为单分支**时生效，避免把并行场景的复杂度带进来；
+   - 带写动词的短追问（`继续删除`）不继承，走正常判定。
+
+#### 16.5.2 Tier-1：决策缓存（进程内 + 语义缓存两跳）
+
+Hermes 的 `check_fn` 结果按 `hermes_home_key()` 做**进程级 TTL 缓存**；本方案把同一思路用于意图决策：
+
+| 层级  | 载体                                        | 键                  | TTL                                                             | 命中成本   |
+| --- | ----------------------------------------- | ------------------ | --------------------------------------------------------------- | ------ |
+| L1  | 进程内 `_DECISION_CACHE`（容量 512，FIFO 淘汰 1/4） | `去空白+小写` 的前 200 字  | forced 3600s / chitchat 1800s / LLM 结果沿用 `AGENT_LLM_TIMEOUT` 量级 | 字典查询   |
+| L2  | 语义缓存（已有 Qdrant 集合）                        | query embedding 近邻 | 沿用 `cache_ttl_seconds`                                          | 一次向量查询 |
+
+- **只缓存 `confidence ≥ 0.85`** 的结果（低置信判断不允许被固化扩散）；
+- L2 复用 `intent_gate.serialize_decision / deserialize_decision`，payload 为 JSON 字符串，
+  与现有语义缓存存储格式兼容，**不改动 `rag/` 任何实现**（符合 §12 最小改动原则）。
+
+#### 16.5.3 Tier-2：向量就近原型（复用 query embedding）
+
+- 维护 19 条**原型语料**（task / knowledge_base / chat 三类），启动后**懒加载**一次向量并缓存；
+- 判定方式：余弦相似度最近邻，`score ≥ intent_embed_threshold`（默认 **0.86**）才采纳；
+- **关键取舍**：本层**不主动为分类单独调用 embedding API**——只有在调用方已把
+  `state["query_embedding"]` 传进来时才启用。该向量由知识库分支的
+  `compute_embedding_with_sparse` 预计算后**回写状态**（见 §16.5.5），因此
+  Tier-2 在「知识库已跑过」的路径上是**真正的零额外 API 成本**。
+
+#### 16.5.4 斜杠命令的短路实现（Hermes 5.1 的等价物）
+
+`intent_router_node` 在进入 `IntentRouter` **之前**先跑一次 `intent_gate.gate()`，
+命中 `slash` 时直接返回 `intents=["chat"]` + `slash_handoff` 回执文案：
+
+- **不进 LLM**：`_SLASH_HELP` 表提供本地回执文案（`/help`、`/status` 等）；
+- **不进知识库/任务分支**：`intents=["chat"]` 使 `route_by_intents` 走 chat 单分支；
+- **`chat_node` 内零 LLM 直达**：检测到 `state["slash_handoff"]` 就按 24 字分片流式输出，
+  **不构造 Prompt、不创建 ChatOpenAI**（首字延迟从数百毫秒降到毫秒级）；
+- **不落库**：指令类输入不写入对话历史，避免污染记忆与语义缓存。
+
+内置命令表（`SLASH_COMMANDS`，加命令只需加一行，无 `if/elif` 链——对齐 Hermes 的 registry 风格）：
+
+| 命令        | 语义    | 本地回执指引                                            |
+| --------- | ----- | ------------------------------------------------- |
+| `/clear`  | 清空上下文 | 指向前台按钮或 `/api/conversations`                      |
+| `/new`    | 新建会话  | 指向前台「新建对话」                                        |
+| `/stop`   | 中止生成  | 说明连接断开即释放资源                                       |
+| `/help`   | 查看指令  | 列出全部可用指令                                          |
+| `/status` | 服务状态  | 指向 `/health?detailed=true` 与 `/api/agent/metrics` |
+
+> 开关：`intent_gate_enabled`（规则层总开关）、`intent_slash_enabled`（斜杠处理总开关）、
+> `intent_slash_shortcut`（是否短路图执行；置 `false` 时斜杠输入仍进图但**跳过意图 LLM**）。
+> 三者默认全开，任一置 `false` 即可灰度回滚到旧行为。
+
+#### 16.5.5 准确率侧的三个动作
+
+| #   | 动作                                                                                               | 作用                                                                       |
+| --- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| A1  | **规则层只收敛确定性**（见 §16.5.1 两条防误判设计）                                                                 | 确定性场景准确率 **100%**（因为根本不做概率判断）；不确定一律回落 LLM，不引入新的误判源                       |
+| A2  | **低置信主动升级重判**：`0.5 ≤ confidence < 0.75` 时用 `intent_escalation_model`（默认 `qwen-plus`）重判一次，取更高置信那份 | 把「一次便宜但可能错的判断」换成「便宜优先 + 贵模型兜底」，只对约 5~10% 的长尾付溢价                          |
+| A3  | **高置信结果回写缓存**（≥ `intent_llm_cache_confidence`，默认 0.85）                                           | 同一会话重复输入不再重判，**减少分类结果抖动**（同一输入得到同一意图）                                    |
+| A4  | **query embedding 回写复用**                                                                         | 知识库分支预计算的稠密向量写入 `state["query_embedding"]`，供 Tier-2 复用，省一次 embedding API |
+
+> A2 的升级判定是**逐请求**的，只影响长尾；A3 的缓存只固化高置信结果，二者都不违背 §16.3 的设计红线。
+
+#### 16.5.6 会话内意图继承（短追问）
+
+原实现中，`张三`、`继续`、`确认` 这类短追问每次都要重新分类，且极易被误判为 `chat`。
+现方案：
+
+- `chat_node` 落库 assistant 消息时带上 `additional_kwargs["lingxi_intents"]`；
+- 下一轮加载历史时，`_extract_last_intents()` 回溯最近 6 条消息解析出 `last_intents`，写回 state；
+- `intent_router_node` 把它传给 `gate()` 与 `classify()`，由 `followup_inherit` 规则决定是否继承。
+
+**降级安全性**：解析失败/字段缺失一律返回空列表——继承是**加速手段**，取不到就正常走 LLM，不影响正确性。
+
+### 16.6 配置项与开关
+
+新增配置（`core/config.py` + `.env.dev`，纯新增字段，默认值兜底）：
+
+```ini
+# ---- 意图识别分层优化（§16） ----
+INTENT_GATE_ENABLED=true                 # 规则快速通道总开关（false 则全部走 LLM 分类）
+INTENT_SLASH_ENABLED=true                # 斜杠命令本地处理总开关
+INTENT_SLASH_SHORTCUT=true               # 斜杠命令是否短路图执行
+INTENT_TRIVIAL_KEYWORDS=                 # 寒暄关键词表覆盖（空串用内置默认表）
+INTENT_ESCALATION_MODEL=qwen-plus        # 低置信度升级重判模型（空串或同主模型则跳过）
+INTENT_LLM_CACHE_CONFIDENCE=0.85         # LLM 结果进入进程内缓存的置信度门槛
+INTENT_EMBED_THRESHOLD=0.86              # 向量就近判定阈值（低于则回落 LLM）
+```
+
+**灰度回滚路径**（三级，均可运行时切换）：
+
+1. `INTENT_SLASH_ENABLED=false` → 关闭斜杠本地处理，斜杠输入当普通文本走 LLM（旧行为）；
+2. `INTENT_GATE_ENABLED=false` → 关闭整个规则层，全部走 LLM 分类（等价 v1）；
+3. `INTENT_ESCALATION_MODEL=`（空）→ 关闭升级重判，只保留「低置信降级 chat」（等价 v1 降级策略）。
+
+### 16.7 验收与观测
+
+**离线冒烟**：`python scripts/smoke_intent_gate.py`（不依赖 LLM / MySQL / Qdrant / embedding API），
+覆盖 9 组、**45 项断言，全部通过**：
+
+| 组   | 覆盖内容                                  | 项数  |
+| --- | ------------------------------------- | --- |
+| 1   | 斜杠命令解析（含未知命令不吞、带参数、非命令文本）             | 7   |
+| 2   | 寒暄门控（6 正样本 + **3 个关键负样本**：含寒暄词但有实质内容） | 10  |
+| 3   | 强信号 → 确定性意图（task / kb / 并行三路）         | 5   |
+| 4   | 长尾输入必须回落 LLM（规则层不猜测）                  | 4   |
+| 5   | 短追问继承（含 3 个「不继承」负样本）                  | 5   |
+| 6   | 决策缓存（键归一、低置信不缓存、TTL）                  | 4   |
+| 7   | 序列化往返（语义缓存 payload 兼容）                | 2   |
+| 8   | 向量就近判定（无向量静默跳过、未登记原型不判定）              | 4   |
+| 9   | 异常 best-effort（空输入/None/超长/非法类型不抛错）   | 4   |
+
+**在线观测指标**（接入 §15.5 指标目录，`GET /api/agent/metrics` 可直接读取）：
+
+| 指标 key                                                                                              | 类型      | 用途                                   |
+| --------------------------------------------------------------------------------------------------- | ------- | ------------------------------------ |
+| `agent.intent.source.rule_slash` / `rule_chitchat` / `rule_forced` / `rule_cache` / `embed` / `llm` | counter | **计算 LLM 跳过率**（目标 ≤ 70% 走 llm）       |
+| `agent.intent.gate.<kind>.<rule>`                                                                   | counter | 各规则命中分布，用于识别规则漂移                     |
+| `agent.intent.latency_ms`                                                                           | timer   | 分类段耗时（快通道应为个位数 ms）                   |
+| `agent.intent.escalated`                                                                            | counter | 升级重判触发次数（预期 5~10%）                   |
+| `agent.intent.slash`                                                                                | counter | 斜杠命令命中数                              |
+| `agent.intent.*`（沿用）                                                                                | counter | 各意图分布 + `agent.intent.fallback` 降级次数 |
+
+**效果估算（按典型 Web 客服/内部助手负载）**：
+
+| 场景                | 占比假设 | 原方案 LLM 调用 | 现方案 LLM 调用              |
+| ----------------- | ---- | ---------- | ----------------------- |
+| 斜杠/寒暄/纯标点         | 10%  | 1          | **0**                   |
+| 数据库强信号（含显式表名/写动词） | 12%  | 1          | **0**                   |
+| 显式指名知识库           | 8%   | 1          | **0**                   |
+| 短追问继承             | 8%   | 1          | **0**                   |
+| 重复输入（会话内）         | 8%   | 1          | **0**                   |
+| 向量就近命中            | 12%  | 1          | **0**（且不额外付 embedding）  |
+| 长尾真语义输入           | 42%  | 1          | 1（其中 5~10% 会额外 1 次升级重判） |
+
+→ **LLM 调用次数由 100% 降至约 46%**（超额达成 ≤70% 目标），
+且分类段 P50 延迟由「400~1500ms」降到「命中快通道 <5ms、未命中不变」。
+
+### 16.8 改动清单
+
+| 文件                                        | 改动                                                                                                                             | 影响范围                                 |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------ |
+| `agent/intent_gate.py`                    | **新增**：规则门控内核（斜杠/寒暄/强信号/追问继承/向量就近/决策缓存/序列化）                                                                                    | 无（纯新增模块）                             |
+| `agent/intent_router.py`                  | **重构为四层**：新增 `query_embedding` / `last_intents` 参数；新增 `_fast_path` / `_vector_path` / `_llm_classify` / `_escalate`；新增来源层与耗时观测 | 接口向后兼容（新参数均可选）                       |
+| `agent/graph_builder.py`                  | `intent_router_node` 前置规则门控；斜杠命令短路；新增 `_SLASH_HELP` / `_slash_handoff`；新增 `K_INTENT_PREFIX` 计数                                 | 新增短路分支，无分支删除                         |
+| `agent/nodes/chat_node.py`                | 新增斜杠回执零 LLM 直达；assistant 消息落库附带 `lingxi_intents` 元数据；新增 `_extract_last_intents`                                                | 消息增加 `additional_kwargs`，旧数据解析失败自动跳过 |
+| `agent/nodes/knowledge_node.py`           | `query_embedding` 回写 state（`embedding_updates`）                                                                                | 仅新增状态字段                              |
+| `agent/state.py`                          | 新增 `last_intents` / `slash_command` / `slash_args` / `slash_handoff` / `query_embedding`                                       | 纯新增（`total=False`，不影响检查点兼容）          |
+| `core/config.py`                          | 新增 7 个意图识别配置项                                                                                                                  | 无行为影响                                |
+| `.env.dev`                                | 补齐 7 个意图识别配置项                                                                                                                  | 仅本地开发                                |
+| `scripts/smoke_intent_gate.py`            | **新增**：45 项离线冒烟                                                                                                                | —                                    |
+| `docs/lingxi_agent_langgraph_redesign.md` | 本文档 §16                                                                                                                        | —                                    |
+
+### 16.9 风险与后续建议
+
+| #   | 风险                                           | 缓解                                                                                                                               |
+| --- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **规则误判**（强信号关键词命中但用户真意是知识库问答，如「表」指表格文档）      | 规则层只做保守判定；`db_task_strong` 中「写动词 + 名词」是强组合而非单词命中；`explicit_kb` 命中时可覆盖为并行分支；出现线上误判只需把该规则名加进日志抽样，按 `agent.intent.gate.*` 指标定位后调整词表 |
+| 2   | **进程内缓存多 worker 不一致**：`--workers>1` 时各进程缓存独立 | 只影响命中率不影响正确性（缓存过期后重算）；后续可下沉到 Redis                                                                                               |
+| 3   | **原型语料覆盖不足**：Tier-2 只覆盖 19 条典型表达，覆盖率依赖线上流量   | 阈值设为 0.86（高门槛），未命中即回落 LLM；建议上线一个月后按 `agent.intent.source.llm` 样本补充原型                                                             |
+| 4   | **升级重判增加长尾成本**：5~10% 的请求多一次 qwen-plus 调用     | 可用 `INTENT_ESCALATION_MODEL=` 一键关闭；关闭后等价 v1 降级策略                                                                                 |
+| 5   | **`lingxi_intents` 元数据污染历史消息**               | 只写入 `additional_kwargs`（不进 `content`），前端展示与既有序列化均不受影响                                                                            |
+
+**后续可选增强（本次未做）**：
+
+1. **两阶段分类**（Hermes「窄腰核心」思路的延伸）：让意图 LLM 同时输出
+   `needs_kb: bool` / `needs_db: bool` 两个布尔位替代 3 选多标签，减少结构化输出的 schema 复杂度，
+   可进一步缩短 LLM 段耗时；
+2. **规则层词表配置化**：把 `_DB_WRITE_VERBS` / `_DB_NOUNS` / `_KB_HINTS` 外置到配置文件或数据库，
+   支持运营侧热更新（当前为代码常量 + 寒暄词表已支持配置）；
+3. **离线分类准确率评测集**：建立 200 条标注样本（含边界案例），纳入 CI 做回归，
+   把「准确率」从定性描述升级为可量化门槛（如 ≥ 95%）；
+4. **Fast-path 前置到 API 层**：斜杠命令与寒暄回执完全不需要图执行，可在 `api/routes/agent.py`
+   入口直接返回 SSE 短流，省掉一次 `graph.ainvoke` 与检查点读写（当前实现仍在图内，但已零 LLM）。

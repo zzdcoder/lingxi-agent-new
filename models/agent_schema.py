@@ -50,3 +50,20 @@ class ApprovalOut(BaseModel):
     status: str
     approved_by: Optional[str] = None
     decision_reason: Optional[str] = None
+
+
+class ClarifyAnswerIn(BaseModel):
+    """追问答案提交请求（支持批量回答多问题；兼容旧单问题请求）"""
+    answer: Optional[str] = Field(default=None, max_length=500, description="用户对追问的回答（单问题兼容字段）")
+    answers: Optional[List[str]] = Field(default=None, description="批量回答列表（与 questions 一一对应）")
+
+    @field_validator("answers")
+    @classmethod
+    def _validate_answers(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        """清洗批量回答：去除空字符项，单条非空且截断到 500 字。"""
+        if v is None:
+            return v
+        cleaned = [str(item).strip() for item in v if item is not None]
+        if not cleaned or any(not item for item in cleaned):
+            raise ValueError("answers 不能为空，且每个回答不能为空")
+        return [item[:500] for item in cleaned]
