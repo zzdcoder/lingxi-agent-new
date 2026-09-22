@@ -287,12 +287,21 @@ async def resume_graph(
     # 4. 恢复同一 thread 的图执行
     #    阶段 4 加固：恢复路径此前**无任何超时保护**（落库/LLM 挂死会永久挂起后台任务，
     #    前端只能等审批等待超时），此处补整体超时 + 主图递归上限。
+    #
+    #    §20 F3.0：`approval_resume` 必须随 config 下发。
+    #    主图的 `Command(resume=...)` 只能恢复**主图自己**的中断；写操作审批实际
+    #    中断在内层任务 Agent（`agent/nodes/task_node.py`，独立 thread + checkpointer），
+    #    主图的 resume 值到不了那里。task_node 重入时会读 `configurable.approval_resume`
+    #    并转交内层 Agent，否则审批决策被静默丢弃 → 写操作永不执行。
+    resume_value = _build_resume_value(decision, reason, action_count)
     config = {
         "configurable": {
             "thread_id": approval.conversation_id,
             "sse_queue": queue,
             "db": db,
             "trace_id": get_trace_id(),
+            "approval_resume": resume_value,
+            "approval_id": approval_id,
         },
         "recursion_limit": settings.agent_graph_recursion_limit,
         "metadata": run_metadata(
@@ -304,10 +313,7 @@ async def resume_graph(
     graph = get_graph()
     try:
         result = await asyncio.wait_for(
-            graph.ainvoke(
-                Command(resume=_build_resume_value(decision, reason, action_count)),
-                config,
-            ),
+            graph.ainvoke(Command(resume=resume_value), config),
             timeout=settings.agent_resume_timeout_seconds,
         )
     except asyncio.TimeoutError:
@@ -326,25 +332,166 @@ async def resume_graph(
         return
 
     result_dict = result if isinstance(result, dict) else {}
+
+    # ---- §20 F3.1：恢复后**再次中断**必须识别，不得误报成功 ----
+    #
+    # 若恢复轮内层 Agent 又抛了 GraphInterrupt，LangGraph 用**返回值**表达中断，
+    # `graph.ainvoke` 正常返回，于是原实现顺着往下走：final_response=None →
+    # 状态不更新 → 末尾照常打「审批恢复完成」并计数成功。
+    # **审批被记为成功，而写操作从未执行** —— 静默假成功，危害最大。
+    #
+    # ---- §20 F3.7：但"再次中断"有两种截然不同的成因，必须区分 ----
+    #
+    # (a) 决策真的没生效（写操作确实没跑）→ 判 failed 正确。
+    # (b) 写操作**已经执行**，只是模型随即又发一次同一写操作、拖出新中断
+    #     → 判 failed 是**误判**，用户会看到"审批通过了却什么都没发生"。
+    #     （生产 trace=00b0b22f2b0446b7 就是这个形态。）
+    # task_node 的 F3.5b 已尽力就地消化 (b)；此处是**第二道兜底** ——
+    # 即便消化失败冒泡上来，也要按真实执行情况上报，不能一口咬定失败。
+    if result_dict.get("__interrupt__"):
+        interrupted = result_dict.get("__interrupt__") or []
+        executed = await _executed_writes_from_task(db, approval)
+
+        if executed:
+            logger.warning(
+                f"[Approval] 恢复后再次中断，但任务审计显示写操作**已执行**，"
+                f"按执行成功上报（模型原地重发导致）: approval_id={approval_id}, "
+                f"已执行={_describe_executed(executed)}, "
+                f"中断数={len(interrupted)}, trace_id={get_trace_id()}"
+            )
+            metrics.incr(K_APPROVAL_PREFIX.format("resume_reissued_but_executed"))
+            summary = _build_result_summary(decision, reason, None)
+            detail = (
+                f"已执行的写操作：{_describe_executed(executed)}。\n\n"
+                "模型随后重复请求了同一写操作，该重复请求未再执行。"
+            )
+            await _update_task_after_resume(db, approval, decision, detail)
+            await _notify_result(queue, approval_id, decision, summary + "\n\n" + detail)
+            return
+
+        logger.error(
+            f"[Approval] 恢复后再次中断，本次决策未生效: approval_id={approval_id}, "
+            f"中断数={len(interrupted)}, trace_id={get_trace_id()}"
+        )
+        metrics.incr(K_APPROVAL_PREFIX.format("resume_interrupted"))
+        error = "审批决策未生效：恢复执行后再次触发人工介入中断"
+        await _mark_task_error(db, approval, error)
+        await _notify_result(
+            queue, approval_id, decision,
+            "审批已受理，但执行未生效（恢复后再次触发人工介入），请重新发起该操作",
+        )
+        return
+
     final_response = result_dict.get("final_response")
     task_answer = result_dict.get("task_answer")
 
     # 4. 更新任务状态与最终结果
-    await _update_task_after_resume(db, approval, decision, final_response)
+    await _update_task_after_resume(db, approval, decision, final_response or task_answer)
 
-    # 5. 推送最终结果（去重：与任务分支结果相同时任务节点已推送）
+    # 5. §20 F3.2：推送**显式**审批完成事件 + 结论文案。
+    #
+    # 原实现按「内容是否等于 task_answer」决定推不推：
+    #     if final_response and final_response != task_answer: 推
+    #     elif not final_response and task_answer:            推
+    # 而审批恢复场景下两者常常**相等**（都是任务分支的产出）→ 两个分支都不满足
+    # → **一条都不推**，前端在审批后收不到任何信号。
+    # 内容相同并不意味着用户已经看过，靠内容比对判断是脆弱的。
+    # 改为：结论文案**始终**推送，并用独立事件标记执行阶段结束。
+    summary = _build_result_summary(decision, reason, final_response or task_answer)
+    await _notify_result(queue, approval_id, decision, summary)
+
+    # 6. 恢复推送补充：final_response 与 task_answer 内容不同时再推一次完整结果
     if final_response and final_response != task_answer:
         if queue is not None:
             await put_content(queue, final_response)
-    elif not final_response and task_answer:
-        if queue is not None:
-            await put_content(queue, task_answer)
 
     metrics.incr(K_APPROVAL_PREFIX.format(decision))
     logger.info(
         f"[Approval] 审批恢复完成: approval_id={approval_id}, decision={decision}, "
         f"trace_id={get_trace_id()}"
     )
+
+
+def _describe_executed(executed: list) -> str:
+    """把已执行的写操作渲染成一句人话（审批结论里如实告知用户）。"""
+    from agent.nodes.task_node import _describe_writes
+
+    try:
+        return _describe_writes(executed)
+    except Exception:
+        # 极端兜底：不让文案渲染失败影响审批结果上报
+        return f"{len(executed)} 个写操作"
+
+
+async def _executed_writes_from_task(db, approval) -> list:
+    """
+    §20 F3.7：从任务审计里读出**确实执行成功**的写操作。
+
+    依据是 `task_node._persist_write_audit` 独立落的 `tool_calls`
+    —— 它在写工具执行成功的当下就写库，**不受后续模型行为影响**。
+    这正是「区分『工具没跑』与『跑了但被误判』」所需的唯一凭据。
+    """
+    from agent.nodes.task_node import _successful_writes
+
+    task_execution_id = getattr(approval, "task_execution_id", None)
+    if not task_execution_id:
+        return []
+    try:
+        from sqlalchemy import select
+
+        from models.task_model import TaskExecution
+
+        result = await db.execute(
+            select(TaskExecution).where(TaskExecution.id == task_execution_id)
+        )
+        record = result.scalars().first()
+        if record is None:
+            return []
+        return _successful_writes(list(record.tool_calls or []))
+    except Exception as e:
+        logger.warning(f"[Approval] 读取任务审计判断写操作是否执行失败（按未执行处理）: {e}")
+        return []
+
+
+def _build_result_summary(
+    decision: str, reason: str, content: Optional[str]
+) -> str:
+    """构造审批结论文案（前端在结果区展示，始终推送）。"""
+    if decision == "approved":
+        head = "审批已通过并执行完成。"
+    elif decision == "rejected":
+        head = f"审批已拒绝，写操作未执行。{('原因：' + reason) if reason else ''}"
+    else:
+        head = "审批已取消，写操作未执行。"
+    body = (content or "").strip()
+    return f"{head}\n\n{body}" if body else head
+
+
+async def _notify_result(
+    queue, approval_id: str, decision: str, summary: str
+) -> None:
+    """
+    推送审批执行结果（§20 F3.2）。
+
+    1. `approval_completed` 状态事件：前端据此结束「审批执行中」状态，
+       不再依赖 content 事件来推断；
+    2. 结论文案：**始终**推送（不因内容与 task_answer 相同而跳过）。
+
+    queue 为 None（连接已断 / 多 worker 落在不同进程）时不推送，但**记日志**——
+    原实现是静默跳过，排障时看不到任何痕迹。前端应以轮询为主通道。
+    """
+    if queue is None:
+        logger.info(
+            f"[Approval] 无可用 SSE 队列，结果仅落库（前端请轮询兜底）: "
+            f"approval_id={approval_id}, decision={decision}"
+        )
+        metrics.incr(K_APPROVAL_PREFIX.format("push_no_queue"))
+        return
+    await put_status(
+        queue, "approval_completed",
+        approval_id=approval_id, decision=decision,
+    )
+    await put_content(queue, summary, branch="task")
 
 
 async def _resume_in_background(
@@ -489,11 +636,25 @@ async def _update_task_after_resume(
     decision: str,
     final_response: Optional[str],
 ) -> None:
-    """审批恢复后更新任务记录状态与最终结果。"""
+    """
+    审批恢复后更新任务记录状态与最终结果（§20 F3.3）。
+
+    修复前的缺陷：只处理 rejected / canceled 两个分支，
+    **approved 分支不赋 status** —— 任务记录永久停留在 `running`。
+    后果：
+      1. 前端轮询 GET /api/agent/tasks/{id} 永远看到 running，无法判定结束；
+      2. `_find_running_task` 是「按会话找最近 running 记录」，
+         这条僵尸记录会被**下一轮任务复用**（task_execution_id 被顶掉），
+         审计与内层 thread 命名空间串到别人身上。
+    此处补上 approved → completed；final_response 为空时也写入兜底文案，
+    避免前端拿到空结果。
+    """
     task = await _get_task(db, approval.task_execution_id)
     if task is None:
         return
-    if decision == "rejected":
+    if decision == "approved":
+        task.status = "completed"
+    elif decision == "rejected":
         task.status = "rejected"
     elif decision == "canceled":
         task.status = "canceled"

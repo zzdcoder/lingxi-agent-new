@@ -198,9 +198,17 @@ class RAGConversationService:
             # 3. 语义缓存检查（复用已计算的 embedding）
             semantic_cache = get_semantic_cache()
             if semantic_cache:
+                # §18：与 Agent 链路共用同一缓存集合，必须带上同样的缓存维度，
+                # 否则写入的条目因缺少 schema_version 永远命中不了（脏数据）。
+                # 本接口是纯知识库问答，意图恒为 knowledge_base，可与 Agent 的
+                # knowledge_base 单分支条目互通。
                 cached = await semantic_cache.get(
                     user_input, login_username,
                     precomputed_embedding=query_embedding,
+                    intent="knowledge_base",
+                    model=model,
+                    kb_version=str(settings.cache_kb_version or "v1"),
+                    prompt_version=str(settings.cache_prompt_version or "1"),
                 )
                 if cached:
                     logger.info(
@@ -252,6 +260,11 @@ class RAGConversationService:
                         answer=full_response,
                         context_docs=context_docs,
                         login_username=login_username,
+                        intent="knowledge_base",
+                        model=model,
+                        kb_version=str(settings.cache_kb_version or "v1"),
+                        prompt_version=str(settings.cache_prompt_version or "1"),
+                        ttl_class=int(settings.cache_ttl_knowledge_seconds or 86400),
                     )
                 except Exception as e:
                     logger.warning(f"写入语义缓存失败（非致命）: {e}")
@@ -658,6 +671,9 @@ class RAGConversationService:
             openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
             temperature=0.3,
             max_tokens=500,
+            # §19.1：摘要不需要长链推理，关掉思考模式，避免 500 上限被
+            # reasoning_tokens 吃满导致摘要被截断成空串（与意图判别同一类隐患）
+            extra_body={"enable_thinking": False},
         )
 
         conversation_text = self._messages_to_conversation_text(messages)
@@ -684,6 +700,8 @@ class RAGConversationService:
             openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
             temperature=0.3,
             max_tokens=500,
+            # §19.1：同上，关闭思考模式防止输出上限被 reasoning 吃满
+            extra_body={"enable_thinking": False},
         )
 
         new_conversation_text = self._messages_to_conversation_text(new_messages)
@@ -708,10 +726,15 @@ class RAGConversationService:
         :return: LangChain 对话链
         """
         # 创建 LLM
-        llm = ChatOpenAI(
-            model=model,
-            openai_api_key=settings.api_key,
-            openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        # §21.2：走统一入口 —— RAG 分支也要能拿到思考过程。裸 ChatOpenAI 会把
+        # `reasoning_content` 静默丢弃（`_convert_delta_to_message_chunk` 只读
+        # content/tool_calls），ThinkingChatOpenAI 才把它透传到 additional_kwargs。
+        # 对本文件其余 ChatOpenAI（摘要等）**不动**：那些是内部中间产物，
+        # 不但不需要思考过程，还刻意 `enable_thinking=False` 防止输出被吃满。
+        from core.llm import get_chat_model
+
+        llm = get_chat_model(
+            model,
             temperature=0.3,
             streaming=True,
         )

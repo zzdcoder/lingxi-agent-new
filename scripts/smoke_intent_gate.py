@@ -109,7 +109,35 @@ def main() -> int:
     check("命中登记原型", d is not None and d.kind == G.KIND_FORCED,
           f"实际 {None if d is None else d.rule}")
 
-    print("\n== 9. 异常 best-effort（不抛错、退化为 NONE） ==")
+    print("\n== 9. 清单句式扩表（§17.3，保守扩表 + LLM 兜底） ==")
+    # 正样本：清单句式 + 无知识库线索 -> 判为 db_task（避免 LLM 层多花 3~10s）
+    for t in ("数据库中有哪些表", "有哪些用户", "列出订单表所有记录",
+              "查一下用户表里有多少人", "系统里都有什么表", "用户表包含哪些字段"):
+        expect(t, G.KIND_FORCED, ["task"])
+    # 负样本：带知识库线索 -> 必须让给知识库，不得吞成 task
+    # （注：显式含「知识库」「文档」的会命中更优先的 explicit_kb，属正确行为，
+    #   故这里断言「不是 task」而非「必须是 NONE」）
+    for t in ("根据知识库文档有哪些条款", "文档中有哪些退货规则", "政策里列出了哪些情形",
+              "知识库有哪些内容"):
+        d = G.gate(t)
+        check(f"非 task({t!r})", "task" not in d.intents,
+              f"实际 kind={d.kind} rule={d.rule} intents={d.intents}")
+    # 负样本：文档词在前、无介词（_mentions_doc_scope 兜住的场景）
+    for t in ("文档里有哪些条款", "手册里的规范有哪些"):
+        expect(t, G.KIND_NONE)
+    # 负样本：纯闲聊/写作类清单，不含数据域锚点 -> 回落 LLM（§17.3 锚定规则）
+    for t in ("有哪些适合春天的诗", "推荐几本书", "有哪些好看的电影", "有哪些好用的工具"):
+        expect(t, G.KIND_NONE)
+    # 灰度开关：关闭后清单句式不再强判为 task
+    _orig = getattr(G, "_list_patterns_enabled", None)
+    try:
+        G._list_patterns_enabled = lambda: False
+        expect("有哪些用户", G.KIND_NONE)
+    finally:
+        if _orig is not None:
+            G._list_patterns_enabled = _orig
+
+    print("\n== 10. 异常 best-effort（不抛错、退化为 NONE） ==")
     # 注意：空输入/None 会被寒暄门控判为 chitchat（chat 兜底），这是**预期行为**
     check("空输入 -> chat 兜底", G.gate("").kind == G.KIND_CHITCHAT)
     check("None -> chat 兜底", G.gate(None).kind == G.KIND_CHITCHAT)

@@ -20,7 +20,7 @@
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from langchain_core.tools import BaseTool
 from sqlalchemy import select

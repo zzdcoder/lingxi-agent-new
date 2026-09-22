@@ -153,14 +153,28 @@ def build_card_payload(clarify: ApprovalRequest) -> dict:
 # 追问恢复
 # =============================================================================
 
-def _resume_config(clarify: ApprovalRequest, queue, db, clarify_id: str) -> dict:
+def _resume_config(
+    clarify: ApprovalRequest,
+    queue,
+    db,
+    clarify_id: str,
+    resume_value: dict,
+) -> dict:
     """
     构造恢复图执行的运行配置（阶段 4：统一携带递归上限与 LangSmith 元数据）。
+
+    §20 F3.0：`clarify_resume` 必须随 config 下发。
+    主图的 `Command(resume=...)` 只能恢复**主图自己**的中断；`ask_user` 追问实际
+    中断在内层任务 Agent（`agent/nodes/task_node.py`，独立 thread + checkpointer），
+    主图的 resume 值到不了那里。task_node 重入时会读
+    `configurable.clarify_resume` 并转交内层 Agent，否则答案/取消信号被静默丢弃
+    → 内层 Agent 重新追问（二次中断），用户永远等不到结果。
 
     :param clarify: 追问单对象
     :param queue: SSE 队列（可能为 None）
     :param db: 数据库会话
     :param clarify_id: 追问单 ID（LangSmith 检索维度）
+    :param resume_value: 透传给内层 Agent 的恢复载荷（answers / canceled）
     """
     return {
         "configurable": {
@@ -168,6 +182,8 @@ def _resume_config(clarify: ApprovalRequest, queue, db, clarify_id: str) -> dict
             "sse_queue": queue,
             "db": db,
             "trace_id": get_trace_id(),
+            "clarify_resume": resume_value,
+            "clarify_id": clarify_id,
         },
         "recursion_limit": settings.agent_graph_recursion_limit,
         "metadata": run_metadata(
@@ -226,11 +242,13 @@ async def resume_clarify(
 
     # 4. 恢复同一 thread 的图执行（ask_user 工具的 interrupt() 返回答案列表）
     #    阶段 4 加固：补整体超时 + 递归上限（同审批链路，避免后台任务永久挂起）
-    config = _resume_config(clarify, queue, db, clarify_id)
+    #    §20 F3.0：resume 值经 configurable.clarify_resume 透传给内层 Agent
+    resume_value = {"answers": answers}
+    config = _resume_config(clarify, queue, db, clarify_id, resume_value)
     graph = get_graph()
     try:
-        await asyncio.wait_for(
-            graph.ainvoke(Command(resume={"answers": answers}), config),
+        result = await asyncio.wait_for(
+            graph.ainvoke(Command(resume=resume_value), config),
             timeout=settings.agent_resume_timeout_seconds,
         )
     except asyncio.TimeoutError:
@@ -241,7 +259,9 @@ async def resume_clarify(
         )
         metrics.incr(K_CLARIFY_PREFIX.format("resume_timeout"))
         if queue is not None:
-            await put_content(queue, "追问已受理，但恢复执行超时，请稍后查看会话结果")
+            await put_content(
+                queue, "追问已受理，但恢复执行超时，请稍后查看会话结果", branch="task"
+            )
         return
     except Exception as e:
         logger.exception(
@@ -249,7 +269,28 @@ async def resume_clarify(
             f"trace_id={get_trace_id()}"
         )
         if queue is not None:
-            await put_content(queue, f"追问已处理，但恢复执行失败：{str(e)[:120]}")
+            await put_content(
+                queue, f"追问已处理，但恢复执行失败：{str(e)[:120]}", branch="task"
+            )
+        return
+
+    # ---- §20 F3.1（追问链路）：恢复后再次中断不得误报成功 ----
+    # LangGraph 用返回值表达中断，`ainvoke` 仍正常返回；若内层 Agent 未消费到
+    # 答案（透传失效）则会再次追问，此处必须显式识别并提示，避免静默假成功。
+    result_dict = result if isinstance(result, dict) else {}
+    if result_dict.get("__interrupt__"):
+        logger.error(
+            f"[Clarify] 恢复后再次中断，本次回答未生效: clarify_id={clarify_id}, "
+            f"中断数={len(result_dict.get('__interrupt__') or [])}, "
+            f"trace_id={get_trace_id()}"
+        )
+        metrics.incr(K_CLARIFY_PREFIX.format("resume_interrupted"))
+        if queue is not None:
+            await put_content(
+                queue,
+                "回答已提交，但执行未生效（恢复后再次触发追问），请重新发起该操作",
+                branch="task",
+            )
         return
 
     metrics.incr(K_CLARIFY_PREFIX.format("resumed"))
@@ -299,15 +340,15 @@ async def cancel_clarify(
         )
 
     # 4. 恢复同一 thread 的图执行（ask_user 工具收到取消信号）
-    config = _resume_config(clarify, queue, db, clarify_id)
+    #    §20 F3.0：resume 值经 configurable.clarify_resume 透传给内层 Agent
+    resume_value = {"canceled": True}
+    config = _resume_config(clarify, queue, db, clarify_id, resume_value)
     graph = get_graph()
     try:
-        await asyncio.wait_for(
-            graph.ainvoke(Command(resume={"canceled": True}), config),
+        result = await asyncio.wait_for(
+            graph.ainvoke(Command(resume=resume_value), config),
             timeout=settings.agent_resume_timeout_seconds,
         )
-        # 5. 任务终止标记（用户主动取消追问语义）
-        await _mark_task_canceled(db, clarify)
     except asyncio.TimeoutError:
         logger.error(
             f"[Clarify] 追问取消恢复执行超时"
@@ -316,7 +357,9 @@ async def cancel_clarify(
         )
         metrics.incr(K_CLARIFY_PREFIX.format("resume_timeout"))
         if queue is not None:
-            await put_content(queue, "追问已取消，但恢复执行超时，请稍后查看会话结果")
+            await put_content(
+                queue, "追问已取消，但恢复执行超时，请稍后查看会话结果", branch="task"
+            )
         return
     except Exception as e:
         logger.exception(
@@ -324,8 +367,31 @@ async def cancel_clarify(
             f"trace_id={get_trace_id()}"
         )
         if queue is not None:
-            await put_content(queue, f"追问已取消，但恢复执行失败：{str(e)[:120]}")
+            await put_content(
+                queue, f"追问已取消，但恢复执行失败：{str(e)[:120]}", branch="task"
+            )
         return
+
+    # ---- §20 F3.1（追问链路）：取消后再次中断不得误报成功 ----
+    result_dict = result if isinstance(result, dict) else {}
+    if result_dict.get("__interrupt__"):
+        logger.error(
+            f"[Clarify] 取消后再次中断，取消信号未生效: clarify_id={clarify_id}, "
+            f"trace_id={get_trace_id()}"
+        )
+        metrics.incr(K_CLARIFY_PREFIX.format("resume_interrupted"))
+        if queue is not None:
+            await put_content(
+                queue,
+                "取消已提交，但执行未生效（恢复后再次触发追问），请重新发起该操作",
+                branch="task",
+            )
+        # 即便二次中断，用户取消意图明确 → 任务仍标记 canceled（终止态）
+        await _mark_task_canceled(db, clarify)
+        return
+
+    # 5. 任务终止标记（用户主动取消追问语义）
+    await _mark_task_canceled(db, clarify)
 
     metrics.incr(K_CLARIFY_PREFIX.format("canceled_resumed"))
     logger.info(

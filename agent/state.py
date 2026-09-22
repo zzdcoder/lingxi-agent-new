@@ -8,7 +8,7 @@ Agent 图状态定义
 - 任务执行：任务记录 / 工具调用 / 审批相关
 - 输出：汇总节点合并后的最终回答
 """
-from typing import TypedDict, Annotated, Optional, Any
+from typing import TypedDict, Annotated, Optional
 from langgraph.graph.message import add_messages
 
 
@@ -28,7 +28,18 @@ class AgentState(TypedDict, total=False):
     slash_command: Optional[str]         # 命中的斜杠命令名（§16 规则层短路）
     slash_args: Optional[str]            # 斜杠命令参数
     slash_handoff: Optional[str]         # 斜杠命令本地回执文案（免 LLM 直接输出）
-    query_embedding: Optional[list]      # query 稠密向量（知识库分支预计算，供意图层复用，§16）
+    # 已弃用（§18.5）：向量改由 `config["configurable"]` 在同一次 run 内传递，
+    # 不再写入 state —— 1024 维向量进检查点会被逐轮序列化落库，且上一轮残留
+    # 会污染下一轮的意图判定。保留声明仅为兼容老检查点中的同名字段。
+    query_embedding: Optional[list]
+
+    # ---- 答案缓存准入（§18.2，由入口节点每轮覆盖写入） ----
+    # 语义「答案缓存」命中会跳过整条执行链路（不检索、不生成、不执行工具、
+    # 不留审计），因此必须先由意图判定它的准入结果，再决定是否去查缓存。
+    # 这两项与 executed_branches 同理，由 intent_router_node 每轮无条件覆盖，
+    # 避免检查点里上一轮的策略残留影响本轮。
+    cache_policy: Optional[str]          # allow / short / deny
+    cache_ttl_seconds: Optional[int]     # 本轮答案缓存可用的 TTL（deny 时为 0）
 
     # ---- 知识库问答 ----
     context_docs: list                   # 检索到的文档
@@ -49,3 +60,19 @@ class AgentState(TypedDict, total=False):
     task_answer: Optional[str]           # 任务分支产出（含审批后结果，供汇总节点合并）
     final_response: Optional[str]        # 汇总节点合并后的最终回答（供落库与回溯）
     error: Optional[str]                 # 错误信息
+
+    # ---- 本轮分支标记（§17.2 跨轮状态隔离） ----
+    # 由入口节点 intent_router_node 每轮**无条件覆盖**写入，值为本轮**计划执行**
+    # 的分支名列表（"knowledge" / "task_agent"）。
+    #
+    # 为什么需要它：LangGraph 检查点（挂 MySQLAsyncSaver，thread_id=conversation_id）
+    # 是**按 thread 累积的 channel 存储**——节点只写自己产出的字段，未执行的节点
+    # 对应字段会**保留上一轮的旧值**。例如本轮只路由 task 单分支时，上一轮
+    # knowledge/chat 分支写入的 rag_answer 仍在 channel 中，merge_node 若按
+    # 「字段非空」判断，会把**与本轮无关的历史内容**当成知识库结论去做 LLM 合并，
+    # 既白付一次 LLM（实测 17.4s），又产生串味幻觉。
+    #
+    # 因此 merge 改用本字段判断「本轮到底跑过哪些分支」，彻底与历史残留解耦。
+    # 注意：**不要**改成清空 rag_answer/task_answer 等业务字段——并行审批中断
+    # 场景下 rag_answer 必须保留给 resume 后合并（§17.2.4 场景论证）。
+    executed_branches: list

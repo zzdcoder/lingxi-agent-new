@@ -5,6 +5,7 @@ Agent 路由
 """
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -323,7 +324,15 @@ async def get_task_status(
     current_user: User = Depends(get_current_user),
 ):
     """
-    查询任务执行状态与结果（SSE 断连时前端轮询兜底）。
+    查询任务执行状态与结果（SSE 断连 / 用户离开会话时前端轮询兜底）。
+
+    §20 F3.3：补越权校验。
+    该接口原实现**无任何归属校验** —— 任意登录用户拿到 task_execution_id
+    即可读取他人任务的执行结果（可能含业务数据与错误详情）。
+    前端轮询兜底（§20 F3.2）会把此接口作为主通道调用，暴露面随之变大，
+    必须按「任务属于当前用户」或「任务所属会话属于当前用户」放行。
+    历史记录 user_id 可能为空（早期数据），此时退化为「仅校验会话归属」，
+    会话也取不到则放行（保持兼容，不因审计字段缺失锁死功能）。
 
     :param task_execution_id: 任务执行记录 ID
     :param db: 数据库会话
@@ -339,6 +348,22 @@ async def get_task_status(
         task = result.scalars().first()
         if not task:
             raise ConversationException(f"任务不存在: {task_execution_id}")
+
+        # 归属校验：优先比对任务 user_id；缺失时回落到会话归属
+        if task.user_id and str(task.user_id) != str(current_user.id):
+            raise ConversationException("无权查看该任务", code=403)
+        if not task.user_id and task.conversation_id:
+            from models.conversation_model import ConversationDefinition
+            conv_result = await db.execute(
+                select(ConversationDefinition).where(
+                    ConversationDefinition.id == task.conversation_id
+                )
+            )
+            conversation = conv_result.scalars().first()
+            owner = getattr(conversation, "user_id", None)
+            if owner and str(owner) != str(current_user.id):
+                raise ConversationException("无权查看该任务", code=403)
+
         return task
     except ConversationException:
         raise

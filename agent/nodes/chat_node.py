@@ -15,14 +15,15 @@ import logging
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 
 from core.config import settings
+from core.llm import get_chat_model
 from prompt.prompt_storage import CHAT_SYSTEM_PROMPT
 from rag.memory_mysql import MySQLChatMessageHistory
-from agent.streaming import put_content, get_sse_queue
+from agent.streaming import put_content, put_thinking, get_sse_queue
+from agent.stream_emitter import extract_reasoning, extract_text
 from agent.state import AgentState
-from agent.observability import node_trace
+from agent.observability import metrics, node_trace
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ async def chat_node(
     handoff = state.get("slash_handoff")
     if handoff:
         for i in range(0, len(handoff), _HANDOFF_CHUNK):
-            await put_content(queue, handoff[i : i + _HANDOFF_CHUNK])
+            await put_content(queue, handoff[i : i + _HANDOFF_CHUNK], branch="chat")
         logger.info(
             f"[Agent-聊天] 斜杠回执本地输出: /{state.get('slash_command')} "
             f"len={len(handoff)}"
@@ -90,10 +91,12 @@ async def chat_node(
         prompt = ChatPromptTemplate.from_messages(prompt_messages)
 
         # 3. 创建 LLM 并流式生成
-        llm = ChatOpenAI(
-            model=model,
-            openai_api_key=settings.api_key,
-            openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        #    §21.2：统一走 get_chat_model —— 思考型模型（qwen3 等）会把推理过程
+        #    放在 `reasoning_content` 里，裸 ChatOpenAI 的
+        #    `_convert_delta_to_message_chunk` 只读 content/tool_calls，会**静默丢弃**。
+        #    get_chat_model 返回的 ThinkingChatOpenAI 把它透传到 additional_kwargs。
+        llm = get_chat_model(
+            model,
             temperature=0.7,
             streaming=True,
             # 阶段 4 加固：流式会话若无超时，模型侧挂死会让 SSE 永久沉默
@@ -102,11 +105,37 @@ async def chat_node(
         chain = prompt | llm
 
         full_response = ""
-        async for chunk in chain.astream({"input": user_input}):
-            content = chunk.content if hasattr(chunk, "content") else str(chunk)
-            if content:
-                full_response += content
-                await put_content(queue, content)
+        # 阶段 5 加固：流式过程单独兜住连接异常，保留已推送给用户的片段。
+        # 此前流式失败会直接落到最外层 except 返回 rag_answer=None，把已经通过 SSE
+        # 展示给用户的内容全部丢弃（与 knowledge_node 同类缺陷）。
+        stream_error = None
+        try:
+            async for chunk in chain.astream({"input": user_input}):
+                # 思考过程：独立事件推给前端，与正文分区域渲染（§21.2）
+                reasoning = extract_reasoning(chunk)
+                if reasoning:
+                    await put_thinking(queue, reasoning)
+                    metrics.incr("agent.reasoning.deltas")
+                content = extract_text(chunk)
+                if content:
+                    full_response += content
+                    await put_content(queue, content, branch="chat")
+        except Exception as e:
+            stream_error = e
+            logger.warning(
+                f"[Agent-聊天] 流式生成中断（保留已生成的部分回答）: "
+                f"{type(e).__name__}: {e}"
+            )
+            metrics.incr("agent.chat.stream_error")
+
+        if not full_response and stream_error is not None:
+            # 完全没有产出（如建连即失败）：如实上报错误，由 merge/finalize 转可读提示。
+            # 注意：**有部分产出时绝不能写 error** —— finalize_node 见到 error 会覆盖
+            # final_response，把用户已完整收到的部分回答变成「处理失败：…」。
+            return {
+                "rag_answer": None,
+                "error": f"聊天生成失败：{type(stream_error).__name__}",
+            }
 
         # 4. 消息落库（assistant 消息附带本轮意图元数据，供下一轮继承）
         try:

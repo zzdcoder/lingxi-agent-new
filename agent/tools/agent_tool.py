@@ -17,6 +17,7 @@ Agent 工具统一定义（2026-09-17 收敛）
 保留为薄封装（re-export），保证既有引用零改动。
 """
 import asyncio
+import json
 import logging
 import re
 import time
@@ -29,6 +30,7 @@ from langchain_core.tools import ToolException, tool
 from langgraph.types import interrupt
 
 from core.config import settings
+from agent.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,13 @@ class DbToolSystemError(DbToolError):
 class DbToolExecutor:
     """数据库工具执行器：白名单 + 参数化 + LIMIT + 超时保护"""
 
+    # §20 F3.4b：逻辑删除标记列的**候选集**（按优先级）。
+    # 不再假设全库都叫 is_deleted —— 现实里 `deleted` / `del_flag` 都很常见。
+    # 顺序即优先级：越靠前越可能是本项目约定。
+    DELETE_FLAG_COLUMN_CANDIDATES: tuple = (
+        "deleted", "is_deleted", "delete_flag", "del_flag", "is_del", "deleted_flag",
+    )
+
     def __init__(self, session):
         """
         :param session: SQLAlchemy AsyncSession（来自图运行配置 configurable.db）
@@ -120,9 +129,76 @@ class DbToolExecutor:
     # =========================================================================
 
     def _assert_table_allowed(self, table: str) -> None:
-        """表白名单校验：非法或越权表直接拒绝。"""
-        if not table or table not in self._allowed_tables:
-            raise DbToolError(f"表 {table!r} 不在授权白名单内，拒绝访问")
+        """
+        表白名单校验：非法或越权表直接拒绝。
+
+        §17.4 加固：增加**保守的单复数归一**。
+
+        背景：白名单是单数 `user`，而模型按英文习惯常生成复数 `users`。原实现做
+        精确集合匹配 → 抛错 → 错误作为 ToolMessage 回灌模型 → 模型自我纠错重来，
+        实测一次误判要多付约 9.8s 的 LLM 往返。
+
+        归一策略（严格保守）：
+        - 仅当 `table` 去掉/补上末尾 `s` 后**唯一命中**白名单时才接受；
+        - 若白名单里同时存在 `user` 与 `users`（或有多个候选）→ 视为歧义，拒绝；
+        - 归一后的表名通过 `_resolve_table` 返回，**调用方必须使用返回值**，
+          确保后续 SQL 用的是白名单里的真实表名而非模型给的猜测。
+
+        注意：本方法只做读取校验，不改写传入的表名以免调用方拿到未归一的字符串。
+        实际取用请走 `_resolve_table`。
+        """
+        if table and table in self._allowed_tables:
+            return
+        if settings.agent_db_table_name_fuzzy and table:
+            resolved = self._normalize_table(table)
+            if resolved is not None:
+                logger.info(
+                    f"[DbTool] 表名保守归一生效: {table!r} -> {resolved!r}"
+                )
+                metrics.incr("agent.tool.table_norm.applied")
+                return
+        raise DbToolError(
+            f"表 {table!r} 不在授权白名单内，拒绝访问。"
+            f"当前可用表：{', '.join(sorted(self._allowed_tables))}"
+        )
+
+    def _normalize_table(self, table: str) -> Optional[str]:
+        """
+        保守归一（大小写 + 单复数）：仅当候选**唯一命中**白名单时返回，否则 None。
+
+        模型可能给出的大小写/复数变体：`USER` / `Users` / `users` / `conversations`。
+        候选集 = { 原名, 去尾 s, 去尾 es, 补 s }，全部小写化后与白名单求交；
+        命中 **恰好 1 个** 才接受，多解一律视为歧义（宁拒绝、不猜）。
+        """
+        candidates = set()
+        low = table.lower()
+        candidates.add(low)
+        if low.endswith("es") and len(low) > 2:
+            candidates.add(low[:-2])
+        if low.endswith("s") and len(low) > 1:
+            candidates.add(low[:-1])
+        else:
+            candidates.add(low + "s")
+        hits = candidates & self._allowed_tables
+        if len(hits) == 1:
+            return next(iter(hits))
+        if len(hits) > 1:
+            logger.warning(
+                f"[DbTool] 表名 {table!r} 归一存在歧义（候选 {sorted(hits)}），拒绝访问"
+            )
+        return None
+
+    def resolve_table(self, table: str) -> str:
+        """
+        校验并返回**可直接用于 SQL 的实际表名**（归一后）。
+
+        §17.4：调用方一律用本方法的返回值拼 SQL，避免「校验通过但用的是模型猜测名」。
+        """
+        self._assert_table_allowed(table)
+        if table in self._allowed_tables:
+            return table
+        resolved = self._normalize_table(table)
+        return resolved if resolved is not None else table
 
     @staticmethod
     def _assert_column_name(column: str) -> None:
@@ -140,19 +216,69 @@ class DbToolExecutor:
                 cls._assert_column_name(col)
 
     @staticmethod
+    def _coerce_json_object(value: Any, *, field: str) -> Dict[str, Any]:
+        """
+        §20 F3.6：把「模型偶尔给成 JSON 字符串」的字段宽容地还原成 dict。
+
+        生产实测（trace=00b0b22f2b0446b7）：模型把 `filters` 传成
+        `'{"username": "testuser99"}'`（**字符串**）而不是对象，
+        而工具签名声明的是 `Dict`。原实现直接 `isinstance(filters, dict)`
+        判否 → 抛「过滤条件必须为对象」→ 错误回灌模型 → 多一次 LLM 往返
+        自我纠错，甚至让写操作半途而废。
+
+        容忍三类输入：
+        - 已是 dict → 原样返回；
+        - JSON 字符串（如 `'{"a": 1}'`，含被双重编码的 `'"{\\"a\\": 1}"'`）→ 解析；
+        - 空串 / `"{}"` / `None` → 返回空 dict，交由调用方按「必填」判定。
+
+        :param value: 待还原的值
+        :param field: 字段名（用于错误文案）
+        :return: 解析后的 dict
+        :raises DbToolError: 是字符串但无法解析成 JSON 对象
+        """
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw or raw in ("{}", "null", "None"):
+                return {}
+            # 最多解两层：应对 `'"{\\"a\\": 1}"'` 这类双重编码
+            for _ in range(2):
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, TypeError):
+                    break
+                if isinstance(parsed, dict):
+                    logger.info(
+                        f"[DbTool] {field} 由 JSON 字符串还原为对象（模型格式容错）"
+                    )
+                    metrics.incr("agent.tool.json_coerce.applied")
+                    return parsed
+                if isinstance(parsed, str) and parsed.strip() != raw:
+                    raw = parsed.strip()
+                    continue
+                break
+            raise DbToolError(
+                f"{field} 必须是对象（如 {{\"列名\": \"值\"}}），"
+                f"收到的是无法解析的字符串：{value[:80]}"
+            )
+        raise DbToolError(f"{field} 必须为对象，收到 {type(value).__name__}")
+
+    @staticmethod
     def _validate_filters(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """过滤条件校验：必须是字典，键为合法列名，值不做额外限制（参数化）。"""
-        filters = filters or {}
-        if not isinstance(filters, dict):
-            raise DbToolError("过滤条件必须为对象")
+        filters = DbToolExecutor._coerce_json_object(filters, field="过滤条件")
         for key in filters:
             DbToolExecutor._assert_column_name(str(key))
         return filters
 
     @staticmethod
     def _validate_values(values: Dict[str, Any]) -> Dict[str, Any]:
-        """写入值校验：非空字典，键为合法列名。"""
-        if not values or not isinstance(values, dict):
+        """写入值校验：非空字典，键为合法列名（§20 F3.6：同样容忍 JSON 字符串）。"""
+        values = DbToolExecutor._coerce_json_object(values, field="写入值")
+        if not values:
             raise DbToolError("写入值必须为非空对象")
         for key in values:
             DbToolExecutor._assert_column_name(str(key))
@@ -263,7 +389,8 @@ class DbToolExecutor:
         :param limit: 最大行数（默认 AGENT_QUERY_MAX_ROWS）
         """
         start = time.perf_counter()
-        self._assert_table_allowed(table)
+        # §17.4：用归一后的真实表名，避免「校验通过但 SQL 仍用模型猜测名」
+        table = self.resolve_table(table)
         self._assert_columns(columns)
         filters = self._validate_filters(filters)
         limit = min(int(limit or self._max_rows), self._max_rows)
@@ -341,7 +468,8 @@ class DbToolExecutor:
         :param user_intent_quote: 用户原话中表达"插入/新增"意图的片段
         """
         start = time.perf_counter()
-        self._assert_table_allowed(table)
+        # §17.4：用归一后的真实表名
+        table = self.resolve_table(table)
         values = self._validate_values(values)
         quote = self._assert_intent_quote(user_intent_quote)
 
@@ -390,7 +518,8 @@ class DbToolExecutor:
         :param filters: 等值过滤条件 {col: value}，必填
         """
         start = time.perf_counter()
-        self._assert_table_allowed(table)
+        # §17.4：用归一后的真实表名
+        table = self.resolve_table(table)
         values = self._validate_values(values)
         filters = self._validate_filters(filters)
         quote = self._assert_intent_quote(user_intent_quote)
@@ -443,19 +572,60 @@ class DbToolExecutor:
         """
         按条件删除数据（必须携带过滤条件防止全表删除，且二次确认写意图）。
 
+        §20 F3.4：删除策略可配置（`settings.agent_delete_mode`）。
+        - `logical`（默认，用户答复「逻辑删除合理」）：改为
+          `UPDATE ... SET <flag_col>=<flag_val>`，数据行保留，仅打删除标记。
+          业务侧查询须自行过滤；此策略**不可逆地改变了 delete 的语义**，
+          因此结果体中显式回传 `mode="logical"` 与标记列名，审计与前端
+          都应能看出「这是标记删除，不是物理删除」。
+        - `physical`：真删（改动前行为）。
+        标记列不存在时**回落为物理删除**并记录 `fallback_reason`
+        ——不静默改变语义（要么按配置标记，要么按老行为删，且必须留痕）。
+
         :param table: 表名（白名单内）
         :param user_intent_quote: 用户原话中表达"删除"意图的片段
         :param filters: 等值过滤条件 {col: value}，必填
         """
         start = time.perf_counter()
-        self._assert_table_allowed(table)
+        # §17.4：用归一后的真实表名
+        table = self.resolve_table(table)
         filters = self._validate_filters(filters)
         quote = self._assert_intent_quote(user_intent_quote)
         if not filters:
             raise DbToolError("delete_data 必须携带过滤条件，禁止全表删除")
 
         where_sql, params = self._build_where(filters)
-        stmt = text(f"DELETE FROM `{table}`{where_sql}")
+
+        # ---- §20 F3.4 / F3.4b：删除策略判定 ----
+        mode = str(getattr(settings, "agent_delete_mode", "physical") or "physical").lower()
+        flag_val = getattr(settings, "agent_delete_flag_true_value", 1)
+        fallback_reason = ""
+
+        # F3.4b：标记列不再写死默认值，改为**按表探测候选列**。
+        # 生产事故：默认值 `is_deleted` 与 `user` 表真实列名 `deleted` 不符
+        # （SHOW COLUMNS 确认），导致逻辑删除静默回落物理删除。
+        # 策略：显式配置优先；未配置（或配置的列不存在）时按候选集探测，
+        # 命中即用；全部未命中才回落物理删除并留痕。
+        flag_col = ""
+        if mode == "logical":
+            flag_col = await self._resolve_delete_flag_column(table)
+            if not flag_col:
+                fallback_reason = (
+                    f"表 {table} 无任何候选删除标记列"
+                    f"（{', '.join(self.DELETE_FLAG_COLUMN_CANDIDATES)}），已回落为物理删除"
+                )
+                logger.warning(f"[DbTool-delete] {fallback_reason}")
+                metrics.incr("agent.tool.delete.fallback_physical")
+                mode = "physical"
+
+        if mode == "logical":
+            stmt = text(
+                f"UPDATE `{table}` SET `{flag_col}` = :__flag__{where_sql}"
+            )
+            params = {**params, "__flag__": flag_val}
+        else:
+            stmt = text(f"DELETE FROM `{table}`{where_sql}")
+
         try:
             result = await self._run(stmt, params)
             await self._session.commit()
@@ -465,14 +635,20 @@ class DbToolExecutor:
             raise DbToolSystemError(self._safe_error("删除失败", e))
 
         logger.info(
-            f"[DbTool-delete] table={table} affected={result.rowcount} "
+            f"[DbTool-delete] table={table} mode={mode} affected={result.rowcount} "
             f"elapsed={self._elapsed(start)}ms"
+            + (f" fallback={fallback_reason}" if fallback_reason else "")
         )
         result = {
             "ok": True,
             "affected_rows": result.rowcount,
             "elapsed_ms": self._elapsed(start),
+            # 显式回传策略：审计/前端据此区分「标记删除」与「物理删除」
+            "mode": mode,
+            "flag_column": flag_col if mode == "logical" else None,
         }
+        if fallback_reason:
+            result["fallback_reason"] = fallback_reason
         self._record_call(
             "delete_data",
             {"table": table, "user_intent_quote": quote},
@@ -480,6 +656,50 @@ class DbToolExecutor:
             result["elapsed_ms"],
         )
         return result
+
+    async def _resolve_delete_flag_column(self, table: str) -> str:
+        """
+        §20 F3.4b：解析该表**真实存在**的删除标记列名。
+
+        解析顺序（显式配置优先，探测兜底）：
+
+        1. `settings.agent_delete_flag_column` —— 仅当它在该表**确实存在**时采用。
+           注意：配置为空串表示「未显式配置」，此时直接跳到探测，
+           不会因为「默认值恰好叫 is_deleted」而误判。
+        2. 候选集 `DELETE_FLAG_COLUMN_CANDIDATES` 按序探测，命中即用。
+
+        :param table: 表名（已归一）
+        :return: 可用的标记列名；全部未命中返回空串（调用方据此回落）
+        """
+        try:
+            cols = [str(c).strip().lower() for c in (await self._fetch_columns(table)) or []]
+        except Exception as e:
+            logger.warning(
+                f"[DbTool-delete] 探测标记列失败，按无标记列处理: table={table} err={e}"
+            )
+            return ""
+
+        configured = str(
+            getattr(settings, "agent_delete_flag_column", "") or ""
+        ).strip().lower()
+        if configured:
+            if configured in cols:
+                return configured
+            logger.warning(
+                f"[DbTool-delete] 配置的标记列 {configured!r} 在表 {table} 不存在，"
+                f"转入候选列探测"
+            )
+            metrics.incr("agent.tool.delete.flag_col_config_miss")
+
+        for cand in self.DELETE_FLAG_COLUMN_CANDIDATES:
+            if cand in cols:
+                if cand != configured:
+                    logger.info(
+                        f"[DbTool-delete] 按候选集命中标记列: table={table} col={cand}"
+                    )
+                    metrics.incr("agent.tool.delete.flag_col_probed")
+                return cand
+        return ""
 
 
 # =============================================================================
@@ -749,6 +969,12 @@ def _build_tools() -> dict[str, ToolSpec]:
     def _register(spec: ToolSpec) -> None:
         tools[spec.name] = spec
 
+    # §17.4：把**具体授权表名**显式注入 description。
+    # 原描述只说「仅限授权表白名单」，模型无从得知有哪些表，首轮常猜错表名
+    # （实测把 `user` 猜成 `users`）→ 报错 → 回灌 → 自我纠错循环，白付一次 LLM 往返。
+    _tables = ", ".join(sorted(settings.agent_db_allowed_table_list)) or "（未配置）"
+    _whitelist_note = f"仅限以下表：{_tables}"
+
     # 只读工具
     _register(ToolSpec(
         name="list_tables",
@@ -759,7 +985,10 @@ def _build_tools() -> dict[str, ToolSpec]:
     ))
     _register(ToolSpec(
         name="query_data",
-        description="按条件查询指定表的数据，仅限授权表白名单，单次最多返回 50 行",
+        description=(
+            f"按条件查询指定表的数据，{_whitelist_note}，单次最多返回 50 行。"
+            f"表名请使用清单中的原名（不要自行改写单复数）"
+        ),
         risk_level=RiskLevel.READ,
         requires_approval=False,
         handler="query_data",
@@ -777,11 +1006,20 @@ def _build_tools() -> dict[str, ToolSpec]:
 
     # 写工具：insert 审批开关由配置控制，update/delete 强制审批
     # 二次确认（§5.5.2）：全部写工具必填 user_intent_quote（用户原话片段）
+    #
+    # §20 F1.3：description 显式声明「调用即进入审批等待，属正常流程」。
+    # 模型只看 system prompt 时，仍可能把「写操作要审批」误读为「我没有权限」
+    # 而在调用前就先拒绝（生产现象：用户说"删除 testuser99"，模型回答
+    # "我无法处理删除任务"）。工具描述是模型决定是否调用时**最直接**的输入，
+    # 在此重申一句，成本极低但能显著压低误拒率。
+    _approval_note = "（本工具为写操作，调用后系统自动进入人工审批等待，属正常流程，不要因为需要审批而拒绝调用）"
+
     _register(ToolSpec(
         name="insert_data",
         description=(
-            "向指定表插入一条数据，仅限授权表白名单。"
-            "必须提供 user_intent_quote：用户原话中表达插入/新增意图的原文片段"
+            f"向指定表插入一条数据，{_whitelist_note}。"
+            "必须提供 user_intent_quote：用户原话中表达插入/新增意图的原文片段。"
+            f"{_approval_note}"
         ),
         risk_level=RiskLevel.WRITE,
         requires_approval=settings.agent_insert_requires_approval,
@@ -790,8 +1028,9 @@ def _build_tools() -> dict[str, ToolSpec]:
     _register(ToolSpec(
         name="update_data",
         description=(
-            "按条件更新指定表的数据，仅限授权表白名单，必须携带过滤条件。"
-            "必须提供 user_intent_quote：用户原话中表达更新/修改意图的原文片段"
+            f"按条件更新指定表的数据，{_whitelist_note}，必须携带过滤条件。"
+            "必须提供 user_intent_quote：用户原话中表达更新/修改意图的原文片段。"
+            f"{_approval_note}"
         ),
         risk_level=RiskLevel.WRITE,
         requires_approval=True,
@@ -800,8 +1039,9 @@ def _build_tools() -> dict[str, ToolSpec]:
     _register(ToolSpec(
         name="delete_data",
         description=(
-            "按条件删除指定表的数据，仅限授权表白名单，必须携带过滤条件。"
-            "必须提供 user_intent_quote：用户原话中表达删除意图的原文片段"
+            f"按条件删除指定表的数据，{_whitelist_note}，必须携带过滤条件。"
+            "必须提供 user_intent_quote：用户原话中表达删除意图的原文片段。"
+            f"{_approval_note}"
         ),
         risk_level=RiskLevel.WRITE,
         requires_approval=True,

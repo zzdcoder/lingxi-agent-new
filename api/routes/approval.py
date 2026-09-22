@@ -18,7 +18,7 @@ from models.approval_schema import ApprovalDecisionIn, ApprovalOut
 from models.user_model import User
 from utils.auth import get_current_user
 from agent.approval import approval_service
-from agent.observability import bind_trace_id, get_trace_id
+from agent.observability import bind_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +72,18 @@ async def submit_decision(
         )
         logger.info(
             f"[Approval] 前台审批决策已受理: approval_id={approval_id}, "
-            f"decision={body.decision.value}, approved_by={current_user.username}, "
+            f"decision={body.decision.value}, approved_by=current_user.username, "
             f"trace_id={trace_id}"
         )
+        # §20 F3.2：回传 task_execution_id / conversation_id。
+        # 前端在「用户离开会话后又回来」或 SSE 断连时，需要凭 task_execution_id
+        # 轮询 GET /api/agent/tasks/{id} 兜底获取执行结果 —— 原响应只回
+        # approval_id + status，前端拿不到轮询句柄，断连即彻底失联。
         return {
             "code": 0,
             "approval_id": approval_id,
+            "task_execution_id": approval.task_execution_id,
+            "conversation_id": approval.conversation_id,
             "status": body.decision.value,
             "trace_id": trace_id,
             "message": "审批已受理，结果将经会话流式推送",

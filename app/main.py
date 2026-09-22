@@ -17,8 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from sqlalchemy import select
-
 from core.config import settings
 from core.database import async_engine, Base, AsyncSessionLocal
 from core.exceptions import RAGException
@@ -31,7 +29,6 @@ from api.routes import cache as cache_routes
 from api.routes import agent as agent_routes
 from api.routes import approval as approval_routes
 from api.routes import tools as tools_routes
-from models.metadata_model import MetadataDefinition
 from utils.captcha import cleanup_expired_captchas
 
 # 配置全局日志：输出到控制台，级别 INFO，带时间戳和模块名。
@@ -110,6 +107,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"语义缓存初始化失败（降级为无缓存模式）: {e}")
 
+    # 初始化检索缓存（§18.13：缓存检索结果，命中后仍照常走 LLM 生成）
+    try:
+        from rag.retrieval_cache import init_retrieval_cache
+        init_retrieval_cache()
+        logger.info("检索缓存初始化完成")
+    except Exception as e:
+        logger.warning(f"检索缓存初始化失败（降级为无检索缓存模式）: {e}")
+
     # 启动验证码过期清理后台任务
     async def captcha_cleanup_loop():
         while True:
@@ -120,7 +125,7 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(captcha_cleanup_loop())
 
-    # 启动语义缓存过期清理后台任务（每小时执行一次）
+    # 启动缓存过期清理后台任务（每小时执行一次；覆盖答案缓存与检索缓存两层）
     async def cache_cleanup_loop():
         while True:
             await asyncio.sleep(3600)
@@ -133,6 +138,15 @@ async def lifespan(app: FastAPI):
                         logger.info(f"清理了 {removed} 条过期语义缓存")
             except Exception as e:
                 logger.debug(f"语义缓存清理任务异常: {e}")
+            try:
+                from rag.retrieval_cache import get_retrieval_cache
+                rcache = get_retrieval_cache()
+                if rcache:
+                    removed = await rcache.cleanup_expired()
+                    if removed > 0:
+                        logger.info(f"清理了 {removed} 条过期检索缓存")
+            except Exception as e:
+                logger.debug(f"检索缓存清理任务异常: {e}")
 
     cache_task = asyncio.create_task(cache_cleanup_loop())
 
@@ -190,6 +204,19 @@ async def lifespan(app: FastAPI):
         logger.info("Agent 主图编译预热完成")
     except Exception as e:
         logger.warning(f"Agent 主图预热失败（首次调用时重试）: {e}")
+
+    # §17.3 预热意图层原型向量：把 20 条原型语料的 embedding 挪到启动期，
+    # 既不占首个请求的首字延迟，也让 api_key/网络配置问题在启动阶段就暴露。
+    # 失败仅告警——向量层降级，规则层与 LLM 兜底照常工作。
+    if settings.intent_proto_warmup_enabled:
+        try:
+            from agent.intent_router import warmup_proto_vectors
+            if await warmup_proto_vectors():
+                logger.info("意图层原型向量预热完成")
+            else:
+                logger.warning("意图层原型向量预热未成功（向量判定层将降级）")
+        except Exception as e:
+            logger.warning(f"意图层原型向量预热异常（已降级）: {e}")
 
     yield
 

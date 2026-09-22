@@ -124,6 +124,32 @@ class Settings(BaseSettings):
     agent_sse_put_timeout_seconds: float = 2.0     # 队列满时投递的最长等待时间（超时丢弃并记录）
 
     # ============================================================
+    # LLM 思考过程与任务流式输出（设计文档 §21）
+    # ============================================================
+    # 统一 LLM 服务地址（收敛此前散落在 11 处 ChatOpenAI 实例化里的硬编码字面量）
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    agent_reasoning_enabled: bool = True           # 思考过程总开关（关闭后不请求也不推送）
+    # 支持思考过程的模型前缀白名单（逗号分隔，前缀匹配）。
+    # 只放白名单是刻意的：非思考模型传 enable_thinking 可能直接报错，
+    # 宁可不传（退回改造前行为），也不要为少数模型破坏多数请求。
+    agent_reasoning_models: str = "qwen3,qwen-plus,qwen-max,deepseek-r1,glm-4.5"
+    agent_reasoning_max_chars: int = 20000         # 单轮思考过程推送上限（防超长思考刷屏/撑爆前端）
+
+    # 任务分支流式输出（task_node 由 ainvoke 改为 astream）
+    agent_task_streaming_enabled: bool = True      # 任务分支是否流式输出（关闭则退回一次性整段推送）
+    agent_task_tool_events_enabled: bool = True    # 是否推送工具调用进度事件（tool 帧）
+
+    @property
+    def agent_reasoning_model_prefixes(self) -> list[str]:
+        """将思考模型白名单解析为小写前缀列表（过滤空项）。"""
+        return [
+            p.strip().lower()
+            for p in (self.agent_reasoning_models or "").split(",")
+            if p.strip()
+        ]
+
+    # ============================================================
     # 意图识别分层优化（设计文档 §16）
     # ============================================================
     intent_gate_enabled: bool = True               # 规则快速通道总开关（关闭后全部走 LLM 分类）
@@ -133,6 +159,94 @@ class Settings(BaseSettings):
     intent_escalation_model: str = "qwen-plus"     # 低置信度升级重判模型（空串或与主模型相同则跳过）
     intent_llm_cache_confidence: float = 0.85      # LLM 结果进入进程内缓存的置信度门槛
     intent_embed_threshold: float = 0.86           # 向量就近判定阈值（低于则回落 LLM）
+
+    # ============================================================
+    # 性能优化（设计文档 §17）
+    # ============================================================
+    intent_llm_timeout_seconds: int = 15           # 意图判别单独超时（秒）。与 agent_llm_timeout_seconds
+                                                   # 解耦：意图只需输出极短结构化对象，等 60s 无意义，
+                                                   # 超时即降级 chat。设回 60 即恢复旧行为（§17.3）
+    intent_llm_max_tokens: int = 1024              # 意图判别输出上限（§19.1）。
+                                                   # 注意：qwen 思考型模型会先消耗 reasoning_tokens 再产出
+                                                   # 正文，256 会被思考过程吃满导致 finish_reason=length，
+                                                   # 结构化输出解析抛 LengthFinishReasonError。1024 为思考留足余量。
+    intent_llm_disable_thinking: bool = True       # 意图判别是否关闭模型思考模式（§19.1）。
+                                                   # 分类任务无需长链推理，关掉可省掉全部 reasoning 开销
+                                                   # （既避免撑爆 max_tokens，也显著降低首字延迟）。
+                                                   # 不支持该参数的模型会忽略它；若出现兼容问题置 False。
+    intent_list_patterns_enabled: bool = True      # 「有哪些X / 列出X / X清单」句式强信号开关（§17.3）
+    intent_proto_warmup_enabled: bool = True       # 启动时预热原型向量（§17.3）
+    agent_merge_cross_turn_guard: bool = True      # 跨轮状态隔离：merge 按本轮分支标记判定，
+                                                   # 忽略检查点里的历史残留（§17.2）。
+                                                   # False 则回落「字段非空」旧判据
+    agent_db_table_name_fuzzy: bool = True         # DB 工具表名单复数保守归一（§17.4）
+
+    # ============================================================
+    # 缓存治理：语义缓存 × 意图缓存（设计文档 §18）
+    # ============================================================
+    # 答案缓存阈值独立于 cache_similarity_threshold：答案缓存一旦命中就
+    # **跳过整条执行链路**（不再检索、不再生成），因此对相似度要求更严；
+    # 0.92 对短中文文本过松（「删除张三」与「删除李四」余弦常在 0.95+）。
+    cache_answer_threshold: float = 0.95           # 答案缓存命中阈值（§18.3）
+    cache_intent_policy_enabled: bool = True       # 意图驱动的缓存准入开关（§18.2）
+                                                   # False 时回到「所有意图都可缓存」旧行为
+    cache_entity_check_enabled: bool = True        # 命中实体一致性校验（§18.3）
+    cache_ttl_knowledge_seconds: int = 86400       # knowledge_base 单分支答案缓存 TTL
+    cache_ttl_short_seconds: int = 900             # chat / 时效类短 TTL
+
+    # 缓存维度版本：任一 bump 后旧条目**自动失配**（逻辑失效，无需删数据）
+    cache_schema_version: str = "1"                # 缓存结构版本（字段变更时 bump）
+    cache_prompt_version: str = "1"                # 提示词版本（RAG/系统提示变更时 bump）
+    cache_kb_version: str = "v1"                   # 知识库内容版本（§18 P1 改为真实指纹前，
+                                                   # 由文档变更处显式 bump）
+
+    cache_embed_prefetch_enabled: bool = True      # 入口预计算 query 双向量并复用（§18.5）
+                                                   # 修复 L2 向量层拿不到 embedding 的缺陷
+
+    # ---- §18.13 检索缓存层（P1-2）：缓存检索结果，命中后仍照常走 LLM 生成 ----
+    cache_retrieve_enabled: bool = True            # 检索缓存总开关（False 即回到无检索缓存行为）
+    cache_retrieve_threshold: float = 0.90         # 检索缓存命中阈值（宽松档：错了只是多检索一次）
+    cache_retrieve_collection_name: str = "lingxi-retrieve-cache"  # 独立集合，不与答案缓存混用
+    cache_retrieve_ttl_seconds: int = 86400        # 检索结果 TTL（与知识库答案缓存同档）
+    cache_retrieve_max_entries: int = 5000         # 独立容量上限（条目比答案缓存大，故更保守）
+    cache_retrieve_max_doc_chars: int = 1200       # 单文档 page_content 上限，超出则**不缓存**
+                                                   # （宁可不缓存，也不存被截断的上下文）
+    cache_retrieve_max_docs: int = 8               # 单条目最多缓存文档数
+
+    # ---- §19 嵌套图检查点隔离 ----
+    agent_task_thread_isolate: bool = True         # 任务 Agent（内层图）使用独立 thread_id，
+                                                   # 不再与主图共用 conversation_id 检查点。
+                                                   # False → 回到「内层图读写主图检查点」旧行为
+                                                   # （跨轮串味：本轮 LLM 看到上一轮的问题）
+
+    # ---- §23 任务 Agent 跨轮上下文注入 ----
+    agent_task_history_inject: bool = True         # 任务 Agent 是否注入最近历史对话，
+                                                   # 供模型消解「这个用户 / 刚才那个」等指代。
+                                                   # 内层 thread 隔离后内层图拿不到任何历史，
+                                                   # 关闭 → 回到改动前行为（模型可能重复追问
+                                                   # 用户已在上一轮给出的实体）。
+    agent_task_history_recent_num: int = 10        # 注入的历史条数上限。任务场景的实体通常
+                                                   # 出现在紧邻上一轮，10 条足够；再多会被
+                                                   # 内层的大段工具结果挤爆上下文预算。
+
+    # ---- §20 收尾补推 ----
+    agent_push_final_response: bool = True         # finalize 节点是否补推 final_response。
+                                                   # merge 合并后的最终回答只在该节点产生，
+                                                   # 原实现不推送 → 降级路径下前端收不到任何内容。
+                                                   # False → 回到改动前行为（不补推）
+
+    # ---- §20 删除策略（delete_data） ----
+    agent_delete_mode: str = "logical"             # physical（真删）| logical（标记删除）
+                                                   # 用户答复「逻辑删除合理」→ 默认 logical。
+                                                   # 需与 agent_delete_flag_column 配合。
+    agent_delete_flag_column: str = ""             # §20 F3.4b：逻辑删除标记列名（仅 logical 模式使用）。
+                                                   # **留空 = 让工具按候选集自动探测**
+                                                   # （deleted / is_deleted / delete_flag / del_flag…）。
+                                                   # 曾默认写死 "is_deleted"，而 `user` 表真实列名是
+                                                   # `deleted`（SHOW COLUMNS 确认）→ 逻辑删除静默回落
+                                                   # 物理删除。故改为「显式配置优先、探测兜底」。
+                                                   # 显式配置但该列不存在时也会转入探测并告警。
+    agent_delete_flag_true_value: int = 1          # 标记「已删除」时写入的值（0/1 或时间戳均可配置）
 
     @property
     def agent_db_allowed_table_list(self) -> list[str]:

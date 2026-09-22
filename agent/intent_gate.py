@@ -160,6 +160,102 @@ _DB_NOUN_RE = re.compile(r"\b[a-z][a-z0-9_]{2,30}\b", re.I)   # 形如 user / or
 _TABLE_META_WORDS = ("有哪些表", "哪些表", "表结构", "表清单", "字段有哪些", "有哪些字段",
                      "表定义", "库表")
 
+# ---------------------------------------------------------------------------
+# §17.3 列表句式强信号（口径封闭、可枚举）
+# ---------------------------------------------------------------------------
+# 起因：「当前系统有哪些用户」这类元数据问询无法在规则层拦截，每次都要付一次
+# LLM 往返（实测 10.1s）。而它其实与 `_TABLE_META_WORDS` 里的「有哪些表」**同属
+# 一个语义类**。
+#
+# 为什么是「句式」而不是「补名词」：把「用户」加进 `_DB_NOUNS` 看似更省事，但
+# 那等于给一个**开放名词集**开后门——「有哪些订单/有哪些商品/有哪些角色…」会连锁
+# 命中，实际效果等同于激进扩表。而句式的作用域是**可枚举的有限模式**，能精确
+# 控制在「清单/枚举」这一种问法上。
+#
+# 注意：命中后仍需过 `_has_kb_hint` 排除（「文档里有哪些条款」应走知识库），
+# 由调用方 `_looks_like_db_task` 统一把关。
+_DB_LIST_PATTERNS = (
+    re.compile(r"有哪些\S{1,8}$"),          # 有哪些用户 / 有哪些订单
+    re.compile(r"有哪些\S{1,8}[?？]?$"),     # 带问号
+    re.compile(r"列出(一下)?\S{1,10}$"),     # 列出所有订单 / 列出一下用户
+    re.compile(r"^(查看|看看|显示|给我)\S{1,8}(列表|清单)$"),
+    re.compile(r"\S{1,8}(清单|列表)$"),       # 用户清单 / 订单列表
+    re.compile(r"(都有|一共有|总共有)(什么|哪些|多少)\S{1,8}$"),   # 都有什么表
+    re.compile(r"(包含|含有|包括)\S{0,4}(哪些|什么)\S{1,6}$"),     # 包含哪些字段
+)
+
+# ---------------------------------------------------------------------------
+# §17.3 列表句式的**作用域锚定**（防止「有哪些X」这类泛句式误伤闲聊）
+# ---------------------------------------------------------------------------
+# 为什么必须有这一层：`有哪些\S{1,8}$` 是自然语言里极常见的句式——「有哪些适合
+# 春天的诗」「有哪些好看的电影」都会命中。若只看句式，规则层就会把**闲聊/创作类**
+# 请求强判成 db_task，直接走错分支（远比多花一次 LLM 更糟）。
+#
+# 判定口径：句式中出现**数据域锚点**（表/字段/记录/行/条/数据/库）才算数据库清单；
+# 出现**知识库锚点**则排除。注意这里的锚点是**窄集**——故意不含 `_DB_NOUNS` 里的
+# 泛词「数据」，因为「有哪些数据」「有哪些数据源」语义太模糊（可能是元数据问询，
+# 也可能是别的），交给 LLM 更稳。
+_LIST_DB_ANCHORS = ("表", "字段", "记录", "行", "条", "库", "用户", "订单", "商品",
+                    "角色", "账号", "库存", "日志")
+_LIST_DB_ANCHOR_RE = re.compile(r"\b[a-z][a-z0-9_]{2,30}\b", re.I)   # user / order_item
+
+
+def _list_patterns_enabled() -> bool:
+    """列表句式强信号开关（惰性读配置，失败默认开启）。"""
+    try:
+        from core.config import settings
+
+        return bool(settings.intent_list_patterns_enabled)
+    except Exception:
+        return True
+
+
+def _looks_like_list_query(text: str) -> bool:
+    """
+    是否「清单/枚举」句式问询（§17.3）。
+
+    两道关卡，缺一不可：
+    1. **句式匹配**（`_DB_LIST_PATTERNS`）——限定在可枚举的问法上；
+    2. **数据域锚定**（`_LIST_DB_ANCHORS` / `_LIST_DB_ANCHOR_RE`）——句子里必须真的
+       提到表/字段/记录这类数据域对象。
+
+    第 2 关是必需的：只有句式的话，「有哪些适合春天的诗」会命中 `有哪些\\S{1,8}$`
+    而被强判成数据库任务（实测误判）。锚定后，闲聊/创作类清单句式会自然回落到 LLM。
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not any(p.search(stripped) for p in _DB_LIST_PATTERNS):
+        return False
+    if any(a in stripped for a in _LIST_DB_ANCHORS):
+        return True
+    return bool(_LIST_DB_ANCHOR_RE.search(stripped))
+
+
+def _mentions_doc_scope(text: str) -> bool:
+    """
+    是否在**清单句式的作用域内**提到文档类词（§17.3 列表规则的排除条件）。
+
+    为什么不能用 `_has_kb_hint` 直接排除：那个函数的口径是「介词 + 文档词」
+    （`根据政策` / `对照手册`），但「文档里有哪些条款」是**文档词在前、清单词在后**，
+    没有介词，`_has_kb_hint` 判 False —— 若不额外把关，这条会被列表规则误判成 DB 任务。
+
+    判定口径：文档类词出现在「有哪些 / 列出 / 清单 / 列表」之前（即限定作用域），
+    或文本中直接出现知识库直指词。
+    """
+    if any(h in text for h in _KB_HINTS):
+        return True
+    for w in _KB_DOC_WORDS:
+        idx = text.find(w)
+        if idx < 0:
+            continue
+        tail = text[idx + len(w):]
+        # 文档词之后紧跟清单类触发词 → 限定在文档范围内枚举
+        if any(k in tail for k in ("有哪些", "列出", "清单", "列表", "哪几")):
+            return True
+    return False
+
+
 # 知识库显式指名（双口径：`指名词` 或 `根据/参考 + 文档类词`，避免漏掉「对照政策」）
 _KB_HINTS = ("知识库", "文档库", "资料库", "知识文档", "已上传的文档", "上传的文件")
 _KB_DOC_WORDS = ("文档", "资料", "文件", "手册", "说明书", "规范", "制度", "政策",
@@ -221,6 +317,12 @@ def _looks_like_db_task(text: str) -> bool:
     """
     if any(w in text for w in _TABLE_META_WORDS):
         return True
+    # §17.3：列表/枚举句式（「有哪些用户」「列出所有订单」「用户清单」）。
+    # 但若同时显式指向知识库/文档（「文档里有哪些条款」），则不判 task——
+    # 这类应走知识库或并行分支，交由 LLM 判定，避免误伤。
+    if _list_patterns_enabled() and _looks_like_list_query(text):
+        if not _has_kb_hint(text) and not _mentions_doc_scope(text):
+            return True
     has_write = any(v in text for v in _DB_WRITE_VERBS)
     if not has_write:
         # 只读查询不强判：`查询` / `看看` 同时也是知识库高频动词，
@@ -491,3 +593,76 @@ def deserialize_decision(payload) -> Optional[GateDecision]:
         )
     except Exception:
         return None
+
+
+# =============================================================================
+# 答案缓存准入策略（设计文档 §18.2）
+# =============================================================================
+#
+# 背景：语义「答案缓存」命中会**跳过整条执行链路**——不检索、不生成、不执行
+# 工具、不留审计。因此它必须受「控制平面」（意图）管辖，而不是绕过它。
+#
+# 三条硬规则：
+#   1. 有副作用的意图（task，含并行场景下的 knowledge_base 分支）一律 DENY：
+#      上一轮刚删改完数据，这一轮再问同样的问题必须看到**新结果**；
+#   2. 纯知识库只读问答才 ALLOW；
+#   3. chat 走短 TTL（创作/时效类内容复用价值有限，且模型输出有随机性）。
+
+CACHE_ALLOW = "allow"     # 允许答案缓存
+CACHE_DENY = "deny"       # 禁用答案缓存（副作用 / 实时性 / 未知意图）
+CACHE_SHORT = "short"     # 允许但短 TTL
+
+# 未取到配置时的兜底 TTL（秒）
+_TTL_KNOWLEDGE_FALLBACK = 86400
+_TTL_SHORT_FALLBACK = 900
+
+
+def _ttl_seconds() -> tuple[int, int]:
+    """读取两档 TTL（配置优先，失败回落常量）。"""
+    try:
+        from core.config import settings
+
+        return (
+            int(getattr(settings, "cache_ttl_knowledge_seconds", 0) or _TTL_KNOWLEDGE_FALLBACK),
+            int(getattr(settings, "cache_ttl_short_seconds", 0) or _TTL_SHORT_FALLBACK),
+        )
+    except Exception:
+        return _TTL_KNOWLEDGE_FALLBACK, _TTL_SHORT_FALLBACK
+
+
+def cache_policy_for(intents: Optional[list]) -> tuple[str, int]:
+    """
+    按意图给出**答案缓存**准入策略与 TTL。
+
+    判定口径（保守优先，与规则层一致：宁可不缓存，不可缓存错）：
+
+    - 含 task            → DENY。任务分支有副作用（写库）或实时读，
+                           且并行场景下 knowledge_base 分支的答案必须与
+                           「刚发生的写操作」一致，不能复用写之前的旧答案；
+    - 仅 knowledge_base  → ALLOW（长 TTL，受 kb_version 等维度约束）；
+    - 仅 chat            → SHORT（短 TTL）；
+    - 空 / 未知组合      → DENY。
+
+    :param intents: 本轮意图列表
+    :return: (policy, ttl_seconds)；policy ∈ {allow, short, deny}，deny 时 ttl 为 0
+    """
+    try:
+        from core.config import settings
+
+        if not getattr(settings, "cache_intent_policy_enabled", True):
+            # 开关关闭：回到改动前行为（所有意图都可缓存，沿用原全局 TTL）
+            ttl_knowledge, _ = _ttl_seconds()
+            return CACHE_ALLOW, ttl_knowledge
+    except Exception:
+        pass
+
+    s = set(intents or [])
+    ttl_knowledge, ttl_short = _ttl_seconds()
+
+    if "task" in s:
+        return CACHE_DENY, 0
+    if s == {"knowledge_base"}:
+        return CACHE_ALLOW, ttl_knowledge
+    if s == {"chat"}:
+        return CACHE_SHORT, ttl_short
+    return CACHE_DENY, 0

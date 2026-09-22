@@ -2,11 +2,17 @@
 Agent SSE 流式辅助
 
 图节点将生成 token / 状态事件推入 asyncio.Queue，由 API 层消费并转发为 SSE。
-统一事件帧格式（与设计文档 §7.6 对齐）：
-- {"event": "content", "content": "..."}   普通 token
-- {"event": "status", "status": "...", ...} 任务/审批状态
-- {"event": "ping"}                         心跳
-- {"event": "done"}                         完成
+统一事件帧格式（与设计文档 §7.6 / §21 对齐）：
+- {"event": "content", "content": "..."}            正文 token
+- {"event": "thinking", "content": "..."}           思考过程 token（§21.2 新增）
+- {"event": "tool", "tool": "...", "status": "..."} 工具调用进度（§21.2 新增）
+- {"event": "status", "status": "...", ...}         任务/审批状态
+- {"event": "ping"}                                 心跳
+- {"event": "done"}                                 完成
+
+**向后兼容**：`thinking` / `tool` 均为**新增**事件名，改造前的帧格式与语义完全不变。
+未适配的前端把它们当未知事件忽略即可，`content` 行为零变化 —— 这是一次
+「零破坏升级」：后端可以先上，前端随后跟上。
 
 **背压与丢帧保护（阶段 4 加固）**：
 
@@ -110,10 +116,82 @@ async def put_frame(queue: asyncio.Queue, frame: bytes, kind: str = "frame") -> 
     return await _safe_put(queue, frame, kind)
 
 
-async def put_content(queue: asyncio.Queue, content: str) -> None:
-    """推送普通 token 事件"""
+async def put_content(queue: asyncio.Queue, content: str, branch: str = "") -> bool:
+    """
+    推送普通 token 事件。
+
+    :param queue: SSE 事件队列
+    :param content: 内容片段
+    :param branch: 内容来源分支标识（§20 F2.1）
+    :return: 是否投递成功
+
+    返回值**必须保留**（§21.3）：`StreamEmitter` 靠它判断「这一帧真的推出去了吗」，
+    据此维护去重指纹与已推字符数。若这里吞掉返回值（`return None`），
+    `StreamEmitter` 会认为每帧都失败 → 去重集合永远为空 → 重入后模型重生成的
+    内容会**再推一遍**，`delivered_chars` 也永远是 0（兜底补推无法裁切）。
+    改动前本函数返回 None，属于「返回值被无意间丢弃」的缺陷。
+
+    `branch` 的意义：并行分支（knowledge / chat / task）共用同一个队列，
+    若帧内不带来源标识，前端只能把各分支的内容全部塞进**同一个** assistant 气泡。
+    届时任一分支触发审批卡片、或某分支覆盖渲染，会把其它分支已渲染的内容一并
+    冲掉（实测：知识库答案被审批卡片覆盖，刷新后才从历史消息里恢复）。
+    取值约定："knowledge" / "chat" / "task" / "final"；空串表示未标注（兼容旧前端，
+    前端应回退到默认气泡行为）。
+    """
     if queue is not None and content:
-        await _safe_put(queue, build_sse_frame("content", content=content), "content")
+        frame = build_sse_frame("content", content=content, branch=branch) if branch \
+            else build_sse_frame("content", content=content)
+        return await _safe_put(queue, frame, "content")
+    return False
+
+
+async def put_thinking(queue: asyncio.Queue, content: str) -> bool:
+    """
+    推送思考过程 token 事件（§21.2）。
+
+    与 `put_content` 分成独立事件名，是为了让前端能把「推理过程」与「正式回答」
+    渲染到**不同区域**（可折叠思考面板 / 正文气泡），而不是混在同一段文字里。
+
+    帧结构：`{"event": "thinking", "content": "..."}`
+
+    丢帧影响面小：正文丢帧用户会看到内容缺失，思考过程丢帧只是看不到推理细节，
+    因此复用同一套丢帧策略即可，不额外告警。
+
+    :param queue: SSE 事件队列
+    :param content: 思考过程增量文本
+    :return: 是否投递成功（供 `StreamEmitter` 计数，见 `put_content` 的说明）
+    """
+    if queue is not None and content:
+        return await _safe_put(queue, build_sse_frame("thinking", content=content), "thinking")
+    return False
+
+
+async def put_tool(
+    queue: asyncio.Queue,
+    tool: str,
+    status: str,
+    **extra: Any,
+) -> None:
+    """
+    推送工具调用进度事件（§21.2）。
+
+    任务分支执行多轮工具调用时耗时最长，此前「跑完才说话」导致用户长时间干等。
+    工具事件让前端能实时展示「正在查询 → 执行中 → 完成」的进度。
+
+    帧结构：`{"event": "tool", "tool": "query_data", "status": "start"|"end", ...}`
+
+    :param queue: SSE 事件队列
+    :param tool: 工具名
+    :param status: 进度状态（start / end）
+    :param extra: 附加字段（如 ok）
+    """
+    if queue is None or not tool:
+        return
+    await _safe_put(
+        queue,
+        build_sse_frame("tool", tool=tool, status=status, **extra),
+        f"tool:{status}",
+    )
 
 
 async def put_status(queue: asyncio.Queue, status: str, **extra: Any) -> None:

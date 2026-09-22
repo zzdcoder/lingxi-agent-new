@@ -314,6 +314,24 @@ K_CLARIFY_PREFIX = "agent.clarify.{}"
 K_TOOL_PREFIX = "agent.tool.{}"
 K_SSE_DROPPED = "agent.sse.frame_dropped"
 K_PROBE_PREFIX = "agent.probe.{}"
+# §21 流式输出与思考过程
+K_THINKING_DELTA = "agent.reasoning.deltas"          # 思考过程帧数
+K_THINKING_SUPPRESSED = "agent.reasoning.suppressed"  # 被思考块过滤器拦下的内容（泄漏防护生效次数）
+K_TASK_STREAM_CHUNK = "agent.task.stream_chunks"      # 任务分支流式帧数
+K_TASK_STREAM_DEDUP = "agent.task.stream_dedup"       # 重入去重拦下的帧数
+K_TASK_STREAM_FALLBACK = "agent.task.stream_fallback"  # astream 失败回落 ainvoke 的次数
+K_TASK_TOOL_EVENT = "agent.task.tool_events"          # 工具进度事件数
+# §22 恢复载荷与中断类型对齐
+K_TASK_RESUME_PAYLOAD_MISMATCH = "agent.task.resume.payload_mismatch"  # 载荷/中断不匹配被拦截次数
+K_TASK_CLARIFY_ANSWER_NO_WRITE = "agent.task.clarify_answer_no_write"  # 有追问答案但最终未发起写调用（退化告警）
+# §23 图内部二次中断（恢复后被模型原地重发写操作拖出的 HITL 中断）载荷不匹配
+K_TASK_RESUME_SECONDARY_INTERRUPT = "agent.task.resume.secondary_interrupt"
+# §23 任务 Agent 历史注入
+K_TASK_HISTORY_INJECTED = "agent.task.history_injected"
+K_TASK_HISTORY_LOAD_FAILED = "agent.task.history_load_failed"
+# §24 陈旧 running 记录（上一轮已终结但状态未同步）拒收
+K_TASK_STALE_RUNNING_REJECTED = "agent.task.stale_running_rejected"
+K_TASK_STALE_RUNNING_CLOSED = "agent.task.stale_running_closed"
 
 
 # =============================================================================
