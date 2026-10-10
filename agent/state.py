@@ -61,6 +61,27 @@ class AgentState(TypedDict, total=False):
     final_response: Optional[str]        # 汇总节点合并后的最终回答（供落库与回溯）
     error: Optional[str]                 # 错误信息
 
+    # ---- 推送去重（§27.6） ----
+    # 本轮**已由分支节点流式推送过**的完整内容列表，供 finalize 补推时去重，
+    # 避免用户在流式看完整段后又收到一遍同样的文字。
+    #
+    # ⚠️ 必须在 schema 里声明：LangGraph 的 StateGraph 只认识 state schema 声明的
+    # channel，**未声明字段的写入会被静默丢弃且不报错**（实测确认）。
+    # 原实现 `task_node` 返回了 `pushed_contents` 但此处未声明 → §20 F2.4 宣称的
+    # dedup 机制从头到尾没有数据基础；叠加 `_already_pushed_branches` 无调用点，
+    # 该机制实际是「三重失效」。
+    #
+    # 为什么由 merge 单点写入（而不是各分支自己写）：knowledge / chat / task 三节点
+    # 在多意图场景下会**并行**执行，同时写同一 channel 需要 reducer 才不会冲突；
+    # 而 merge 是 barrier（全部前驱完成才执行），单点写入既无并发写冲突，
+    # 又天然按「本轮实际产出」判定，且每轮覆盖写、不留跨轮残留。
+    pushed_contents: list
+
+    # 本轮是否抑制 finalize 补推（§27.4.1）：merge 走拼接路径时写 True
+    # —— 拼接结果就是两段已推内容的直接组合，再补推必然重复。
+    # 同样由 merge 每轮覆盖写入（单分支路径显式写 False），避免检查点残留。
+    final_push_suppressed: bool
+
     # ---- 本轮分支标记（§17.2 跨轮状态隔离） ----
     # 由入口节点 intent_router_node 每轮**无条件覆盖**写入，值为本轮**计划执行**
     # 的分支名列表（"knowledge" / "task_agent"）。

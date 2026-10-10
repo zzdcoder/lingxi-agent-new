@@ -17,6 +17,8 @@ Agent 工具统一定义（2026-09-17 收敛）
 保留为薄封装（re-export），保证既有引用零改动。
 """
 import asyncio
+import functools
+import inspect
 import json
 import logging
 import re
@@ -75,6 +77,64 @@ WRITE_INTENT_KEYWORDS = (
 
 # 用户原话引用的最大长度（超长截断，防注入异常参数）
 _MAX_INTENT_QUOTE_LENGTH = 200
+
+# -----------------------------------------------------------------------------
+# §25 P1：聚合函数白名单
+#
+# 只有这 5 个函数会被拼进 SQL，且**函数名来自本常量、列名经 `_assert_column_name`
+# 校验、值一律参数化**，模型无法注入任意 SQL。JOIN / 子查询 / 任意表达式一律不开：
+# 开了就等于把 SQL 能力交给了模型，白名单与审计口径都会被绕过。
+# -----------------------------------------------------------------------------
+AGGREGATE_FUNCS = ("count", "sum", "avg", "min", "max")
+
+
+def _audited(fn):
+    """
+    §25 P2-1：把**被拒绝的**工具调用也写进审计。
+
+    原实现的 `_record_call` 只在**成功路径**上调用，于是「表名不在白名单」
+    「列名非法」「参数类型不对」「缺 user_intent_quote」这类被拒绝的调用
+    **既不落审计、也不进指标、还没有 SQL 可查** —— 在日志里完全隐形。
+
+    这正是 trace=0e7fc2dd93554f24 里 24 次 LLM 调用只有 4 条工具痕迹的原因：
+    其余 20 次全部消耗在「调用 → 被拒 → 回灌 → 换参数再调用」的循环里，
+    而排查时看不到任何一条记录。
+
+    装饰器形态是刻意选的：校验逻辑散落在各工具方法内部，逐个方法包 try/except
+    既重复又容易漏；统一包一层后，任何一个工具方法抛异常都会留痕。
+
+    只记录**脱敏**信息（参数结构与错误类型），不落参数值与完整堆栈。
+    """
+    param_names = [
+        n for n in inspect.signature(fn).parameters if n != "self"
+    ]
+
+    @functools.wraps(fn)
+    async def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        start = time.perf_counter()
+        try:
+            return await fn(self, *args, **kwargs)
+        except Exception as e:
+            # 守卫：审计本身绝不能改变工具的行为或掩盖原始异常
+            try:
+                if not getattr(settings, "agent_tool_error_audit_enabled", True):
+                    raise  # 开关关闭 → 回到「只有成功调用才留痕」的旧行为
+                bound: Dict[str, Any] = {}
+                for idx, value in enumerate(args):
+                    if idx < len(param_names):
+                        bound[param_names[idx]] = value
+                bound.update(kwargs)
+                self._record_error_call(
+                    fn.__name__,
+                    bound,
+                    e,
+                    int((time.perf_counter() - start) * 1000),
+                )
+            except Exception:  # pragma: no cover - 审计失败静默降级
+                pass
+            raise
+
+    return wrapper
 
 
 class DbToolError(ToolException):
@@ -357,10 +417,44 @@ class DbToolExecutor:
             "elapsed_ms": elapsed_ms,
         })
 
+    def _record_error_call(
+        self,
+        name: str,
+        params: Dict[str, Any],
+        exc: Exception,
+        elapsed_ms: int,
+    ) -> None:
+        """
+        §25 P2-1：记录一次**被拒绝/失败**的工具调用（审计留痕 + 指标）。
+
+        与 `_record_call` 的区别：
+        - `ok=False`，因此 `_successful_writes` 等「成功判据」不会误把它算成写成功；
+        - 额外记录 `error_type`，用于区分「参数/白名单类」（模型可纠正，不必熔断）
+          与「系统类」（DbToolSystemError，需熔断）—— 排障时一眼可辨。
+
+        字段口径与成功记录保持一致（`tool` / `params_summary` / `result_summary`），
+        避免审计侧出现两套字段名（项目踩过的坑：按 `name` 取 → 命中 0 条）。
+        """
+        self.tool_calls.append({
+            "tool": name,
+            "params_summary": {
+                k: (f"<{len(v)} 项>" if isinstance(v, (list, dict)) else str(v)[:32])
+                for k, v in params.items()
+            },
+            "result_summary": {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:160],
+            },
+            "elapsed_ms": elapsed_ms,
+        })
+        metrics.incr(f"agent.tool.{name}.rejected")
+
     # =========================================================================
     # 只读工具
     # =========================================================================
 
+    @_audited
     async def list_tables(self) -> dict:
         """列出授权白名单内的表清单。"""
         start = time.perf_counter()
@@ -373,6 +467,7 @@ class DbToolExecutor:
         self._record_call("list_tables", {}, result, result["elapsed_ms"])
         return result
 
+    @_audited
     async def query_data(
         self,
         table: str,
@@ -432,6 +527,115 @@ class DbToolExecutor:
         )
         return result
 
+    @_audited
+    async def aggregate_data(
+        self,
+        table: str,
+        agg: str = "count",
+        column: Optional[str] = None,
+        group_by: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """
+        §25 P1：聚合统计（count / sum / avg / min / max，支持分组与等值过滤）。
+
+        为什么必须新增这个工具：生产 trace=0e7fc2dd93554f24 里用户问
+        「统计用户 dada 有多少条消息会话」，而 `query_data` **只能拉明细**
+        （等值过滤 + LIMIT 50）。模型于是陷入两难：要么拉 50 条明细后自己数
+        （数出来是错的，且上限 50），要么反复换参数重试 —— 24 次 LLM 调用
+        就是这么烧掉的。**工具能力缺失是根因，提示词与预算只是止血。**
+
+        安全口径与 `query_data` 完全一致：表名走白名单归一、列名走
+        `_assert_column_name`、函数名的取值来自模块常量、过滤值一律参数化。
+        **不接受任何原始 SQL 片段。**
+
+        :param table: 表名（白名单内）
+        :param agg: 聚合函数，取值 count/sum/avg/min/max（默认 count）
+        :param column: 聚合列；count 时可省略（COUNT(*)），其余必填
+        :param group_by: 分组列（可传字符串或列名数组），None 表示不分组
+        :param filters: 等值过滤条件 {col: value}
+        :param limit: 分组结果最大行数（默认 agent_query_max_rows）
+        """
+        start = time.perf_counter()
+        # §17.4：用归一后的真实表名（模型常把 `user` 猜成 `users`）
+        table = self.resolve_table(table)
+
+        agg_norm = str(agg or "count").strip().lower()
+        if agg_norm not in AGGREGATE_FUNCS:
+            raise DbToolError(
+                f"不支持的聚合函数 {agg!r}，仅支持：{', '.join(AGGREGATE_FUNCS)}"
+            )
+        if agg_norm != "count" and not (column or "").strip():
+            raise DbToolError(
+                f"聚合函数 {agg_norm} 必须指定 column（统计列）；"
+                f"若只需统计行数请用 agg='count'"
+            )
+        if column:
+            self._assert_columns([column])
+
+        # 分组列：模型可能给字符串，也可能是数组 —— 两种都收，但都过列名校验
+        raw_group = group_by or []
+        if isinstance(raw_group, str):
+            raw_group = [raw_group]
+        gb_cols = [str(c) for c in raw_group if str(c or "").strip()]
+        self._assert_columns(gb_cols)
+
+        filters = self._validate_filters(filters)
+        limit = min(int(limit or self._max_rows), self._max_rows)
+
+        # 聚合表达式：函数名来自白名单常量，列名已校验 —— 无注入面
+        if agg_norm == "count" and not column:
+            agg_expr = "COUNT(*)"
+        else:
+            agg_expr = f"{agg_norm.upper()}(`{column}`)"
+
+        where_sql, params = self._build_where(filters)
+        params["__limit__"] = limit
+
+        if gb_cols:
+            gb_sql = ", ".join(f"`{c}`" for c in gb_cols)
+            select_sql = f"{gb_sql}, {agg_expr} AS `agg_value`"
+            group_sql = f" GROUP BY {gb_sql}"
+            # 分组场景按聚合值降序，让「最多 / 最大」这类诉求直接落在首行
+            order_sql = " ORDER BY `agg_value` DESC"
+        else:
+            select_sql = f"{agg_expr} AS `agg_value`"
+            group_sql = ""
+            order_sql = ""
+
+        stmt = text(
+            f"SELECT {select_sql} FROM `{table}`"
+            f"{where_sql}{group_sql}{order_sql} LIMIT :__limit__"
+        )
+
+        try:
+            result = await self._run(stmt, params)
+            rows = [dict(row) for row in result.mappings().all()]
+        except DbToolError:
+            raise
+        except Exception as e:
+            raise DbToolSystemError(self._safe_error("聚合查询失败", e))
+
+        logger.info(
+            f"[DbTool-aggregate] table={table} agg={agg_norm} groups={len(gb_cols)} "
+            f"rows={len(rows)} elapsed={self._elapsed(start)}ms"
+        )
+        result = {
+            "ok": True,
+            "agg": agg_norm,
+            "data": rows,
+            "row_count": len(rows),
+            "elapsed_ms": self._elapsed(start),
+        }
+        self._record_call(
+            "aggregate_data",
+            {"table": table, "agg": agg_norm, "column": column, "group_by": gb_cols},
+            result,
+            result["elapsed_ms"],
+        )
+        return result
+
     async def _fetch_columns(self, table: str) -> List[str]:
         """读取表的真实列名（用于全列查询时排除敏感列）。"""
         try:
@@ -457,6 +661,7 @@ class DbToolExecutor:
     # 写工具
     # =========================================================================
 
+    @_audited
     async def insert_data(
         self, table: str, values: Dict[str, Any], user_intent_quote: str
     ) -> dict:
@@ -502,6 +707,7 @@ class DbToolExecutor:
         )
         return result
 
+    @_audited
     async def update_data(
         self,
         table: str,
@@ -563,6 +769,7 @@ class DbToolExecutor:
         )
         return result
 
+    @_audited
     async def delete_data(
         self,
         table: str,
@@ -993,6 +1200,25 @@ def _build_tools() -> dict[str, ToolSpec]:
         requires_approval=False,
         handler="query_data",
     ))
+    # §25 P1：聚合统计。description 里**显式写出适用场景与不适用场景**——
+    # 模型只看到「aggregate_data」这个名字时，仍可能继续用 query_data 拉明细
+    # 自己数（trace=0e7fc2dd93554f24 的实际行为）。把它写成强指令。
+    if getattr(settings, "agent_aggregate_tool_enabled", True):
+        _register(ToolSpec(
+            name="aggregate_data",
+            description=(
+                f"对指定表做聚合统计，{_whitelist_note}。"
+                "支持 count/sum/avg/min/max，可用 group_by 按某列分组计数，"
+                "filters 为等值过滤条件。"
+                "**凡是需要「有多少条 / 总共有多少 / 数量 / 统计 / 计数 / 求和 / 平均 / 最多 / 最少」"
+                "的问题，必须调用 aggregate_data 本工具**，不要用 query_data 拉取明细后自己数——"
+                "query_data 最多返回 50 行，数出来的结果是错的。"
+                "限制：仅支持单表等值过滤与分组，不支持跨表关联、模糊匹配、时间范围比较。"
+            ),
+            risk_level=RiskLevel.READ,
+            requires_approval=False,
+            handler="aggregate_data",
+        ))
     _register(ToolSpec(
         name="search_knowledge",
         description=(

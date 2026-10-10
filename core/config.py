@@ -82,6 +82,34 @@ class Settings(BaseSettings):
     agent_llm_timeout_seconds: int = 60            # 单次 LLM 推理超时（秒）
 
     # ============================================================
+    # 任务迭代预算与循环防护（设计文档 §25）
+    # ============================================================
+    # 背景（生产 trace=0e7fc2dd93554f24）：一次「统计某用户有多少条会话消息」
+    # 跑到 136s / 24 次 LLM 调用仍未解决 —— 工具能力先天不可达（无 COUNT/GROUP BY、
+    # conversation_message 无 user_id），模型却在「报错 → 换参数 → 再报错」里空转。
+    # 既有约束全部失效：recursion_limit=100（≈25~50 轮才触发）、审批模式无墙钟上限。
+    #
+    # 与 recursion_limit 的分工（源码级核对，langchain 1.3.10 / langgraph）：
+    # - recursion_limit 计**超步**（model=1 步、tools=1 步），且每次 invoke 都重新
+    #   发放一整份预算（pregel/_loop.py:1700 用 checkpoint 的 step 重算 stop），
+    #   因此**不是**任务生命周期上限；
+    # - ModelCallLimitMiddleware 只计**模型节点调用次数**，严格等于 LLM 调用数，
+    #   与工具调用次数无关。两者叠加，前者兜底、后者才是真正的成本闸门。
+    agent_model_call_limit_enabled: bool = True    # LLM 调用预算总开关（False 回到无预算旧行为）
+    agent_model_call_thread_limit: int = 20        # 同一任务（含审批恢复各轮）累计 LLM 调用上限。
+                                                   # 计数落在检查点里，跨 invoke 累积 —— 这是主闸门
+    agent_model_call_run_limit: int = 12           # 单次 invoke 内 LLM 调用上限（辅助闸门）。
+                                                   # 该计数是 UntrackedValue，每次 invoke 重置，
+                                                   # 因此**不能**单独依赖它（审批恢复即清零）
+    agent_task_approval_timeout_seconds: int = 180  # 审批模式单次 invoke 墙钟上限（秒）。
+                                                   # 只覆盖「模型+工具」的实际执行时间：
+                                                   # interrupt 会立刻抛出、协程随即返回，
+                                                   # 人类审批等待发生在两次 invoke 之间，不计时
+    agent_repeat_call_guard_enabled: bool = True   # 同参重复调用守卫总开关（P0-3）
+    agent_repeat_call_max: int = 3                 # 同一 tool+args 累计出现 N 次即强制收尾
+                                                   # （ToolCallLimitMiddleware 只计次数、不比参数，治不住空转）
+
+    # ============================================================
     # 工具注册（启动时扫描 @tool 装饰器工具并同步工具注册表
     # ============================================================
     agent_tool_scan_packages: str = "tools"        # 扫描 @tool 装饰器工具的包（逗号分隔，相对项目根目录）
@@ -180,6 +208,65 @@ class Settings(BaseSettings):
                                                    # 忽略检查点里的历史残留（§17.2）。
                                                    # False 则回落「字段非空」旧判据
     agent_db_table_name_fuzzy: bool = True         # DB 工具表名单复数保守归一（§17.4）
+
+    # ---- §25 工具侧可观测性与能力补全（P1/P2）----
+    agent_aggregate_tool_enabled: bool = True      # 是否注册并绑定 aggregate_data（聚合统计）工具。
+                                                   # False 时回到「只有 query_data 明细查询」旧行为
+    agent_tool_error_audit_enabled: bool = True    # 被拒绝/非法的工具调用是否落审计与指标（§25.5）。
+                                                   # False 时回到「只有成功调用才留痕」旧行为 ——
+                                                   # 那正是 24 次 LLM 调用里 20 次「查不到痕迹」的原因
+    agent_circuit_count_non_system_failure: bool = True  # 参数/业务类失败（白名单拒绝、校验不过）
+                                                   # 是否计入 total_calls / fail_calls（§25.6.2）。
+                                                   # 只影响**统计口径**，不参与连续失败与熔断判定，
+                                                   # 因此不会引入误熔断。False 回到 total/fail 不同步的旧行为
+    agent_circuit_clear_last_error_on_success: bool = True  # 成功调用是否清空 last_error（§25.6.1）。
+                                                   # False 回到「成功后仍残留上一次错误信息」的旧行为
+    agent_task_prompt_capability_clause: bool = True  # 任务 Agent 提示词是否追加「工具能力边界」条款
+                                                   # （§25.7，治「模型把追问埋在正文里反复重试」）
+
+    # ---- §25.11 连接池健壮性（P2-5 的**缓解**措施，非根治）----
+    #
+    # ⚠️⚠️ 生产事故（2026-09-23）：`db_pool_pre_ping=True` 在本项目的依赖组合下
+    # **直接让所有复用连接的接口 400**。完整链路见 `core/database.py` 的注释，
+    # 简述：SQLAlchemy 用 **pymysql** 的 `Connection.ping` 签名去探测
+    # `_send_false_to_ping`，而 pymysql>=2.2 把默认值改成了 `reconnect=False`
+    # → 探测结果为 False → `do_ping` 改调 `ping()`（不传参）→ 而实际对象是
+    # SQLAlchemy 自己的 `AsyncAdapt_aiomysql_connection.ping(self, reconnect)`
+    # （**无默认值**）→ TypeError: missing 1 required positional argument。
+    # 只在**复用**连接时触发（新建连接不做 pre_ping），故表现为「第一条请求正常、
+    # 之后全挂」。默认 False；确要开启必须先开 `db_pool_pre_ping_shim`。
+    db_pool_pre_ping: bool = False             # 取出连接前先探活（默认关闭，原因见上）
+    db_pool_pre_ping_shim: bool = False        # 兼容补丁：覆盖方言的 `_send_false_to_ping`
+                                               # 为 True，使 aiomysql 适配器一定收到 `reconnect`
+                                               # 参数。开启后 `db_pool_pre_ping` 才真正可用
+    db_pool_recycle_seconds: int = 1800        # 连接复用上限（秒），低于 MySQL wait_timeout，
+                                               # 避免服务端单方面断连后客户端还在使用。
+                                               # 该选项不经过 ping 路径，无上述兼容性问题
+    db_echo: bool = True                       # 是否打印 SQL（生产建议关闭：trace=0e7fc2dd93554f24
+                                               # 的日志里绝大部分是 SQL 回显，淹没真正有用的信息）
+
+    # ---- §27 多意图串行化 × 上游上下文注入 ----
+    #
+    # 四个开关对应改造的四个步骤（详见
+    # `docs/multi_intent_serial_and_context_injection_plan.md`），
+    # **每一个都可独立回滚**。
+    agent_multi_intent_serial: bool = True         # 多意图 {task, knowledge_base} 是否串行（§27.3）。
+                                                   # True：先进知识分支，产出落 state 后由
+                                                   # `route_after_knowledge` 接力进任务分支；
+                                                   # False：恢复并行 fan-out 旧行为
+    agent_merge_llm_enabled: bool = False          # merge 是否调用 LLM 合并两段结果（§27.4）。
+                                                   # False（默认）：走 `_concat_answers` 拼接。
+                                                   # 省掉的一次 LLM 输入含 rag + task 两段全文
+                                                   # （链路最大），且其超时 60s × 重试 1 次
+                                                   # = 最坏 120s，又位于 DAG 必经汇聚点
+    agent_task_kb_context_inject: bool = True      # 是否把上游知识分支的 context_text 注入任务
+                                                   # Agent 系统提示（§27.5）。注入后模型不必重复
+                                                   # 调 search_knowledge，省「1 次决定调工具的
+                                                   # LLM + 1 次 embedding + 1 次检索 + 1 次回灌 LLM」
+    agent_task_kb_context_max_chars: int = 3000    # 注入段正文上限（字符）。**必须限长**：
+                                                   # `format_context_public` 没有总长度上限
+                                                   # （工具侧才有 800/4000 截断），直接注入会与
+                                                   # `_load_task_history`（10 条）叠加撑大 prompt
 
     # ============================================================
     # 缓存治理：语义缓存 × 意图缓存（设计文档 §18）

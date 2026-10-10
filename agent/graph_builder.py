@@ -42,6 +42,10 @@ NODE_TASK_AGENT = "task_agent"
 NODE_MERGE = "merge"
 NODE_FINALIZE = "finalize"
 
+# 拼接模式的分段标题（§27.4.1，merge 免 LLM 路径使用）
+CONCAT_RAG_HEADER = "【知识依据】"
+CONCAT_TASK_HEADER = "【执行结果】"
+
 
 # =============================================================================
 # 节点导入（惰性，避免阶段间强依赖）
@@ -292,21 +296,43 @@ def route_by_intents(state: AgentState) -> Union[str, list[str]]:
     - 返回节点名**列表**时，LangGraph 会在同一 superstep 并行执行多个节点；
     - 返回单个节点名则走单分支。
 
-    意图组合规则（设计文档 §5.2）：
+    意图组合规则（设计文档 §5.2 / §27.3）：
     - 仅 ["chat"] → chat
     - 仅 ["knowledge_base"] / 仅 ["task"] → 单分支
-    - ["task","knowledge_base"] → 并行 fan-out
+    - ["task","knowledge_base"] → **串行**：先 knowledge，再由
+      `route_after_knowledge` 接力进 task_agent（§27.3.1）
     - 异常/低置信度（意图识别已降级为 chat）→ chat
+
+    §27.3 为什么由并行改为串行：
+    1. 并行时两分支各自检索知识库，任务分支看不到知识分支的产出，只能重复检索；
+    2. 并行结果必须靠一次额外的 LLM 合并（`agent_merge_timeout_seconds` 60s
+       × 重试 1 次 = 最坏 120s，且位于 DAG 必经汇聚点）；
+    3. 并行审批中断会**取消**仍在执行的知识分支，恢复后需 `_recover_knowledge_branch`
+       补跑（§14.2）；串行时知识分支早已落检查点，天然可用。
+    串行后 `merge` 仍按 `executed_branches` 判定（§17.2），两分支都被记为已执行。
+
+    回滚：`agent_multi_intent_serial=False` 时恢复原并行 fan-out。
     """
     intents = set(state.get("intents") or ["chat"])
     if intents == {"task", "knowledge_base"}:
-        # 并行分支：task_agent 未注册时退化为仅知识库
-        if _is_node_registered(NODE_TASK_AGENT):
-            target = [NODE_KNOWLEDGE, NODE_TASK_AGENT]
-        else:
-            target = NODE_KNOWLEDGE
-        logger.info(f"[Agent-路由] {sorted(intents)} -> {target} trace_id={get_trace_id()}")
-        return target
+        if not _is_node_registered(NODE_TASK_AGENT):
+            # 任务节点未注册（阶段 1 主图）→ 退化为仅知识库
+            logger.info(
+                f"[Agent-路由] {sorted(intents)} -> {NODE_KNOWLEDGE}（任务节点未注册） "
+                f"trace_id={get_trace_id()}"
+            )
+            return NODE_KNOWLEDGE
+        if getattr(settings, "agent_multi_intent_serial", True):
+            logger.info(
+                f"[Agent-路由] {sorted(intents)} -> 串行 "
+                f"{NODE_KNOWLEDGE} → {NODE_TASK_AGENT} trace_id={get_trace_id()}"
+            )
+            return NODE_KNOWLEDGE
+        logger.info(
+            f"[Agent-路由] {sorted(intents)} -> 并行 "
+            f"[{NODE_KNOWLEDGE}, {NODE_TASK_AGENT}] trace_id={get_trace_id()}"
+        )
+        return [NODE_KNOWLEDGE, NODE_TASK_AGENT]
     if "task" in intents:
         target = NODE_TASK_AGENT if _is_node_registered(NODE_TASK_AGENT) else NODE_CHAT
     elif "knowledge_base" in intents:
@@ -315,6 +341,30 @@ def route_by_intents(state: AgentState) -> Union[str, list[str]]:
         target = NODE_CHAT
     logger.info(f"[Agent-路由] {sorted(intents)} -> {target} trace_id={get_trace_id()}")
     return target
+
+
+def route_after_knowledge(state: AgentState) -> str:
+    """
+    知识分支执行后的去向（§27.3.2）。
+
+    **判据只看意图与节点可用性，不看知识分支是否成功。** 知识分支失败
+    （`rag_answer=None`，见 knowledge_node 的 except 分支）时仍必须进任务分支：
+    任务分支自带 `search_knowledge`，可以自行补检索自愈；若因失败改道 merge，
+    会**直接丢掉任务意图**（用户明确要求的数据操作不会被执行）。
+
+    非多意图（仅 knowledge_base / chat）→ 返回 merge，与串行改造前一致。
+
+    :return: 下一节点名（"task_agent" 或 "merge"）
+    """
+    intents = set(state.get("intents") or [])
+    if (
+        "task" in intents
+        and _is_node_registered(NODE_TASK_AGENT)
+        and getattr(settings, "agent_multi_intent_serial", True)
+    ):
+        logger.info(f"[Agent-路由] 知识分支完成 -> {NODE_TASK_AGENT}（串行接力）")
+        return NODE_TASK_AGENT
+    return NODE_MERGE
 
 
 _registered_nodes: set = set()
@@ -328,6 +378,42 @@ def _register_node(name: str) -> None:
 def _is_node_registered(name: str) -> bool:
     """判断节点是否已注册。"""
     return name in _registered_nodes
+
+
+def _pushed_contents(rag: Optional[str], task: Optional[str]) -> list:
+    """
+    本轮分支节点**已经流式推送过**的完整内容（§27.6）。
+
+    merge 是 barrier，此处读到的 rag / task 就是各分支实际推给用户的内容
+    （task 分支推送时已按 `delivered_chars` 裁切，见 task_node §21.5），
+    且已按 `executed_branches` 过滤掉跨轮残留，因此可直接作为去重集合。
+
+    ⚠️ 本字段必须在 `AgentState` 里声明才有效 —— LangGraph 只认识 schema 声明的
+    channel，未声明字段的写入会被**静默丢弃**（不报错）。
+
+    :param rag: 知识库/聊天分支产出（本轮实际执行时）
+    :param task: 任务分支产出（本轮实际执行时）
+    :return: 已推送内容列表（保序：知识段在前）
+    """
+    return [c for c in (rag, task) if c]
+
+
+def _concat_answers(rag: str, task: str) -> str:
+    """
+    拼接两段分支产出（§27.4.1，merge 的免 LLM 路径）。
+
+    与降级裸拼接 `f"{rag}\\n\\n{task}"` 的区别：加固定小标题，让用户分得清
+    「依据」与「结果」；任一段缺失时退化为单段输出，不产生空标题。
+
+    :param rag: 知识库分支产出
+    :param task: 任务分支产出
+    :return: 拼接后的最终回答
+    """
+    if not rag:
+        return task or ""
+    if not task:
+        return rag
+    return f"{CONCAT_RAG_HEADER}\n{rag}\n\n{CONCAT_TASK_HEADER}\n{task}"
 
 
 @node_trace(NODE_MERGE)
@@ -380,11 +466,38 @@ async def merge_node(
         rag = rag if ran_kb else None
         task = task if ran_task else None
 
-    # 审批中断恢复容错：知识库分支被并行中断取消时重新执行以恢复结果
-    if not rag and "knowledge_base" in intents:
+    # 审批中断恢复容错：知识库分支被并行中断取消时重新执行以恢复结果。
+    #
+    # §27.3.3：**串行模式下必须禁用**。串行时知识分支在任务分支之前已经跑完，
+    # 失败就是失败；若在此处补跑，等于把「重复生成」从流程开头搬到了结尾，
+    # 而且发生在用户已看到任务结果之后，体验更差。
+    # 保留该分支仅为 `agent_multi_intent_serial=False`（并行回滚路径）服务。
+    if (
+        not rag
+        and "knowledge_base" in intents
+        and not getattr(settings, "agent_multi_intent_serial", True)
+    ):
         rag = await _recover_knowledge_branch(state, config)
 
+    pushed = _pushed_contents(rag, task)
+
     if rag and task:
+        # §27.4：默认走拼接（免 LLM）。
+        # 依据：注入改造完成后，知识结论已进入任务分支的上下文，两段内容高度重叠，
+        # 此时 LLM 合并做的其实主要是「去重 + 加过渡词」，性价比反转。
+        if not getattr(settings, "agent_merge_llm_enabled", False):
+            metrics.incr("agent.merge.mode.concat")
+            logger.info(
+                f"[Agent-汇总] 拼接模式（未调用 LLM）: rag={len(rag)}, task={len(task)} "
+                f"trace_id={get_trace_id()}"
+            )
+            return {
+                "final_response": _concat_answers(rag, task),
+                "pushed_contents": pushed,
+                # 拼接结果 = 两段已推内容的直接组合 → 抑制 finalize 补推
+                "final_push_suppressed": True,
+            }
+
         metrics.incr("agent.merge.mode.llm")
         from langchain_core.prompts import ChatPromptTemplate
         from langchain_openai import ChatOpenAI
@@ -415,7 +528,12 @@ async def merge_node(
                     f"[Agent-汇总] LLM 合并完成 attempt={attempt} "
                     f"trace_id={get_trace_id()}"
                 )
-                return {"final_response": resp.content}
+                return {
+                    "final_response": resp.content,
+                    "pushed_contents": pushed,
+                    # LLM 产出的是**新文本**（含综合建议段），与已推两段不同 → 需补推
+                    "final_push_suppressed": False,
+                }
             except Exception as e:
                 last_error = e
                 logger.warning(
@@ -427,7 +545,13 @@ async def merge_node(
             f"[Agent-汇总] LLM 合并最终失败，回退拼接: {last_error} "
             f"trace_id={get_trace_id()}"
         )
-        return {"final_response": f"{rag}\n\n{task}"}
+        # §27.6：降级拼接同样是「两段已推内容的组合」→ 一并抑制补推，
+        # 否则 LLM 抖动时会退化成「用户看两遍」。
+        return {
+            "final_response": _concat_answers(rag, task),
+            "pushed_contents": pushed,
+            "final_push_suppressed": True,
+        }
 
     metrics.incr("agent.merge.mode.passthrough")
     logger.info(
@@ -435,7 +559,15 @@ async def merge_node(
         f"本轮分支={sorted(executed) if executed else '未知'} "
         f"trace_id={get_trace_id()}"
     )
-    return {"final_response": rag or task or "暂无可用结果"}
+    # §27.6：单分支时 final_response 来自唯一已推过的分支内容（或兜底文案）：
+    # - 命中分支内容 → 已推过，抑制补推；
+    # - 落到「暂无可用结果」兜底文案 → 是**新文本**，必须补推（让用户看到失败原因）。
+    fallback = rag or task
+    return {
+        "final_response": fallback or "暂无可用结果",
+        "pushed_contents": pushed,
+        "final_push_suppressed": bool(fallback),
+    }
 
 
 async def _recover_knowledge_branch(
@@ -482,9 +614,16 @@ async def finalize_node(
     （merge 节点产出 final_response，但原实现不推送）。并行双意图场景下，
     用户看到的是 knowledge + task 两段原始内容，缺少「综合建议」这一段；
     某些降级路径（分支静默失败、error 兜底）更是**一条内容都不会推**，
-    前端只能等到 done 事件，界面上一片空白。此处按开关统一补推一次：
-    - `final_response` 与分支已推内容不同时，作为尾段推送（branch="final"）；
-    - 完全相同则跳过，避免用户看到两遍同样的文字。
+    前端只能等到 done 事件，界面上一片空白。此处按开关统一补推一次。
+
+    §27.6 去重（本次修复，三重失效全部堵上）：
+    1. `pushed_contents` 在 `AgentState` 中**声明**（否则写入被静默丢弃）；
+    2. 由 `merge_node` 每轮覆盖写入（单点写，避免并行写冲突）；
+    3. 本节点据此跳过补推，并在 merge 标记 `final_push_suppressed` 时整体跳过。
+    - `final_push_suppressed=True`（拼接/降级拼接）：final_response 就是两段已推内容的
+      直接组合，补推必然重复 → 跳过；
+    - 兜底文案（无 final_response 的 error 分支）：是用户唯一能看到失败原因的机会
+      → **不受抑制标记影响**，照常推送。
     """
     # 审计快照回写（best-effort：失败仅告警，不影响响应产出）
     await _persist_final_snapshot(config, state)
@@ -498,10 +637,18 @@ async def finalize_node(
             f"trace_id={get_trace_id()}"
         )
         # 兜底文案同样需要推送 —— 这是用户唯一能看到失败原因的机会
-        await _push_final_response(config, final)
+        await _push_final_response(config, final, state)
         return {"final_response": final}
 
-    await _push_final_response(config, final)
+    if state.get("final_push_suppressed"):
+        metrics.incr("agent.finalize.push_suppressed")
+        logger.info(
+            f"[Agent-收尾] final_response 由已推内容拼接而成，跳过补推 "
+            f"len={len(final)} trace_id={get_trace_id()}"
+        )
+        return {}
+
+    await _push_final_response(config, final, state)
     return {}
 
 
@@ -509,9 +656,14 @@ def _already_pushed_branches(state: AgentState) -> set[str]:
     """
     收集本轮**已由分支节点推送过**的内容（用于 finalize 去重）。
 
-    依据：分支节点推送时会同时写入状态标记（见 knowledge/chat/task 节点）。
-    老版本状态没有该字段时返回空集，退化为「总是补推」——宁可多推一次，
-    也不要让用户什么都看不到。
+    §27.6 修复：本函数此前是**死代码**（全仓无调用点），且其数据来源
+    `state["pushed_contents"]` 未在 `AgentState` 中声明 —— 而 LangGraph 对未声明
+    字段的写入是**静默丢弃**的，因此 `task_node` 写了也没用。两处叠加导致
+    §20 F2.4 宣称的去重机制从未生效。现在由 `merge_node` 每轮覆盖写入该字段，
+    并在 `_push_final_response` 中真正参与判定。
+
+    按 strip 后的文本比对；字段缺失/类型异常时返回空集，退化为「总是补推」
+    —— 宁可多推一次，也不要让用户什么都看不到。
     """
     pushed = state.get("pushed_contents")
     if not isinstance(pushed, (list, tuple, set)):
@@ -519,16 +671,31 @@ def _already_pushed_branches(state: AgentState) -> set[str]:
     return {str(c).strip() for c in pushed if c}
 
 
-async def _push_final_response(config: RunnableConfig | None, content: str) -> None:
+async def _push_final_response(
+    config: RunnableConfig | None, content: str, state: AgentState | None = None
+) -> None:
     """
-    补推最终回答（§20 F2.4，best-effort）。
+    补推最终回答（§20 F2.4 / §27.6，best-effort）。
 
     开关 `agent_push_final_response` 关闭时直接返回（逐字节回到改动前行为）。
-    与已有分支内容重复时不推，避免双段重复。
+
+    去重判据（§27.6）：`content` 与分支节点已推内容相同时不推，避免用户把
+    同一段文字看两遍。`state` 为 None 时跳过去重（老调用点兼容）。
+
+    :param config: 运行配置（取 sse_queue）
+    :param content: 待补推内容
+    :param state: 图状态（用于读取已推内容集合）
     """
     if not content:
         return
     if not getattr(settings, "agent_push_final_response", True):
+        return
+    if state is not None and content.strip() in _already_pushed_branches(state):
+        metrics.incr("agent.finalize.push_skipped_duplicate")
+        logger.info(
+            f"[Agent-收尾] final_response 与已推内容重复，跳过补推 "
+            f"len={len(content)} trace_id={get_trace_id()}"
+        )
         return
     queue = get_sse_queue(config)
     if queue is None:
@@ -577,7 +744,32 @@ async def _persist_final_snapshot(
             return
         if state.get("final_response"):
             record.result = state["final_response"]
-        if state.get("rag_answer"):
+
+        # ------------------------------------------------------------------
+        # §25 P2-2：rag_answer 只在「本轮真的跑过知识库分支」时才回写。
+        #
+        # merge_node 已按 executed_branches 把跨轮残留的 rag_answer 判为无效并
+        # 置空（§17.2），但本函数读的是**未经 merge 清洗的原始 state** ——
+        # 于是上一轮知识库分支的答案被写进了本轮 task_execution.rag_answer，
+        # 审计里出现「本轮任务是删除用户，rag_answer 却是退货流程」的串味记录，
+        # 复盘时极易误判「任务分支也回答了知识库问题」。
+        #
+        # 判据与 merge_node 完全对齐：`executed_branches` 为空时视为「未知」，
+        # 按放行处理（保守，避免拦掉真实结果）。
+        # ------------------------------------------------------------------
+        executed = set(state.get("executed_branches") or [])
+        stale_rag = bool(
+            settings.agent_merge_cross_turn_guard
+            and executed
+            and "knowledge" not in executed
+        )
+        if stale_rag and state.get("rag_answer"):
+            metrics.incr("agent.finalize.stale_rag_skipped")
+            logger.warning(
+                f"[Agent-收尾] 跳过回写跨轮残留的 rag_answer（本轮未执行知识库分支）"
+                f" len={len(state['rag_answer'])} trace_id={get_trace_id()}"
+            )
+        if state.get("rag_answer") and not stale_rag:
             record.rag_answer = state["rag_answer"]
         await db.commit()
         logger.debug(f"[Agent-收尾] 审计快照已回写: task_id={record.id}")
@@ -631,8 +823,17 @@ def build_graph(checkpointer=None):
         path_map[NODE_CHAT] = NODE_CHAT
     g.add_conditional_edges(NODE_INTENT_ROUTER, route_by_intents, path_map)
 
-    # 三条分支统一汇入 merge（barrier）
-    for name in (NODE_KNOWLEDGE, NODE_CHAT, NODE_TASK_AGENT):
+    # §27.3.2：知识分支的出边改为**条件边** —— 多意图串行时由它接力进任务分支。
+    # ⚠️ 不能再对同一节点同时添加固定边与条件边（LangGraph 视为重复边）。
+    # 判据见 `route_after_knowledge`：只看意图，不看知识分支成败（失败也必须进任务自愈）。
+    if _is_node_registered(NODE_KNOWLEDGE):
+        kb_map = {NODE_MERGE: NODE_MERGE}
+        if _is_node_registered(NODE_TASK_AGENT):
+            kb_map[NODE_TASK_AGENT] = NODE_TASK_AGENT
+        g.add_conditional_edges(NODE_KNOWLEDGE, route_after_knowledge, kb_map)
+
+    # 其余分支统一汇入 merge（barrier）
+    for name in (NODE_CHAT, NODE_TASK_AGENT):
         if _is_node_registered(name):
             g.add_edge(name, NODE_MERGE)
 

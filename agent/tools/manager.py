@@ -32,6 +32,22 @@ from agent.observability import K_TOOL_PREFIX, metrics
 logger = logging.getLogger(__name__)
 
 
+def _is_retryable(e: Exception) -> bool:
+    """
+    §25 P2-1b：判定该错误**是否值得再试一次**。
+
+    口径与熔断器保持一致（设计文档 §7.7.2）：
+    - DbToolSystemError / 超时 = 系统级故障，可能是暂时的，重试有意义；
+    - DbToolError（表不在白名单、列名非法、缺 user_intent_quote、
+      熔断已打开）= **确定性**拒绝，重试多少次结果都一样。
+
+    注意 DbToolSystemError 继承自 DbToolError，判定顺序不可颠倒。
+    """
+    if isinstance(e, asyncio.TimeoutError):
+        return True
+    return isinstance(e, DbToolSystemError)
+
+
 def tool_error_content(e: Exception) -> str:
     """
     工具执行失败的模型可见消息（作为 ToolMessage 送回 Agent 循环）。
@@ -39,8 +55,26 @@ def tool_error_content(e: Exception) -> str:
     基于已脱敏的异常消息（不暴露 SQL/参数值/堆栈）附加修复引导，
     供模型决策"修正参数重试 / 换工具 / 如实告知用户无法完成"。
     仅对 ToolException 子类（如 DbToolError、CircuitOpenError）生效。
+
+    §25 P2-1b：旧实现对**所有**错误统一回「请修正参数后重试」，而白名单拒绝、
+    列名非法、缺 user_intent_quote 这类错误**重试不会改变结果** —— 模型照着做
+    就是空转（trace=0e7fc2dd93554f24：24 次 LLM 调用里绝大部分消耗在这里）。
+    现在对确定性拒绝明确下达「禁止同参重试」并给出替代动作。
     """
-    return f"工具执行失败：{e}。请修正参数后重试；若仍失败，请如实告知用户暂时无法完成该操作。"
+    if _is_retryable(e):
+        return (
+            f"工具执行失败（系统级，可能是暂时故障）：{e}。"
+            "可以换一种方式再试一次；若仍失败，请如实告知用户暂时无法完成该操作。"
+        )
+    return (
+        f"工具调用被拒绝：{e}。\n"
+        "**不要用相同或几乎相同的参数再次调用本工具** —— 这类拒绝是确定性的，"
+        "重试不会改变结果，只会白白消耗轮次。\n"
+        "请改为下列之一：换用更合适的工具（要统计数量/求和/平均/最大值就用 "
+        "aggregate_data，不要拉明细自己数）、换一种查询口径，"
+        "或调用 ask_user 向用户说明当前能力的边界；"
+        "若确认现有工具无法完成，请如实告知用户。"
+    )
 
 
 def with_tool_timeout(handler: Callable, timeout: float):

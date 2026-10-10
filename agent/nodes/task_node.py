@@ -21,7 +21,7 @@ import uuid
 from typing import Any, List, Optional
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain.agents.middleware import HumanInTheLoopMiddleware, ModelCallLimitMiddleware
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphInterrupt, GraphRecursionError
@@ -38,7 +38,21 @@ from agent.streaming import get_sse_queue, put_content, put_status, put_tool
 from agent.tools.db_tools import DbToolExecutor
 from agent.tools.knowledge_tool import KnowledgeToolExecutor
 from agent.tools.manager import bind_active_tools
+from agent.task_guards import RepeatToolCallGuardMiddleware, RepeatedToolCallError
 from tools.clarify_tool import ASK_USER_TOOL_NAME
+
+# §25 P0-1：ModelCallLimitExceededError 定义在 model_call_limit 模块内，
+# 但未从 `langchain.agents.middleware` 顶层导出（1.3.10 实测）。用 try/except
+# 兼容未来版本把它提升为公开 API 的情况；导入失败时降级为「按类名兜底」，
+# 保证本模块不因上游重构而 import 失败（韧性原则）。
+try:  # pragma: no cover - 取决于上游版本
+    from langchain.agents.middleware.model_call_limit import (
+        ModelCallLimitExceededError,
+    )
+except Exception:  # pragma: no cover
+    class ModelCallLimitExceededError(Exception):  # type: ignore[no-redef]
+        """占位：上游未导出该类时的兜底（仅用于 except 匹配）。"""
+
 from agent.observability import (
     K_TASK_CLARIFY_ANSWER_NO_WRITE,
     K_TASK_HISTORY_INJECTED,
@@ -563,7 +577,7 @@ async def _run_task_agent(
     token: int,
     queue,
     *,
-    use_timeout: bool,
+    timeout_seconds: Optional[float] = None,
 ) -> dict:
     """
     §21：执行内层任务 Agent（优先流式，失败回落非流式）。
@@ -571,7 +585,7 @@ async def _run_task_agent(
     流式是**增强**：**环境类**异常回落到 `ainvoke`，
     保证任务本身照常跑完（最坏退回改造前的「跑完一次性推送」）。
 
-    三类异常**必须原样上抛、不得回落**（§22 修复 2）：
+    以下异常**必须原样上抛、不得回落**（§22 修复 2 / §25）：
 
     - `GraphInterrupt`：审批/追问中断依赖它向上冒泡，在此吞掉会导致
       审批链路彻底失效（用户看不到卡片，写操作悬空）；更严重的是回落会
@@ -583,11 +597,18 @@ async def _run_task_agent(
       错误再抛一次、白白多跑一轮模型。必须在投递前拦下并转可读提示。
       （§23 修复 1 起，图内部二次中断拖出的 `KeyError('decisions')` 也在
       `_run_task_agent_streaming` 里转译成本异常，走同一条路径。）
+    - `ModelCallLimitExceededError` / `RepeatedToolCallError`（§25）：预算类
+      终止同样**不是环境故障** —— 计数写在检查点里，回落重跑只会在同一个
+      闸门上再撞一次，白白多一次 ainvoke 的开销。
 
     除此之外的异常（langgraph 版本不支持 stream_mode、消息结构变化等
     **环境类**故障）才回落 —— 那时非流式路径确实能跑通。
 
-    :param use_timeout: 是否施加整体墙钟超时（非审批模式才加，审批等待不计时）
+    :param timeout_seconds: 本次 invoke 的墙钟上限（None 表示不设）。
+        §25 P0-2：审批模式**也必须给上限**。旧实现 `use_timeout=not approval_mode`
+        让审批模式完全裸奔（生产 trace=0e7fc2dd93554f24 跑到 136s 无人拦截）。
+        这里的上限**不会**惩罚人类审批等待：`interrupt()` 是立刻抛出、
+        协程随即返回的，等待发生在两次 invoke 之间，不占这个预算。
     """
     streaming_on = (
         emitter is not None
@@ -599,15 +620,20 @@ async def _run_task_agent(
             coro = _run_task_agent_streaming(
                 agent, invoke_input, invoke_config, emitter, token, queue
             )
-            if use_timeout:
-                return await asyncio.wait_for(
-                    coro, timeout=settings.agent_task_timeout_seconds
-                )
+            if timeout_seconds:
+                return await asyncio.wait_for(coro, timeout=timeout_seconds)
             return await coro
-        except (GraphInterrupt, asyncio.TimeoutError, ResumeMismatchError):
+        except (
+            GraphInterrupt,
+            asyncio.TimeoutError,
+            ResumeMismatchError,
+            ModelCallLimitExceededError,
+            RepeatedToolCallError,
+        ):
             # GraphInterrupt：审批/追问中断必须冒泡（不得降级重跑，否则重复执行写操作）
             # TimeoutError：整体超时，交由上层统一转友好错误
             # ResumeMismatchError：确定性错误，重投无效（§22 修复 2）
+            # 预算/守卫类终止：计数在检查点里，重跑必撞同一闸门（§25）
             raise
         except Exception as e:
             # 流式路径自身故障（版本不支持 stream_mode / 结构变化等**环境类**问题）：
@@ -618,10 +644,10 @@ async def _run_task_agent(
                 f"{type(e).__name__}: {e} trace_id={get_trace_id()}"
             )
 
-    if use_timeout:
+    if timeout_seconds:
         return await asyncio.wait_for(
             agent.ainvoke(invoke_input, config=invoke_config),
-            timeout=settings.agent_task_timeout_seconds,
+            timeout=timeout_seconds,
         )
     return await agent.ainvoke(invoke_input, config=invoke_config)
 
@@ -659,6 +685,56 @@ async def _run_task_agent(
 
 INNER_THREAD_PREFIX = "task_agent"
 
+# =============================================================================
+# §26：跨图传递 config 必须过滤 LangGraph 运行时内部键
+# =============================================================================
+#
+# 生产 trace=ad5ee2d1a2714dc6（2026-09-23）：
+#   用户「给我删除用户baba的用户信息，逻辑删除」→ 首次中断 → 前台**批准**
+#   → 恢复后**再次中断** → 任务 failed，而 `user` 表**一条 UPDATE 都没有**。
+#
+# 根因：`_build_subgraph_config` 旧实现用 `dict(config)` **照抄**了主图节点
+# 的 `configurable`，把 LangGraph 注入的**运行时内部键**一并带给了内层 Agent：
+#
+#   __pregel_scratchpad / __pregel_send / __pregel_call / __pregel_task_id /
+#   __pregel_read / __pregel_replay_state / __pregel_runtime /
+#   __pregel_checkpointer / checkpoint_id / checkpoint_map / checkpoint_ns
+#
+# 这些键描述的是**外层图当前这一次执行的上下文**，对内层图毫无意义，
+# 透传后会造成三连锁后果：
+#
+#   ① 内层 `interrupt()` 读到**外层的 scratchpad** → 内层 PregelLoop 无法接管，
+#      `GraphInterrupt` 以**异常**形式穿透（而不是像正常那样转成 `__interrupt__`
+#      作为返回值）—— 日志里的 `[观测] 节点 task_agent 异常: GraphInterrupt`
+#      就是这个形态；
+#   ② 恢复轮 resume 值**投递错位** → 内层从 `model` 节点恢复（**重跑 LLM**，
+#      模型**重新规划**出参数不同的新 tool_call，实测 `filters` 由
+#      `{"id":65,"username":"baba"}` 变为 `{"username":"baba"}`），而不是从
+#      `HumanInTheLoopMiddleware.after_model` 节点恢复、去执行**已批准**的那个
+#      tool_call ⇒ **写操作从未执行**，用户看到「审批通过了却什么都没发生」；
+#   ③ `_absorb_reissued_interrupt`（§20 F3.5b）运行在 `result` 赋值**之后**，
+#      而中断是**异常**抛出的 ⇒ 该消化逻辑**永不执行**（日志中「本轮无写操作
+#      成功，不消化」这条 WARNING 缺失，即是实证）。
+#
+# 实测对照（scripts/smoke_subgraph_config_isolation.py + diag_nested_interrupt_form.py）：
+# 完全相同的嵌套调用形态下，不过滤 → 写操作「未执行」；过滤 → 写操作「执行」。
+#
+# 判据：`__` 前缀（LangGraph 内部协议键，如 `__pregel_*`）与 `checkpoint_`
+# 前缀（检查点定位键）。本项目全部业务键（db / sse_queue / trace_id /
+# thread_id / approval_resume / clarify_resume / user_id / username …）
+# 均不落在这两个前缀内，故为**安全收窄**。
+_INTERNAL_CONFIG_KEY_PREFIXES: tuple = ("__", "checkpoint_")
+
+
+def _is_internal_config_key(key: Any) -> bool:
+    """
+    §26：判断某个 `configurable` 键是否为 LangGraph 运行时**内部键**。
+
+    内部键描述的是「某一次图执行」的上下文（scratchpad / send / task_id /
+    检查点定位），**跨图传递时必须剔除**，否则内层图的中断与恢复语义会被破坏。
+    """
+    return isinstance(key, str) and key.startswith(_INTERNAL_CONFIG_KEY_PREFIXES)
+
 
 def _inner_thread_id(conversation_id: str, task_execution_id: str) -> str:
     """
@@ -676,13 +752,28 @@ def _build_subgraph_config(
 ) -> dict:
     """
     构造内层 Agent 的运行配置：复用 db / sse_queue / trace_id / metadata / tags，
-    但把 `thread_id` 换成独立命名空间。
+    但把 `thread_id` 换成独立命名空间，并**剔除 LangGraph 运行时内部键**（§26）。
 
     保留 metadata 与 tags 是有意的：LangSmith 上内层 run 仍挂在本轮 trace 树下，
     只是不再与主图共享检查点。
+
+    §26 修复要点（务必保留）：`configurable` **不再整体照抄**。
+    `__pregel_scratchpad` / `__pregel_send` / `checkpoint_ns` 这类键一旦透传，
+    内层 `interrupt()` 会用外层的 scratchpad，导致中断变成**抛出**、
+    恢复落点错位到 `model` 节点（重跑 LLM）而不是执行已批准的 tool_call ——
+    表现为「审批通过后写操作没有执行」。详见文件顶部 §26 长注释。
+
+    :param config: 主图节点的运行配置（含业务键与 LangGraph 内部键）
+    :param thread_id: 内层图独立 thread_id
+    :param recursion_limit: 内层递归上限
+    :return: 可在内层图直接使用的配置
     """
     cfg = dict(config or {})
-    configurable = dict(cfg.get("configurable") or {})
+    configurable = {
+        k: v
+        for k, v in (cfg.get("configurable") or {}).items()
+        if not _is_internal_config_key(k)
+    }
     configurable["thread_id"] = thread_id
     cfg["configurable"] = configurable
     cfg["recursion_limit"] = recursion_limit
@@ -768,7 +859,12 @@ async def task_agent_node(
 
     try:
         # 2. 构建任务 Agent（审批模式绑定全部生效工具；工具从 tool_registry 查询 status=1 生效项）
-        agent = await _build_task_agent(model, db, executor, kb_executor, approval_mode)
+        #    §27.5：携带上游知识依据 —— 多意图时非空（knowledge 分支已检索），
+        #    单意图 task 时为空串 → 系统提示与改动前逐字节一致。
+        agent = await _build_task_agent(
+            model, db, executor, kb_executor, approval_mode,
+            kb_context=_resolve_kb_context(state),
+        )
 
         # 3. 执行任务（恢复执行时从检查点继续，审批决策自动路由）
         # 注入 recursion_limit 覆盖 create_agent 默认值，防模型-工具死循环
@@ -873,9 +969,17 @@ async def task_agent_node(
             )
 
         # §21：流式执行（边跑边推送正文 / 思考过程 / 工具进度）。
-        # 审批模式不设整体墙钟超时（等待用户审批可能很久，超时语义由审批侧
-        # APPROVAL_WAIT_TIMEOUT 负责），仍受工具级/LLM 超时与递归上限保护；
-        # 非审批模式施加整体超时兜底。流式失败自动回落 ainvoke（见 `_run_task_agent`）。
+        #
+        # §25 P0-2：审批模式**也要**给墙钟上限。旧注释「等待用户审批可能很久，
+        # 所以不设超时」的推理是错的 —— `interrupt()` 立刻抛出、协程随即返回，
+        # 人类等待发生在两次 invoke 之间，**不占**这份预算。真正被裸奔放掉的是
+        # 模型与工具的实际执行时间（trace=0e7fc2dd93554f24 跑了 136s）。
+        # 审批模式给一份更宽松的额度（工具/模型往返本就更长），但必须有上限。
+        loop_timeout = (
+            settings.agent_task_approval_timeout_seconds
+            if approval_mode
+            else settings.agent_task_timeout_seconds
+        )
         result = await _run_task_agent(
             agent,
             invoke_input,
@@ -883,7 +987,7 @@ async def task_agent_node(
             emitter,
             stream_token,
             queue,
-            use_timeout=not approval_mode,
+            timeout_seconds=loop_timeout,
         )
 
         # 流结束：吐出被思考块过滤器扣留的正常尾巴（未闭合思考块内的内容丢弃）
@@ -1020,6 +1124,49 @@ async def task_agent_node(
             tool_calls=_merge_tool_calls(executor, kb_executor),
         )
         return {"task_answer": error_msg, "error": error_msg}
+    except ModelCallLimitExceededError as e:
+        # §25 P0-1：LLM 调用预算耗尽（thread_limit / run_limit 命中）。
+        #
+        # 这是**成本与收敛性**的兜底，不是系统故障：既有的 recursion_limit=100
+        # 计的是超步（一次「模型+工具」往返 = 2 步），24 次调用约 48 步根本没到 100，
+        # 所以只能眼睁睁看着它跑。预算中间件只数模型节点，才是真正的闸门。
+        metrics.incr("agent.task.model_call_limit_exceeded")
+        logger.warning(
+            f"[Agent-任务] 模型调用预算耗尽，已终止: "
+            f"task_execution_id={task_execution_id}, {e}, trace_id={get_trace_id()}"
+        )
+        error_msg = (
+            "任务已停止：本次任务的模型推理次数已达上限，继续尝试不会再有进展。\n"
+            "这通常说明需求无法用现有工具一步达成。建议：\n"
+            "1) 把问题拆得更具体（明确表名、统计口径、筛选条件）；\n"
+            "2) 或缩小范围后重试。"
+        )
+        if queue is not None:
+            await put_content(queue, error_msg, branch="task")
+        await _update_task_record(
+            db, task_execution_id, status="failed",
+            error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
+        )
+        await _save_conversation_messages(db, conversation_id, user_input, error_msg)
+        return {"task_answer": None, "error": error_msg}
+    except RepeatedToolCallError as e:
+        # §25 P0-3：同参重复调用守卫命中（模型在用相同参数空转）。
+        # 与预算耗尽的区别：这里能给**具体**的工具名与参数，用户看得懂卡在哪。
+        metrics.incr("agent.task.repeat_call_terminated")
+        logger.warning(
+            f"[Agent-任务] 同参重复调用，已终止: "
+            f"task_execution_id={task_execution_id}, tool={e.tool_name}, "
+            f"count={e.count}, trace_id={get_trace_id()}"
+        )
+        error_msg = e.user_message()
+        if queue is not None:
+            await put_content(queue, error_msg, branch="task")
+        await _update_task_record(
+            db, task_execution_id, status="failed",
+            error=error_msg, tool_calls=_merge_tool_calls(executor, kb_executor),
+        )
+        await _save_conversation_messages(db, conversation_id, user_input, error_msg)
+        return {"task_answer": None, "error": error_msg}
     except Exception as e:
         logger.exception(f"[Agent-任务] 执行失败: {e}")
         error_msg = f"任务执行失败：{str(e)}"
@@ -1038,12 +1185,98 @@ async def task_agent_node(
 # 任务 Agent 构建
 # =============================================================================
 
+# =============================================================================
+# 上游知识依据注入（§27.5）
+# =============================================================================
+
+# 注入段固定头尾文案（限长计算时需计入，故提取为常量）
+KB_CONTEXT_HEADER = "【已检索的知识依据】（由上游知识分支提供，可直接使用）"
+KB_CONTEXT_TRUNCATED_TAIL = (
+    "\n（以上依据已截断，如不足请调用 search_knowledge 补充检索）"
+)
+
+
+def _build_kb_context_section(context_text: str, limit: int) -> str:
+    """
+    构造注入任务分支的「知识依据」段（§27.5.2）。
+
+    背景：多意图场景下知识分支已检索出文档并写入 `state["context_text"]`，
+    但任务分支此前完全看不到它 —— 模型只能按系统提示第 3 条自行调用
+    `search_knowledge` 再检索一遍，代价是「1 次决定调工具的 LLM + 1 次 embedding
+    + 1 次向量检索 + 1 次回灌后的 LLM」。注入后这一段可以整轮省掉。
+
+    **必须限长**：`format_context_public` 没有总长度上限（不同于工具侧的
+    `_build_truncated_context` 会截断到 800/4000），直接注入会与
+    `_load_task_history`（最多 10 条历史）叠加撑大 prompt。
+
+    best-effort 语义：空输入或 limit<=0 时返回空串，等价于「未开启注入」，
+    调用方据此跳过拼接，行为与改动前逐字节一致。
+
+    :param context_text: 上游知识分支格式化的上下文（state["context_text"]）
+    :param limit: 注入正文的字符上限（不含固定头尾文案）
+    :return: 注入段文本；不满足注入条件时为空串
+    """
+    text = (context_text or "").strip()
+    if not text or limit <= 0:
+        return ""
+    truncated = len(text) > limit
+    if truncated:
+        text = text[:limit]
+    metrics.incr("agent.task.kb_context.injected")
+    if truncated:
+        metrics.incr("agent.task.kb_context.truncated")
+    tail = KB_CONTEXT_TRUNCATED_TAIL if truncated else ""
+    return f"{KB_CONTEXT_HEADER}\n{text}{tail}"
+
+
+def _resolve_kb_context(state: AgentState) -> str:
+    """
+    解析本轮要注入任务分支的知识依据段（§27.5.2）。
+
+    开关 `agent_task_kb_context_inject` 关闭时返回空串（逐字节回滚到改动前行为）。
+
+    数据来源 `state["context_text"]`：由上游 `knowledge_node` 写入并**进检查点**
+    （`AgentState` 已声明该字段），因此审批恢复轮重建 Agent 时同样读得到
+    → 注入段与首轮一致，模型决策上下文不漂移。
+
+    单意图 `task` 场景下该字段为本轮空值（跨轮残留会被 merge 的
+    `executed_branches` 守卫拦下，此处也读不到），返回空串 → 不注入。
+
+    :param state: 图状态
+    :return: 注入段文本；关闭开关或无依据时为空串
+    """
+    if not getattr(settings, "agent_task_kb_context_inject", True):
+        return ""
+    return _build_kb_context_section(
+        state.get("context_text") or "",
+        int(getattr(settings, "agent_task_kb_context_max_chars", 3000) or 0),
+    )
+
+
+def _compose_system_prompt(base: str, kb_context: str) -> str:
+    """
+    组装任务 Agent 的最终系统提示（§27.5.1）。
+
+    抽成**纯函数**是为了可测：`_build_task_agent` 依赖 db 会话与 tool_registry，
+    冒烟脚本无法离线调用它，而「注入是否真的进了系统提示」是本改造的核心不变量，
+    必须能被断言（项目约定 C3：回归必须跑生产实现，不得重写等价逻辑得到假绿）。
+
+    :param base: 基础系统提示（TASK_AGENT_SYSTEM_PROMPT）
+    :param kb_context: 注入段（空串表示不注入）
+    :return: 最终系统提示
+    """
+    if not kb_context:
+        return base
+    return f"{base}\n\n{kb_context}"
+
+
 async def _build_task_agent(
     model: str,
     db,
     executor: DbToolExecutor,
     kb_executor: KnowledgeToolExecutor,
     approval_mode: bool,
+    kb_context: str = "",
 ):
     """
     构建任务执行 Agent。
@@ -1052,6 +1285,16 @@ async def _build_task_agent(
     HumanInTheLoopMiddleware 审批后执行；无审批模式仅绑定只读 + 不审批工具。
     工具列表来自 tool_registry 表 status=1（生效）的记录（见 agent/tools/manager.py），
     失效（0）/熔断（2）的工具不会被绑定，实现单工具粒度的故障隔离。
+
+    §27.5.1 `kb_context`：上游知识分支检索结果的注入段，非空时追加到系统提示末尾。
+    此处**可以安全动态化**，依据（langchain 1.3.10 源码核对）：
+    `create_agent` 把 system_prompt 转为 `SystemMessage` 后作为**闭包变量**，
+    每次 model 节点执行时才 `messages = [request.system_message, *messages]`
+    临时前置（`langchain/agents/factory.py:951 / 1390-1391 / 1412`），
+    **不写入 state**。因此：
+    - 不会污染内层 Agent 自己的 checkpoint（同 thread 后续轮次不会被历史依据串味）；
+    - 审批恢复轮重建 Agent 时传入新 `kb_context` 不会与旧 SystemMessage 冲突；
+    - 恢复轮从 state 重新生成注入段（`context_text` 进检查点）→ 与首轮一致。
     """
     # §21.2：走统一入口而非裸 ChatOpenAI —— 任务 Agent 也需要思考过程
     #（`ThinkingChatOpenAI` 把 `reasoning_content` 从 delta 捞进 additional_kwargs，
@@ -1074,19 +1317,77 @@ async def _build_task_agent(
     if approval_mode:
         from agent.graph_builder import get_checkpointer
 
-        kwargs["middleware"] = [
+        kwargs["checkpointer"] = get_checkpointer()
+
+    middleware = _build_task_middleware(approval_mode)
+    if middleware:
+        kwargs["middleware"] = middleware
+    system_prompt = _compose_system_prompt(TASK_AGENT_SYSTEM_PROMPT, kb_context)
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+        **kwargs,
+    )
+
+
+def _build_task_middleware(approval_mode: bool) -> list:
+    """
+    §25 P0-1 / P0-3：构造任务 Agent 的中间件链（迭代预算 + 审批 + 循环防护）。
+
+    单独抽成函数是有意的：中间件链是**纯构造逻辑**，不依赖 LLM 与数据库，
+    抽出来后冒烟脚本可以直接调用生产实现断言（项目约定 C3：回归要跑生产代码
+    路径，不能在测试里重写一遍等价逻辑 —— 那只会得到「假绿」）。
+
+    关键形态修正：中间件列表**必须独立于 `approval_mode`**。
+    原实现把 `kwargs["middleware"] = [...]` 写在审批分支里，等于
+    「非审批模式完全没有 LLM 调用预算」—— 而那正是绝大多数任务的运行模式
+    （审批只在写操作场景开启）。预算是成本与安全约束，不是审批的附属品。
+
+    顺序是有意为之：
+
+    1. `ModelCallLimitMiddleware` —— before_model 计数，超限即止（成本闸门）
+    2. `HumanInTheLoopMiddleware` —— after_model 抛中断（写操作必须先拿到人的决策）
+    3. `RepeatToolCallGuardMiddleware` —— after_model 判同参空转
+
+    守卫放在 HITL **之后**：若模型重复发起的是一个写操作，应当先走审批
+    （用户有权批准），而不是被守卫当成空转掐掉。
+    """
+    middleware: list = []
+
+    if getattr(settings, "agent_model_call_limit_enabled", True):
+        thread_limit = int(getattr(settings, "agent_model_call_thread_limit", 20) or 0)
+        run_limit = int(getattr(settings, "agent_model_call_run_limit", 12) or 0)
+        # 两个 limit 都为 None 时中间件构造会抛 ValueError，此处直接不挂载
+        if thread_limit > 0 or run_limit > 0:
+            middleware.append(
+                ModelCallLimitMiddleware(
+                    thread_limit=thread_limit or None,
+                    run_limit=run_limit or None,
+                    # 必须用 "error"：exit_behavior="end" 会注入一条**英文**
+                    # AIMessage（"Model call limits exceeded..."），而
+                    # `_extract_answer` 取 messages[-1].content —— 那句话会
+                    # 原样出现在中文产品界面上。抛异常则由本节点统一转中文结论。
+                    exit_behavior="error",
+                )
+            )
+
+    if approval_mode:
+        middleware.append(
             HumanInTheLoopMiddleware(
                 interrupt_on=_interrupt_on_config(),
                 description_prefix="数据库写操作待审批",
             )
-        ]
-        kwargs["checkpointer"] = get_checkpointer()
-    return create_agent(
-        model=llm,
-        tools=tools,
-        system_prompt=TASK_AGENT_SYSTEM_PROMPT,
-        **kwargs,
-    )
+        )
+
+    if getattr(settings, "agent_repeat_call_guard_enabled", True):
+        middleware.append(
+            RepeatToolCallGuardMiddleware(
+                max_repeats=int(getattr(settings, "agent_repeat_call_max", 3) or 3)
+            )
+        )
+
+    return middleware
 
 
 def _interrupt_on_config() -> dict:

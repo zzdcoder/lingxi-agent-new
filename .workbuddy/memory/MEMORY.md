@@ -2,342 +2,231 @@
 
 ## 架构约定
 
-- **主图**：`intent_router → 条件路由（knowledge / chat / task_agent）→ merge → finalize`。
-  多分支是**并行 fan-out**，merge 是 barrier（等所有前驱完成）。
-- **意图分层判定**：L0 规则门控 / L1 进程内缓存 / L2 向量就近 / L3 LLM 结构化输出。
-  LLM 是兜底而非必经路径，任何失败都必须**降级 chat**，不得击穿主链路。
-- **任务 Agent 是嵌套子 Agent**（`agent/nodes/task_node.py`），
-  内层有**独立 thread 与 checkpointer**（`_inner_thread_id`）。
-- **状态跨轮隔离**：`executed_branches` 由入口节点每轮覆盖写入，merge 按它判断
-  「本轮跑过哪些分支」，不按「字段是否非空」（检查点会累积历史残留）。
-- **韧性原则**：优化项失败必须降级，不得击穿主链路（意图识别、SSE 投递、熔断计数均如此）。
+- **主图**：`intent_router → 条件路由（knowledge/chat/task_agent）→ merge → finalize`。
+  merge 是 barrier。**§27 起多意图 `{task,kb}` 为串行接力**（knowledge 跑完再进 task_agent），
+  不再并行 fan-out；回滚开关 `agent_multi_intent_serial=False`（见 F）。
+- **StateGraph 只认识 schema 声明的 channel**：**未声明字段的写入被静默丢弃且不报错**。
+  凡「返回了新 state 字段却没生效」，第一嫌疑是 `AgentState` 未声明（§27 实证）。
+- **意图分层**：L0 规则门控 / L1 进程内缓存 / L2 向量就近 / L3 LLM 结构化输出。
+  LLM 是兜底非必经，任何失败**降级 chat**，不得击穿主链路。
+- **任务 Agent 是嵌套子 Agent**（`agent/nodes/task_node.py`，约 1760 行，改前必重读），
+  内层有**独立 thread + checkpointer**（`_inner_thread_id`）。
+- **状态跨轮隔离**：`executed_branches` 由入口节点每轮覆盖写入；merge 按它判断「本轮跑过
+  哪些分支」，不按「字段是否非空」（检查点会累积残留）。
+- **韧性原则**：优化项失败必须降级，不得击穿主链路。
 
 ## 项目约定
 
-- 文档用 `§` 编号章节，代码注释引用编号（如 `§20`、`§21`、`§22`）。
-- 每个修复都要求：根因 + 影响范围 + 回归风险 + 验收用例。
-- 冒烟脚本统一 `scripts/smoke_*.py`，断言判定、可重复运行；诊断脚本 `scripts/diag_*.py`。
-- **审计记录字段口径是 `tool` / `params_summary` / `result_summary`**，
-  不是 `name` / `args`（踩过：按 `name` 取 → 命中 0 条，误判「判据失效」）。
-- 观测指标走 `agent/observability.py` 的 `metrics`，键名 `agent.*` / `task.*` / `cache.*`。
-  任务侧：`task.resume.multi_interrupt`、`task.resume.reissue_absorbed`、
-  `task.resume.no_hanging_interrupt`、`task.resume.payload_mismatch`、
-  `task.resume.secondary_interrupt`、`task.clarify_answer_no_write`、
-  `task.history_injected`、`task.history_load_failed`、`task.write_audit.persisted`、
-  `task.stale_running_rejected`、`task.stale_running_closed`。
+- 文档用 `§` 编号章节，代码注释引用编号（§20/§21/§22…）。
+- 每个修复都要：根因 + 影响范围 + 回归风险 + 验收用例。
+- 冒烟脚本 `scripts/smoke_*.py`（断言判定、可重复、离线），诊断 `scripts/diag_*.py`。
+- **审计字段口径是 `tool`/`params_summary`/`result_summary`**，不是 `name`/`args`。
+- 观测指标走 `agent/observability.py` 的 `metrics`，键 `agent.*`/`task.*`/`cache.*`。
+- 断言写**不变量**，绝不写「某源码串出现 N 次」（已踩两次：C2/C8）。
+- 回归脚本必须 import 生产实现，不能重写逻辑（否则假绿）。
+- 配置默认值凡涉及「列名/表名」必须对着真实 schema 核（C4）。
+- Windows + 中文长文本**禁止 heredoc 追加**，用 Write 工具或 Python
+  `write_text(..., encoding='utf-8')`（C6，踩过三次）。
 
 ---
 
-## A. HITL 中断与恢复（§20 / §22）
-
-### A1. 恢复必须用 `Command(resume)`，且不跨嵌套层级自动透传
-
-外层主图的 `Command(resume=...)` **不会**自动传给内层子 Agent。内层若挂了自己的
-checkpointer 又收到「全新 input」，待审批中断被**静默丢弃**、内层从头重跑、模型
-再次发起同一写操作、**再次中断**，写操作从未执行而外层误报「恢复完成」。
-
-- 规则：恢复轮把决策经 `configurable.approval_resume` / `clarify_resume` 下发给
-  `task_node`，由它转 `Command(resume=...)` 交内层 Agent。
-- **不要**改成「内层去掉 checkpointer」—— 内层 thread 隔离是 §19 的修复手段。
-- 复现：`scripts/smoke_approval_resume.py`。
-
-### A2. 恢复后必须判 `result.get("__interrupt__")`，否则「静默假成功」
-
-LangGraph 用**返回值**表达中断，`ainvoke` / `astream` 都正常返回。若决策没送到真正
-中断的那层，图会**再次中断**，而外层顺着往下走、照常打「恢复完成」日志并计数成功。
-
-- 规则：任何 resume 调用后都要判 `result.get("__interrupt__")`，命中即标记失败 + 告警。
-
-### A3. ⚠️ F3.1 护栏的「反向误判」：批准后模型原地重发
-
-`Command(resume=...)` 修好之后仍报「审批通过却没执行」的真正原因。时序：
-① 决策消费旧中断 → **写工具确实被调用**；② ToolMessage 回灌后模型**又发一次同一写操作**；
-③ 新 tool_call 不在本次 decisions 覆盖内 → `after_model` 抛**第三个中断**；
-④ F3.1 检测命中 → `status=failed`、不推成功文案。
-
-⇒ **写操作落库了，用户看到全是失败。** 别把「审批后没执行」简写成「写操作从未执行」，
-要先区分「工具没跑」还是「跑了但被误判」。（复现：`smoke_resume_multiround.py`）
-
-### A4. 稳定 id 的副作用：同一内层 thread 残留多个悬挂中断
-
-`task_node` 用 `id=f"task-input-{task_execution_id}"` 构造首轮 HumanMessage（稳定 id
-防重复 append）。但 `_find_running_task` 复用同一条 running 记录 → 同一
-`_inner_thread_id` → 后续任何「new input」都 **upsert 覆盖**那条消息，而内层
-`last_ai_msg.tool_calls` 仍带上一轮未消费的写操作 → `after_model` **再次 interrupt**。
-
-- 规则：恢复前先用 `aget_state` 看内层 `next` / `tasks[].interrupts`；有多个悬挂中断时
-  按中断 id 逐个投递（langgraph 1.2.10 支持 `Command(resume={interrupt_id: value})`，
-  见 `pregel/_loop.py` 的 `CONFIG_KEY_RESUME_MAP`）。
-
-### A5. decisions 数量对齐的是「写工具数」，不是「全部 tool_calls」
-
-`HumanInTheLoopMiddleware.after_model` 的 `interrupt_indices` **只统计配置了
-`interrupt_on` 的工具**。一写一读混在同一条 AI 消息里时，把 `action_count` 取成全部
-tool_calls 数会直接抛 `ValueError: Number of human decisions (N) does not match ...`。
-
-### A6. 冗余中断不要清理，要在内层就地消化
-
-批准后模型原地重发写操作会拖出一个**冗余中断**。
-
-- **不要**用 `aupdate_state(cfg, None, as_node="...after_model")` 去清它 —— 实测能把
-  `next` 置为 `('tools',)`，等于让**已批准的写操作再执行一遍**（事故级）。
-- 正确做法：`task_node` 内层返回后，若「载荷已批准」**且**「本轮确有写操作成功」
-  同时成立，就地抹掉 `result["__interrupt__"]`（`_absorb_reissued_interrupt`）。
-- **吞并条件必须严格**：reject/canceled 的新中断是真信号；批准但无写操作成功说明决策
-  确实没生效 —— 两种都**必须保留**给 F3.1 护栏。
-- ⚠️ **§24 修正：原先「冗余中断留在内层无害」的假设是错的。**
-  该假设依赖「下轮会新建 thread」，但 `_find_running_task` 是**按会话**查最近一条
-  `running` 记录 —— 上轮若未把状态同步成 `completed`（僵尸记录），下轮就**复用**
-  同一个 `task_execution_id` → 同一个内层 thread → 上一轮的悬挂中断被带出来
-  → **用户看到重复审批卡片**（明明已批准执行过）。
-  所以「返回值层面消化」只解决**同一轮内**的问题，**跨轮有害**。
-
-### A7. 写操作执行必须与「结果上报」解耦
-
-模型在工具执行后的行为不可控（原地重发、超时、乱答）。**写工具执行成功的当下就独立
-落审计**（`_persist_write_audit`），否则后续被误判失败时 `affected_rows` / `mode` /
-`fallback_reason` 全丢。`approval_service` 判定失败前**必须先查这条审计**。
-
-### A8. 判据函数要严格区分「调用」与「成功」
-
-`_successful_writes` 三重条件：工具名 ∈ 写工具 ∧ `result_summary.ok=True` ∧
-含 `affected_rows`/`inserted_id`。只看工具名会把失败调用算进去，只看 `ok` 会把只读
-工具算进去。
-
-### A9. 两类 `interrupt()` 共存时，恢复载荷必须与中断类型配对（§22 根因）
-
-内层任务 Agent 上同时存在：① `ask_user` 工具内部 `interrupt({"type":"clarification"})`
-（期望 `{answers}` / `{canceled}`）；② `HumanInTheLoopMiddleware.after_model` 的
-`interrupt(hitl_request)`（期望 `{decisions}`）。
-
-`langchain/agents/middleware/human_in_the_loop.py:435` 是**下标取值无兜底**：
-`decisions = interrupt(hitl_request)["decisions"]` → 投 `{answers}` 即 `KeyError`。
-
-- 规则：投递 resume 前用 `aget_state` 读悬挂中断的 **value 形态**并与载荷配对
-  （`answers`/`canceled`→clarify，`decisions`→HITL），不匹配就**不下发**并给可读提示
-  （`ResumeMismatchError`，见 `_match_resume_target`）。投递必炸，不是概率问题。
-- **悬挂中断的类型会随轮次变化**：clarify 被消费后模型发出写操作 → 变成 HITL。
-  所以载荷不能按「本轮开头是什么中断」假定，必须在**投递前一刻**重新读。
-- **判据不足 ≠ 真实冲突**：中断 `value` 取不到时应归为「未知」并**放行**，不要拒绝。
-- 附带发现：同一条 AIMessage 里同时有 `ask_user` 与写操作时，HITL 的 `after_model`
-  **先**抛中断（在 model 之后、tools 之前），`ask_user` 的 `interrupt()` 根本不执行 ——
-  即「边问边删」时审批抢占追问。
-
-### A10. 恢复/复用的入口必须按「内层检查点是否仍有悬挂中断」判活（§24 根因）
-
-**症状**：第一轮「删除 dada 信息」审批通过并执行成功；第二轮「同时删除会话信息」
-**弹出两张审批卡**（一张是上轮的删除 dada）。用户视角是「历史任务复活了」。
-
-**根因链**（比 A4/A6 更深一层，务必记住）：
-1. 上一轮结束**未把 `TaskExecution.status` 同步为 `completed`** → 留下僵尸
-   `running` 记录；
-2. `_find_running_task` **按会话**取最近一条 `running` 记录 → **复用**
-   `task_execution_id`；
-3. 复用即复用 `_inner_thread_id` → **同一个内层 thread**；
-4. 内层 checkpointer 里上一轮的悬挂中断**还在** → 恢复时被读出来 → 重复弹卡。
-
-⇒ A6 的「返回值层面消化冗余中断」只覆盖**同一轮内**；**跨轮必须靠入口拒收**。
-
-- 规则：`_find_running_task(..., reject_stale=True)` —— 复用前先判该记录的内层
-  检查点**是否已无悬挂中断**（`_is_stale_running_record`），陈旧则拒绝复用并新建
-  `task_execution_id`；顺带 `_close_stale_running_tasks` 把僵尸记录收尾为 `completed`。
-- **恢复轮必须复用**（`reject_stale = not is_resume_round`）：恢复轮要的就是那条
-  带悬挂中断的 thread，拒收会把真实待审批弄丢。
-- **判据失败一律「保守放行」**：拒收的代价是真实审批失效（用户要重做写操作），
-  放行的代价只是偶发串味 —— 两者不对称，**读不到检查点时放行**。
-- ⚠️ **实现陷阱：`aget_tuple` 返回 `CheckpointTuple`，字段位置与 `StateSnapshot`
-  **不同**。`CheckpointTuple` **顶层没有** `next` / `tasks` / `interrupts`：
-  - `next` 在 `cpt.checkpoint["next"]`；待写在 `cpt.pending_writes`
-  - 实测：停在 interrupt 时 `pending_writes=True, next=None`；跑到 END 时两者皆空
-  按 `StateSnapshot` 形态写（`state.tasks[].interrupts`）会直接 `AttributeError`。
-- 指标：`agent.task.stale_running_rejected` / `agent.task.stale_running_closed`。
-
----
-
-## B. 流式输出与思考过程（§21）
-
-### B1. 思考过程的两个断点
-
-1. 请求侧必须下发 `extra_body={"enable_thinking": True}`（DashScope Qwen3 默认不返回）；
-2. `langchain_openai` 的 `_convert_delta_to_message_chunk` 只读 content/function_call/
-   tool_calls，**静默丢弃 `reasoning_content`**。但 openai SDK `BaseModel` 是
-   `extra="allow"`（`openai/_models.py:128`），字段仍在
-   `chunk["choices"][0]["delta"]` 里 → 覆盖 `_convert_chunk_to_generation_chunk`
-   即可捞回（见 `core/llm.py`）。
-- 非思考模型传 `enable_thinking` 可能报错 → 走**前缀白名单**。
-- 逐 delta 过滤 `<think>` 必须**有状态**（`StreamingThinkScrubber`）：模型会把 `<think>`
-  与内容拆两个 delta 发，逐帧 `re.sub` 匹配不上 → 开标签原样返回 → **思考内容被当正文推**。
-
-### B2. qwen 思考型模型的 max_tokens 必须算上 reasoning 预算
-
-思考型模型**先消耗 reasoning_tokens 再产正文**。给小 `max_tokens` 会被思考吃满 →
-`finish_reason=length` → 正文零 token → 抛 `LengthFinishReasonError`。分类/摘要类
-任务直接 `extra_body={"enable_thinking": False}`。
-
-### B3. `stream_mode="messages"` 会吐 ToolMessage —— 必须按节点名过滤
-
-`astream(..., stream_mode=["messages","updates"])` 的 `messages` 产出 `(chunk, meta)`，
-**所有**节点消息都抖出来，包括 `tools` 节点的 `ToolMessage`（content 是数据库原始结果）。
-
-- 规则：`meta["langgraph_node"] == NODE_MODEL`（`"model"`）才推，配类名排除兜底。
-- `create_agent` 节点名字面量：`"model"` / `"tools"`（`factory.py:1476/1480`）。
-- `updates` 模式用于拿工具 end 事件与 `__interrupt__`。
-
-### B4. 流式化改造中 `GraphInterrupt` 绝不能走「降级重跑」分支
-
-一旦降级重跑到 `ainvoke`，模型会**再发一次同一写操作** → 已批准的删除/更新**执行两遍**
-（事故级）。规则：`except (GraphInterrupt, asyncio.TimeoutError): raise`。
-（非 GraphInterrupt 的异常走回落是安全的 —— 回落用同一份 `invoke_input`。）
-
-### B5. 「回落重跑」只对环境类故障有效，对确定性错误必须排除
-
-「除了 Exception 就回落 ainvoke」的前提是「非流式能跑通」。但**恢复载荷与中断类型不匹配**
-是确定性错误 —— 回落用**同一个** `Command(resume=...)` 重投只会**再炸一次**。
-
-- 规则：回落白名单按「故障是否与环境相关」划分。环境类（版本不支持 stream_mode、
-  图结构变化）→ 可回落；输入类（载荷格式/类型不匹配、参数非法）→ **不得回落**，
-  直接转可读错误（见 §22 修复2，`except (..., ResumeMismatchError): raise`）。
-
-### B5b. ⚠️ 校验点的**位置**与校验逻辑同等重要（§23 修复 1）
-
-§22 修复 1 在 `_build_resume_command` 里做载荷/中断配对校验，但它**只在节点进入时
-执行一次**，且在 `_run_task_agent` **之前**。于是：
-
-1. 进入时悬挂的是 clarify，与载荷 `{answers}` 配对 → **通过（这是对的）**；
-2. 模型消费该中断后**自己发出写操作** → HITL 中间件在 `astream` **内部**抛**新中断**
-   （期望 `{decisions}`），而 `resume_payload` 仍是常量 `{answers}` →
-   `human_in_the_loop.py:435` 下标取值 → `KeyError('decisions')`；
-3. 第二次投递**完全在图内部产生**，不经过校验函数 —— 校验彻底失位。
-
-- 规则：**凡是「图内部可能新产生同类事件」的场景，校验必须下沉到每次投递/异常出口**，
-  不能只在入口做一次。
-- 修法：`astream` **外层**包 try，把 `KeyError('decisions')` 转译成
-  `ResumeMismatchError`（走不回落路径）。转译点**必须在 `astream` 之外** ——
-  异常是在**迭代过程中**抛出的，`async for` 内层接不住。
-- **只认 `'decisions'` 这一个键名**（`exc.args[0]`，注意 `str(KeyError)` 带引号不可比）。
-  泛化捕获 KeyError 会把检查点结构变化、字段重命名这类**真实缺陷**静默转成
-  「载荷不匹配」的可读提示 —— 让确定性 bug 变成看不懂的降级，是更坏的结果。
-- 用 `except BaseException` 而非 `Exception`：`GraphInterrupt` 当前继承 `Exception`，
-  但用 BaseException 防未来继承链变化时漏接中断（转译函数对非 KeyError 返回 None，不误吞）。
-- 诊断「修复为何没生效」时，**先看修复的覆盖面，再怀疑部署** ——
-  本轮的 KeyError 与修复 1 的生效日志出现在**同一次节点执行内**。
-
-### B6. 推送函数的返回值是「上层判据的输入」，不能吞
-
-`put_content` / `put_thinking` 曾写成 `-> None`（内部布尔被丢弃）→ `StreamEmitter` 里
-`if ok and fingerprint` 恒假 → 去重集合永远为空；`delivered_chars` 恒 0。
-
-- 规则：`put_*` 必须 `-> bool` 并显式 return。凡「返回值被上层当判据用」的函数，
-  冒烟里都要有一条直查返回值的断言（这类缺陷只有断言能发现）。
-
-### B7. SSE 帧缺少分支标识，多分支内容会挤同一个气泡
-
-`knowledge_node` 逐 token 推、`task_node` 整段推，共用同一队列且帧内无 branch。
-
-- 规则：`put_content` 必须携带 `branch`（`knowledge` / `chat` / `task` / `final`），
-  空串时不写该字段以兼容旧前端。前端按 branch 累积为 `segments` 分段渲染；
-  `message.content` 仍是各段拼接（它是发给后端的历史消息载体，必须与界面一致，
-  否则多轮对话丢上下文）。SSE 协议：`content` / `status` / `ping` / `done` +
-  `thinking` / `tool`。
-
-### B8. 前端「内容消失」要从渲染条件本身查，别停在数据层
-
-现象：模型先给出的回答从界面消失，刷新才恢复；数据层完全正常。
-
-- 根因：`MessageBubble` 渲染短路 `{!hasApproval && (...)}` —— 卡片存在即让整个正气泡
-  条件为假。**卡片与正文是并列关系，不是互斥关系。** 诊断必须读到 JSX 渲染条件。
-- 同一模式复发：思考面板 `{isThinking && <ThinkingIndicator/>}`，而 `isThinking` 在
-  「开始吐正文」时被置 false → 改成 `hasThinking = Boolean(thinkingContent?.trim())`。
-
----
-
-## C. 通用工程陷阱
-
-### C1. 提示词治不住模型时，该上机制约束
-
-提示词已明确「审批是正常流程、调用前不要预告我做不到」，但模型仍答「我这里无法直接
-操作数据库」。叠加因素：模型换档、`search_knowledge` 召回的表结构文档让模型把自己定位成
-「转达 SQL 建议」、双意图稀释。⇒ **提示词加重语气收益递减**，应上「写意图检测 → 强制
-调用」或打「有写意图但无写调用」告警指标（`task.clarify_answer_no_write`）。
-
-### C2. 断言的「实现形态耦合」要在改造时同步
-
-曾有断言 `src.count("config=invoke_config") == 2` —— 断言**调用形态**而非不变量。
-
-- 规则：断言写**不变量**，不要写「某字符串出现 N 次」。改造后主动扫既有断言。
-
-### C3. 回归脚本必须 import 生产实现，不能重写逻辑
-
-在测试里重写一遍等价逻辑 → 测试通过但生产没修（**假绿**）。脚本要验证生产代码路径。
-
-### C4. 配置默认值必须与真实 schema 核对
-
-`agent_delete_flag_column` 曾默认 `"is_deleted"`，而 `user` / `conversation` 真实列名是
-**`deleted`** → 逻辑删除静默回落物理删除。已改默认空串 + 候选集探测（`deleted` →
-`is_deleted` → `delete_flag` → `del_flag` → `is_del` → `deleted_flag`），探测不到显式告警。
-`conversation_message` 无标记列，探测返回 `''`。
-**凡「某个列名/表名」的默认值，都必须对着真实 schema 核一遍。**
-
-### C5. 诊断方法论：先分清「哪条 UPDATE」
-
-日志里的 `UPDATE xxx` 未必是业务写操作。诊断「执行了更新但状态没变」时**先确认被
-UPDATE 的表名**：`task_execution` / `tool_registry` / 审计表 → 框架记账 SQL；业务表
-（如 `user`）→ 才是用户期待的写。框架记账成功 ≠ 业务写成功。
-
-### C6. Windows 下 heredoc 写中文会「插错位置 + 损坏字节 + 静默失败」
-
-`cat >> file << 'EOF'` 在 Git Bash + 中文长文本场景反复出问题（§22 踩了三次）：
-① 内容被插到文件**开头**而非末尾；② 产生孤立字节（如 `\x86` 应为 `\xe5\x86\x85`＝「内」）
-→ 文件无法 UTF-8 解码；③ **写入静默失败**（文件大小与写入前完全一致）。
-
-- **规则：Windows + 中文长文本一律用 Write 工具或 Python
-  `path.write_text(..., encoding='utf-8')`，禁止 heredoc 追加。**
-- 事后校验三步：`raw.decode('utf-8')` 不抛异常；`text.count('\ufffd') == 0`；
-  `grep -n "^## "` 确认章节顺序。
-- 修复手法：按字节定位后精确替换；`raw.find(bad)` 可能命中**正常序列的尾部**，必须打印
-  上下文人工确认。
-
-### C7. 跨轮上下文：内层任务 Agent 只收到「当前轮」输入（§23 修复 2 已修）
-
-**§23 修复 2 之前的缺陷**：`task_agent_node` 构造 `invoke_input` 时只放一条
-`HumanMessage(content=user_input)`，**不带历史对话**。内层 thread 隔离
-（`{conv}::task_agent::{tid}`）把「靠检查点兜底拿历史」这条后路也断了 ——
-内层图物理上拿不到任何上下文。用户说「给我把**这个用户**的会话信息失效了」，
-模型无从知道「这个用户」是谁 → 重复追问用户上一轮已给的实体。
-
-- **根因是跨分支功能不对称**：`chat_node` 有 `MySQLChatMessageHistory.aget_messages()`
-  + `[-HISTORY_RECENT_NUM:]` 拼进 prompt，**task_node 没有**。
-  消息其实已落库（`_save_conversation_messages`），只是没人读回来。
-- 修法：`_load_task_history(db, conversation_id)`，三条边界必须处理——
-  ① **末条若是 human 必须裁**（恢复轮重入时末条就是本轮输入；不裁会让同一问题
-  出现两次，且本轮用**稳定 id**、历史那条**无 id**，`add_messages` 的按 id
-  去重完全不生效）；② **历史消息不带 id**（表无 message_id 列，补 id 会与检查点冲突）；
-  ③ 条数上限（`agent_task_history_recent_num`，默认 10）。
-- **降级策略**：db 为 None / conversation_id 空 / 构造失败 / 查询失败 → 一律返回空列表
-  + 计数告警。上下文是**增强**，拿不到就退回改动前行为，绝不能因加载失败让任务跑不起来。
-- 开关 `agent_task_history_inject`（默认 True）可逐字节回滚。
-- **诊断教训**：提示词层面的「不要重复问」治不住**输入缺失** —— 先看模型拿到什么，
-  再看提示词怎么写。跨分支功能不对称（chat 有、task 没有）是隐性缺陷高发区。
-
-### C8. 断言要写不变量，别写源码字面串（已踩两次）
-
-`diag_task_context_and_keyerror.py` 的 B4 曾断言
-`"except (GraphInterrupt, asyncio.TimeoutError, ResumeMismatchError):" in src` ——
-修复 1 落地后白名单形态变化，断言必然失配。**这是第二次踩同一个坑**（C2 已记过一次）。
-
-- 规则：改造完成后**必须主动扫一遍全部脚本**，凡「某字符串 in 源码」形式的断言都要
-  审一遍：它断言的是**不变量**还是**实现形态**？后者一律改写。
-- 本次的正例写法：断言 `"KeyError" not in 白名单`（不变量）而不是白名单字面串。
-
----
-
-## D. 前端工程（D:\lingxi-agent-portal）
-
-- React 19 + TypeScript + Vite + TailwindCSS；SSE 用 `fetch` + `ReadableStream` 读取
-  （**不是 EventSource**，因为要 POST + 自定义 header）。
-- 无测试框架。纯逻辑校验脚本放 `scripts/verify-*.mjs`，用 `node` 直接跑。
+## A. HITL 中断与恢复（§20/§22/§24）
+
+- **A1 恢复必须 `Command(resume)`，不跨嵌套层透传**：外层 resume 不会自动给内层。
+  恢复轮把决策经 `configurable.approval_resume`/`clarify_resume` 下发给 `task_node`，
+  由它转 `Command(resume=...)`。**不要**摘掉内层 checkpointer（那是 §19 的修复）。
+- **A2 任何 resume 后必须判 `result.get("__interrupt__")`**，命中即失败+告警。
+  否则「静默假成功」（LangGraph 用返回值表达中断，ainvoke 正常返回）。
+- **A3 批准后模型原地重发** → 新 tool_call 不在 decisions 内 → 第三个中断 →
+  F3.1 判失败。**写其实落库了**。区分「工具没跑」vs「跑了被误判」。
+- **A4 稳定 id 副作用**：同一内层 thread 可残留多个悬挂中断。恢复前 `aget_state`
+  看 `next`/`tasks[].interrupts`，按 interrupt id 逐个投递。
+- **A5 decisions 数量对齐「写工具数」**，不是全部 tool_calls（HITL 只统计
+  `interrupt_on` 配置过的工具），否则 ValueError。
+- **A6 冗余中断就地消化，不要清状态**：禁止 `aupdate_state(None, as_node=...after_model)`
+  （会把 `next` 置 `('tools',)` → 已批准写操作再执行一遍，事故级）。正确：`task_node`
+  内层返回后，若「载荷已批准」∧「本轮确有写操作成功」→ 抹掉 `result["__interrupt__"]`。
+  吞并条件必须严格（reject/canceled、或批准但无写成功 → 必须保留给 F3.1）。
+  **§24 修正**：该法只管同一轮内，跨轮有害（见 A10）。
+- **A7 写操作执行与结果上报解耦**：写成功当下就独立落审计（`_persist_write_audit`）。
+- **A8 判据区分调用 vs 成功**：`_successful_writes` = 写工具 ∧ `ok=True` ∧
+  含 `affected_rows`/`inserted_id`。
+- **A9 两类 `interrupt()` 共存，载荷必须与中断类型配对**：`ask_user` 的
+  `interrupt({"type":"clarification"})` 要 `{answers}`/`{canceled}`；HITL 的
+  `interrupt(hitl_request)` 要 `{decisions}`。`human_in_the_loop.py:435` 是
+  `interrupt(...)["decisions"]` **下标无兜底** → 投错必 KeyError。
+  投递**前一刻**重新读（中断类型会随轮次变化）。判据不足归「未知」并放行。
+  附带：同一条 AIMessage 同时有 ask_user 与写操作时，HITL 的 after_model **先**抛，
+  ask_user 根本不执行 —— 「边问边删」时审批抢占追问。
+- **A10 入口必须按「内层检查点是否仍有悬挂中断」判活**（§24 根因）：
+  僵尸 `running` 记录 → `_find_running_task` 按会话复用 `task_execution_id`
+  → 复用内层 thread → 上一轮悬挂中断被带出 → **重复审批卡**。
+  修法：`_find_running_task(..., reject_stale=True)`（恢复轮必须复用，
+  `reject_stale = not is_resume_round`）+ `_close_stale_running_tasks`。
+  判据失败一律**保守放行**（拒收代价 >> 放行代价）。
+  ⚠️ `aget_tuple` 返回 `CheckpointTuple`：**顶层没有** `next`/`tasks`/`interrupts`；
+  `next` 在 `cpt.checkpoint["next"]`，待写在 `cpt.pending_writes`。
+  停在 interrupt 时 `pending_writes=True, next=None`；跑到 END 两者皆空。
+  指标：`agent.task.stale_running_rejected` / `stale_running_closed`。
+- **A11 ⚠️ 内层 Agent 的 config 必须过滤 LangGraph 内部键**（2026-09-23 根因）：
+  `_build_subgraph_config` 的 `dict(config)` **照抄**了主图节点的
+  `configurable`，其中含 LangGraph 注入的 `__pregel_scratchpad` / `__pregel_send` /
+  `__pregel_call` / `__pregel_task_id` / `__pregel_read` / `__pregel_replay_state` /
+  `__pregel_runtime` / `__pregel_checkpointer` / `checkpoint_id` / `checkpoint_map` /
+  `checkpoint_ns`。后果：
+  ① 内层 `interrupt()` 用**外层 scratchpad** ⇒ `GraphInterrupt` **直接抛出**而非
+  转成 `__interrupt__`；② 恢复轮 resume 投递错位 ⇒ 从 **model 节点**恢复
+  （**重跑 LLM**、模型**重新规划**出参数不同的新 tool_call）而不是从
+  `after_model` 节点恢复执行已批准的旧 tool_call ⇒ **写操作从未执行**；
+  ③ `_absorb_reissued_interrupt` 只处理返回值形态 ⇒ 在异常路径下**永不执行**。
+  表现：审批通过后数据没删、任务判 failed（**判定本身正确**，无假成功）。
+  修法：剔除 `__pregel*` 前缀 + `checkpoint_*`，只保留业务键
+  （db / sse_queue / trace_id）。铁证脚本
+  `scripts/diag_nested_interrupt_form.py`（同样嵌套调用，过滤前后写操作
+  「未执行 → 执行」）。
+  附带结构事实：`HumanInTheLoopMiddleware.after_model` 是**独立节点**
+  （`langchain/agents/factory.py:1543`），正常恢复**不重跑 model**、
+  直接执行旧 tool_call —— 所以「恢复后参数变了」= config 污染的信号。
+
+## B. 流式与思考过程（§21/§23）
+
+- **B1 思考两个断点**：① 请求侧 `extra_body={"enable_thinking": True}`
+  （DashScope Qwen3 默认不返回）；② `langchain_openai` 静默丢 `reasoning_content`
+  → 覆盖 `_convert_chunk_to_generation_chunk` 捞回（`core/llm.py`）。
+  非思考模型传该参数会报错 → **前缀白名单**。
+  `<think>` 过滤必须**有状态**（`StreamingThinkScrubber`）：开标签与内容会拆两个 delta。
+- **B2 思考型模型 `max_tokens` 要算 reasoning 预算**，否则 `finish_reason=length`
+  → 正文零 token → `LengthFinishReasonError`。分类/摘要直接关思考。
+- **B3 `stream_mode="messages"` 会吐 ToolMessage**：必须按
+  `meta["langgraph_node"] == "model"` 过滤（节点名 `"model"`/`"tools"`）。
+- **B4 `GraphInterrupt` 绝不走降级重跑**（会导致已批准写操作执行两遍，事故级）：
+  `except (GraphInterrupt, asyncio.TimeoutError): raise`。
+- **B5 回落只对「环境类故障」有效**：输入类确定性错误（载荷不匹配/参数非法）
+  不得回落，直接转可读错误（`ResumeMismatchError`）。
+- **B5b 校验点位置 = 校验逻辑**：图内部新产生的中断不经过入口校验。校验必须下沉到
+  每次投递/异常出口；`astream` **外层**包 try 把 `KeyError('decisions')` 转译
+  （异常在迭代中抛出，async for 内层接不住）。**只认 `'decisions'` 键名**
+  （用 `exc.args[0]`，`str(KeyError)` 带引号）。用 `except BaseException` 防继承链变化。
+  诊断「修复没生效」先看覆盖面，再怀疑部署。
+- **B6 推送函数返回值不能吞**：`put_*` 必须 `-> bool` 并显式 return（上层当判据用）。
+- **B7 SSE 帧必须带 `branch`**（knowledge/chat/task/final），空串不写字段兼容旧前端。
+  协议：`content`/`status`/`ping`/`done` + `thinking`/`tool`。
+- **B8 前端「内容消失」查渲染条件**：卡片与正文是**并列**不是互斥
+  （`{!hasApproval && ...}` 短路是根因）。同模式：`isThinking` 在吐正文时置 false
+  → 改 `hasThinking = Boolean(thinkingContent?.trim())`。
+
+## C. 通用陷阱
+
+- **C1 提示词治不住就上机制**：提示词加重语气收益递减 → 上「写意图检测→强制调用」
+  或打告警指标（`task.clarify_answer_no_write`）。
+- **C2/C8 断言写不变量**，改造后主动扫既有断言。
+- **C3 回归 import 生产实现**。
+- **C4 默认值核对真实 schema**：`agent_delete_flag_column` 默认 `is_deleted` 而真列是
+  `deleted` → 逻辑删除静默回落物理删除。已改默认空串 + 候选集探测
+  （`deleted`→`is_deleted`→`delete_flag`→`del_flag`→`is_del`→`deleted_flag`）。
+  `conversation_message` 无标记列。
+- **C5 先分清「哪条 UPDATE」**：`task_execution`/`tool_registry`/审计表 = 框架记账，
+  业务表才算用户期待的写。
+- **C7 跨分支功能不对称是隐性缺陷高发区**：`chat_node` 有
+  `MySQLChatMessageHistory` 历史、`task_node` 曾没有（§23 修复 2）。修法
+  `_load_task_history(db, conversation_id)`，三条边界：① 末条若是 human 必须裁
+  （恢复轮重入时末条即本轮输入，且本轮用稳定 id、历史无 id → `add_messages`
+  去重不生效）；② 历史消息不带 id；③ 条数上限 `agent_task_history_recent_num`=10。
+  开关 `agent_task_history_inject`。失败一律返回空列表 + 告警（上下文是增强）。
+
+## E. 任务迭代预算与循环防护（§25）
+
+溯源：trace=0e7fc2dd93554f24「统计某用户有多少条消息」→ 24 次 LLM / 136s / 未解决。
+四条根因：**工具能力不可达**（根因）> 无迭代预算 > 失败不可见+文案喂空转 > 提示词无能力边界。
+
+- **E1 `recursion_limit` ≠ LLM 调用预算**。前者计**超步**（model=1、tools=1），
+  且每次 invoke 用 checkpoint 的 step **重发一整份预算**（`pregel/_loop.py:1700`）
+  → **不是**任务生命周期上限。`ModelCallLimitMiddleware` 只数模型节点，才是真闸门。
+- **E2 预算中间件必须 `exit_behavior="error"`**。`"end"` 注入**英文** AIMessage，
+  而 `_extract_answer` 取 `messages[-1].content` → 英文直出中文界面。
+- **E3 thread_limit 主、run_limit 辅**：run 计数是 `UntrackedValue`，每次 invoke 重置
+  （审批恢复即清零），**不能单独依赖**。
+- **E4 中间件链不能挂在 `if approval_mode:` 里** —— 那等于「非审批模式完全没有预算」，
+  而多数任务是非审批模式。顺序：ModelCallLimit → HITL → RepeatGuard
+  （守卫在后：重复发起写操作时应先走审批，别被掐掉）。
+- **E5 审批模式也要墙钟上限**。`interrupt()` 立刻抛出、协程随即返回，
+  **人类等待发生在两次 invoke 之间，不占预算** —— 旧注释「审批等待久所以不超时」是错推理。
+- **E6 `ToolCallLimitMiddleware` 只计次数不比参数**，治不住「同参空转」→ 自研
+  `agent/task_guards.py::RepeatToolCallGuardMiddleware`（参数排序后做指纹，累计 ≥3 抛
+  `RepeatedToolCallError`）。预算/守卫类异常都要进 `_run_task_agent` 的**不回落白名单**
+  （计数在检查点，重跑必撞同一闸门）。
+- **E7 被拒调用必须留痕**：`_record_call` 只在成功路径 → 白名单拒绝/参数非法完全隐形
+  （24 次调用只有 4 条痕迹）。`@_audited` 装饰器统一包 6 个工具方法。
+- **E8 错误回灌文案要区分可重试/禁止重试**。对所有错误都回「请修正参数后重试」
+  等于**喂养空转** —— 确定性拒绝要明确说「禁止同参重试」并给替代动作。
+- **E9 熔断器的统计口径与熔断口径必须分开**：任何失败都计 total/fail（否则成功率
+  虚高 100%），但**只有系统级故障**计 consecutive_failures（否则误熔断）。
+  另：成功必须清 `last_error`（否则看板长期残留旧错误）。
+- **E10 连接池「non-checked-in connection」告警**：根因是 `asyncio.wait_for`
+  **取消在途 DB 操作**（工具/语句/任务三层），取消时来不及 checkin。
+  **未根治**（根治要把超时下沉到服务端 `MAX_EXECUTION_TIME`）。
+- **E12 ⚠️ 千万别给 aiomysql 开 `pool_pre_ping`**（2026-09-23 我亲手引发的事故）：
+  开启后登录正常但会话接口**全 400** ——
+  `AsyncAdapt_aiomysql_connection.ping() missing 1 required positional argument: 'reconnect'`。
+  根因：SQLAlchemy 用 **pymysql** 的 `Connection.ping` 签名探测
+  `_send_false_to_ping`，pymysql≥2.2 改成 `ping(self, reconnect=False)` → 探测
+  返回 False → `do_ping` 调 `ping()` 不传参，而 aiomysql 适配器的
+  `ping(self, reconnect)` **无默认值** → TypeError。
+  **只有复用连接才 pre_ping** → 表现为「第一条请求成功、后续全挂」。
+  现状：默认关闭；`_resolve_pool_pre_ping()` 在「开了 pre_ping 但没开 shim」时
+  强制关闭并打 ERROR。要真开需同时 `DB_POOL_PRE_PING_SHIM=true`。
+  回归：`scripts/smoke_db_pool_pre_ping.py`。
+  **教训**：连接池这类参数改变的是**每次取连接**的高频路径，
+  不能照搬最佳实践，必须在目标依赖组合下实测。
+- **E11 提示词要定义「能力边界」**：只说「缺信息就追问」不够，模型会把追问埋进正文。
+  必须列出做不到的事（JOIN/LIKE/时间范围/TopN）+ 规定动作顺序。
+
+## D. 前端（D:\lingxi-agent-portal）
+
+- React 19 + TS + Vite + Tailwind；SSE 用 `fetch` + `ReadableStream`（**非 EventSource**）。
+- 无测试框架，纯逻辑校验 `scripts/verify-*.mjs` 用 node 跑。
 - 类型检查 `./node_modules/.bin/tsc -b`，构建 `./node_modules/.bin/vite build`。
-- **已知既有 lint 报错（非本轮引入，勿误判）**：`App.tsx:46` setState-in-effect、
-  `llm.ts:39` explicit-any。
-- 审批/追问卡片是**独立消息**还是**挂在 assistant 消息上**有区别：实时路径挂同一消息、
-  刷新重建走 `reconcile*Messages` 独立消息。改渲染逻辑时两边都要考虑。
+- **既有 lint 报错（非本轮引入）**：`App.tsx:46` setState-in-effect、`llm.ts:39` explicit-any。
+- 审批/追问卡片：实时路径挂同一 assistant 消息，刷新重建走 `reconcile*Messages`
+  独立消息 —— 改渲染两边都要考虑。
+
+---
+
+## F. 多意图串行化 × merge 拼接 × 上游 context 注入（§27，2026-09-29）
+
+溯源：`intents == {task, knowledge_base}` 并行 fan-out 的三重代价 ——
+① 知识分支与任务 Agent 工具**重复检索**；② merge 调 LLM 合并两段（实测 ~120s）；
+③ **并行审批中断会取消知识分支**，恢复后需 `_recover_knowledge_branch` 补偿重跑。
+
+### 四个改造
+- **① 多意图串行**：`route_by_intents` 返回**单个** `NODE_KNOWLEDGE`（回滚时返回列表）；
+  `knowledge` 出边由 `add_edge` 改 `add_conditional_edges(NODE_KNOWLEDGE, route_after_knowledge, kb_map)`。
+  **`route_after_knowledge` 判据只看意图与节点可用性，不看知识分支成败**
+  —— 知识检索失败也**必须**进任务分支自愈，否则任务被静默吞掉。
+- **② merge 拼接省 LLM**：`_concat_answers` 用 `【知识依据】/【执行结果】` 两段拼接，
+  默认 `agent_merge_llm_enabled=False`。**拼接前必须先修 finalize 补推**，否则重复推送。
+- **③ 上游 context 注入**：`task_node` 把 `state["context_text"]` 限长（默认 3000 字，
+  超限截断 + 附「已截断」提示，允许模型补检索）拼进任务 Agent 的 system prompt。
+  **依赖「`create_agent` 的 `system_prompt` 是闭包变量、不进 state」** ——
+  每次 model 节点执行才临时前置，故不污染内层 checkpoint、恢复轮不会重复 SystemMessage。
+  提示词同步加「优先复用【已检索的知识依据】…不要调 `search_knowledge` 重复检索」。
+- **④ 修 finalize 重复推送**：`_push_final_response(config, content, state=None)` 真正使用
+  `pushed_contents` 去重；`final_push_suppressed` 控制 finalize 是否补推。
+  **注意：抑制标记不作用于兜底文案**（否则异常时用户看到空）。
+
+### ⚠️ `pushed_contents` 三重失效（§20 F2.4 从未生效）
+① 未在 `AgentState` 声明 → 静默丢弃；② `_already_pushed_branches` 无调用点；
+③ knowledge/chat 不写该字段。
+**修法：由 `merge_node` 单点覆盖写入**（merge 是 barrier：避免并行写 reducer 冲突、
+天然按本轮产出判定、每轮覆盖不留残留、分支节点零改动）。
+
+### 配置
+`agent_multi_intent_serial`(True) / `agent_merge_llm_enabled`(False) /
+`agent_task_kb_context_inject`(True) / `agent_task_kb_context_max_chars`(3000)。
+
+### 验收
+新增 `scripts/smoke_multi_intent_serial.py`（39 项，`_LLMProbe` 被实例化即 raise
+→ 证明拼接模式**零 LLM 构造**）；`smoke_cross_turn_isolation.py` 第 3 节原断言
+「并行双分支触发 LLM 合并」是**改造前行为**，已改为不变量断言 + 回滚路径覆盖。
+全量 22 个脚本 exit=0。
+⚠️ 跑脚本用 **`.venv/Scripts/python.exe`**（受管 Python 无 langchain_core）。

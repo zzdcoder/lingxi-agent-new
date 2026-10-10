@@ -200,7 +200,13 @@ class ToolCircuitBreaker:
     # =========================================================================
 
     async def _record_success(self, db, tool_name: str, latency_ms: int) -> None:
-        """记录一次成功调用；CLOSED 下复位连续失败（恢复仅由定时探测 / 人工触发）。"""
+        """记录一次成功调用；CLOSED 下复位连续失败（恢复仅由定时探测 / 人工触发）。
+
+        §25.6.1：成功必须清空 `last_error`。
+        修复前该字段只在失败时写、成功后不清，运维看板与 `tool_registry` 里会长期
+        残留**上一次**的错误（生产实测：连续 3 次成功后仍显示
+        "表 'users' 不在授权白名单内，拒绝访问"），据此判断工具状态必然误判。
+        """
         async with self._lock:
             st = await self._get_state(tool_name, db)
             row = st.row
@@ -213,6 +219,8 @@ class ToolCircuitBreaker:
 
             if row.circuit_state == ToolCircuitState.CLOSED:
                 row.consecutive_failures = 0
+            if getattr(settings, "agent_circuit_clear_last_error_on_success", True):
+                row.last_error = None
             st.dirty = True
 
     async def _record_failure(
@@ -223,27 +231,44 @@ class ToolCircuitBreaker:
         latency_ms: int,
         error_args: Optional[dict] = None,
     ) -> None:
-        """记录一次失败调用；仅系统级故障参与熔断统计，失败时沉淀脱敏入参。
+        """记录一次失败调用；仅系统级故障参与**熔断**统计，失败时沉淀脱敏入参。
 
         熔断触发口径（设计文档 §7.7.2）：参数/业务错误（DbToolError 等）属模型可
-        纠正错误，只记录 last_error 不参与计数，避免误熔断；系统级故障
-        （DbToolSystemError / asyncio.TimeoutError）正常计数并在达到阈值时触发熔断。
+        纠正错误，**不参与熔断判定**（不计连续失败、不进窗口、不触发熔断），
+        避免误熔断；系统级故障（DbToolSystemError / asyncio.TimeoutError）
+        正常计数并在达到阈值时触发熔断。
+
+        §25.6.2：**统计口径与熔断口径必须分开**。
+        修复前 `total_calls` / `fail_calls` 只在系统级故障分支里自增，于是
+        「表不在白名单」这类被拒调用**一次都不计数** —— 生产实测出现
+        `total_calls=23, success_calls=23, fail_calls=0` 这种自相矛盾的数据，
+        成功率永远 100%，看板上根本看不出工具在被反复拒绝。
+        现在：任何失败都计入 total_calls / fail_calls（观测口径），
+        但只有系统级故障才计入 consecutive_failures 与窗口（熔断口径）。
         """
         async with self._lock:
             st = await self._get_state(tool_name, db)
             row = st.row
             row.last_call_at = _now()
             row.last_error = _safe_error(exc)
-
-            if not _is_system_failure(exc):
-                st.dirty = True
-                return
-
-            row.total_calls = _int(row.total_calls) + 1
-            row.fail_calls = _int(row.fail_calls) + 1
-            row.avg_latency_ms = _smoothed_avg(_int(row.avg_latency_ms), latency_ms)
             if error_args:
                 row.last_error_args = _sanitize_args(error_args)
+
+            # ---- 观测口径：系统级故障必计；参数/业务类失败由开关决定是否计入 ----
+            system = _is_system_failure(exc)
+            if system or getattr(
+                settings, "agent_circuit_count_non_system_failure", True
+            ):
+                row.total_calls = _int(row.total_calls) + 1
+                row.fail_calls = _int(row.fail_calls) + 1
+                row.avg_latency_ms = _smoothed_avg(
+                    _int(row.avg_latency_ms), latency_ms
+                )
+
+            # ---- 熔断口径：只有系统级故障才参与连续失败与窗口统计 ----
+            if not system:
+                st.dirty = True
+                return
 
             if row.circuit_state == ToolCircuitState.CLOSED:
                 row.consecutive_failures = _int(row.consecutive_failures) + 1

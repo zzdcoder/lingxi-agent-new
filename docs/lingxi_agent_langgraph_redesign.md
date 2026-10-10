@@ -18,7 +18,7 @@
 
 ### 3.2 技术选型原则
 
-1. **LangGraph 承担编排**：意图路由、条件分支、多意图**并行执行与自动汇聚**、任务执行、Human-in-the-loop 审批，全部由 StateGraph 表达，状态显式、可回放、可持久化；
+1. **LangGraph 承担编排**：意图路由、条件分支、多意图**串行接力与自动汇聚**（§27）、任务执行、Human-in-the-loop 审批，全部由 StateGraph 表达，状态显式、可回放、可持久化；
 2. **LangChain 承担模型抽象**：ChatOpenAI、Prompt、Message、Structured Output、Document 等；
 3. **复用现有检索资产**：`HybridRetriever`、`SemanticCache` 等检索组件不重写，通过薄适配层接入图节点；稀疏向量与稠密向量均由 **text-embedding-v4** 一次调用双输出并存储于 Qdrant，**不再维护独立 BM25 内存索引**；
 4. **审批采用官方 HITL 机制**：`create_agent` + `HumanInTheLoopMiddleware` + LangGraph `interrupt()` + `MySQLAsyncSaver` 检查点持久化，天然支持服务重启后继续审批流；
@@ -132,7 +132,7 @@ class AgentState(TypedDict, total=False):
     context_docs: list                 # 检索到的文档
     context_text: Optional[str]        # 格式化后的上下文
     cached_answer: Optional[str]       # 语义缓存命中时直接使用
-    rag_answer: Optional[str]          # 知识库分支产出（并行场景下与任务分支隔离）
+    rag_answer: Optional[str]          # 知识库分支产出（多意图场景下作为上游产出供任务分支复用，§27）
 
     # ---- 任务执行 ----
     task_execution_id: Optional[str]    # 任务执行记录 ID
@@ -173,8 +173,8 @@ class IntentResult(BaseModel):
 - **意图组合规则**（路由函数执行，见 5.8）：
   - 仅 `["chat"]` → 普通聊天；
   - 仅 `["knowledge_base"]` / 仅 `["task"]` → 单分支；
-  - `["task","knowledge_base"]` 同时命中 → **并行**执行任务子图与知识库子图，最后汇总；
-  - `chat` 与其它意图并存时**丢弃 chat**（chat 仅作兜底，不参与并行）；
+  - `["task","knowledge_base"]` 同时命中 → **串行**执行知识库子图 →（接力）任务子图，最后汇总（§27；改造前为并行 fan-out）；
+  - `chat` 与其它意图并存时**丢弃 chat**（chat 仅作兜底，不参与多分支编排）；
   - 异常输入（如同时命中 3 个）→ 按 `task > knowledge_base > chat` 优先级收敛。
 - **降级策略**：LLM 调用失败、输出非法、置信度 < 0.5 时，默认路由到 `chat`，保证服务可用性；
   置信度落在 `[0.5, 0.75)` 时先用 `intent_escalation_model` **升级重判**一次（§16.5.5-A2）；
@@ -206,7 +206,7 @@ class KnowledgeService:
 2. 语义缓存检查（命中 → 直接作为回答，写入消息）；
 3. 未命中 → 混合检索（权限过滤 + 稀疏向量(text-embedding-v4) + 稠密向量 + RRF + 重排，`k=4`）；
 4. 组装 RAG Prompt（复用 `RAG_SYSTEM_PROMPT_WITH_CONTEXT/WITHOUT_CONTEXT`）；
-5. LLM 流式生成（供 API 层 `stream_mode="messages"` 转发 SSE），产出写入 `rag_answer`（并行场景下供 merge 节点合并）；
+5. LLM 流式生成（供 API 层 `stream_mode="messages"` 转发 SSE），产出写入 `rag_answer`（多意图场景下供 merge 汇总；其 `context_text` 同时注入任务分支，§27.5）；
 6. 回答落库（MySQL） + 写入语义缓存。
 
 ### 5.4 普通聊天节点（ChatNode）
@@ -375,46 +375,77 @@ SSE 已断开时前端经 GET /api/approval/{id} 轮询兜底。
 - 长对话压缩与摘要复用现有 `MySQLConversationSummaryMemory` 逻辑（通过薄适配层暴露公开方法）；
 - LangGraph 检查点仅服务于审批中断/恢复场景，与业务消息表互不冲突。
 
-### 5.8 多意图并行路由与汇总（核心新增）
+### 5.8 多意图路由与汇总（§27 已由并行改为串行接力）
 
-当用户输入**同时包含任务执行与知识库问答**（如"查一下订单数据，并对照知识库里的售后政策给出处理建议"）时，利用 LangGraph 原生 DAG 能力实现**并行 fan-out + 自动汇聚（barrier）**：
+> **⚠️ §27 变更（2026-09-29）**：本节原设计为**并行 fan-out + LLM 汇总**，
+> 现已改为**串行接力 + 免 LLM 拼接**。并行在实践中暴露三重代价：
+> ① 任务分支看不到知识分支的产出，只能自行 `search_knowledge` 再检索一遍
+> （代价 = 1 次「决定调工具」的 LLM + 1 次 embedding + 1 次检索 + 1 次回灌 LLM）；
+> ② 两段结果必须靠额外的 LLM 合并（超时 60s × 重试 1 次 = **最坏 120s**，且位于 DAG 必经汇聚点）；
+> ③ 并行审批中断会取消知识分支，恢复后需 `_recover_knowledge_branch` 补偿重跑。
+> 回滚开关：`agent_multi_intent_serial=False`（恢复本节的并行行为）。
+> 完整设计见 **§27**。
+
+当用户输入**同时包含任务执行与知识库问答**（如"查一下订单数据，并对照知识库里的售后政策给出处理建议"）时，
+由知识分支先行检索产出，任务分支复用其上下文，最后汇聚：
 
 ```
 intent_router（多标签）
         │  条件路由（route_by_intents）
         ├─ 仅单意图 ──────────────► 对应单分支（knowledge / task_agent / chat）
-        └─ ["task","knowledge_base"] ─► 同一 superstep 并行执行：
-                                        ├─ knowledge 节点（复用现有检索，输出 rag_answer）
-                                        └─ task_agent 节点（create_agent + HITL，输出 task_answer）
+        └─ ["task","knowledge_base"] ─► knowledge 节点（复用现有检索，输出 rag_answer / context_text）
+                                                 │  条件路由（route_after_knowledge，§27.3.2）
+                                                 ▼
+                                        task_agent 节点（create_agent + HITL，
+                                                         携带上游 context_text 注入系统提示，§27.5）
                                                  │
                                                  ▼
-                                        merge 节点（等待所有前驱完成后自动汇聚，输出 final_response）
+                                        merge 节点（两分支都执行过 → 默认拼接，不调 LLM，§27.4）
 ```
 
-#### 5.8.1 并行机制（LangGraph 原生能力，无需引入额外并发框架）
+#### 5.8.1 串行机制与关键判据（§27.3）
 
-| 能力   | LangGraph 机制                                                            | 本项目用法                                               |
-| ---- | ----------------------------------------------------------------------- | --------------------------------------------------- |
-| 并行执行 | 条件路由映射值可为**节点名列表**，同一 superstep 中无依赖节点并行运行                              | `route_by_intents` 返回 `["knowledge", "task_agent"]` |
-| 自动汇聚 | 节点有**多条入边**时，LangGraph 在所有前驱节点完成后才执行（barrier/join）                      | `merge` 节点收敛两个分支                                    |
-| 状态隔离 | 并行分支写入**不同字段**，避免 reducer 冲突                                            | 知识库分支写 `rag_answer`，任务分支写 `task_answer`             |
-| 中断语义 | 任一分支触发 `interrupt` 会**暂停整个图**，其余分支已产出的结果保留在 state 中，resume 后继续执行到 merge | 任务分支审批中断时，`rag_answer` 已落 state，审批通过后直接进入汇总         |
+| 能力        | 机制                                                                             | 本项目用法                                                                           |
+| --------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| 串行接力      | 条件路由映射值为**单个节点名**；知识分支出边改 `add_conditional_edges`                              | `route_by_intents` 返回 `"knowledge"`；`route_after_knowledge` 再决定是否进 `task_agent` |
+| 自动汇聚      | `merge` 有**多条入边**，LangGraph 在所有前驱完成后才执行（barrier）                               | `merge` 收敛两个分支（进入时机不变，变的只是执行顺序）                                                 |
+| 状态隔离      | 两分支写入**不同字段**，避免 reducer 冲突                                                    | 知识库分支写 `rag_answer` / `context_text`，任务分支写 `task_answer`                        |
+| 上下文传递     | 知识分支的 `context_text` **进检查点** → 任务分支构建时读取并注入系统提示（§27.5）                        | 任务分支不再重复调 `search_knowledge`                                                    |
+| **失败不断路** | `route_after_knowledge` 判据**只看意图与节点可用性，不看知识分支成败** —— 知识分支失败仍进任务分支（任务分支自带检索可自愈） | 若因失败改道 merge，会**直接丢掉任务意图**                                                      |
+| 中断语义      | 串行下知识分支在任务分支前已完成并落检查点；任务分支触发审批中断时，`rag_answer` / `context_text` 天然可用           | 不再需要 `_recover_knowledge_branch` 补偿重跑（§27.3.3）                                  |
 
-#### 5.8.2 与前台审批的交互（并行 + 中断）
+> 回滚路径：`agent_multi_intent_serial=False` → `route_by_intents` 重新返回
+> `["knowledge", "task_agent"]` 列表，恢复原并行 fan-out；此时
+> `merge` 的知识分支补跑逻辑（`_recover_knowledge_branch`）同步恢复生效。
 
-- 知识库分支通常先完成：`rag_answer` 写入 state，检索与生成结果**不因审批中断而丢失**；
-- 任务分支命中写操作 → HITL 中间件 interrupt → 整个图暂停（thread\_id=conversation\_id 持久化）；
-- SSE 行为：知识库答案的 token 在中断前已可流式下发 → 随后推送 `event=approval_required`（含审批卡片载荷）→ 前台渲染卡片，用户提交决策 → 后台恢复 → 任务分支完成 → merge 汇总 → 推送最终回答；
+#### 5.8.2 与前台审批的交互（串行 + 中断）
+
+- 知识分支**先完整执行**：`rag_answer` 与 `context_text` 写入 state 并落检查点，**不因后续审批中断而丢失**；
+- 任务分支携带注入的知识依据（§27.5）命中写操作 → HITL 中间件 interrupt → 整个图暂停（thread\_id=conversation\_id 持久化）；
+- SSE 行为：知识分支的 token 已完整流式下发 → 随后推送 `event=approval_required`（含审批卡片载荷）→
+  前台渲染卡片，用户**已经看到政策依据**再决定是否批准 → 后台恢复 → 任务分支完成 → merge 拼接 → 推送最终回答；
+- 由于事件顺序由「交错」变为「先依据、后执行」，审批卡片的出现时机更符合用户预期；
 - 兜底：若前端连接断开，可通过 `GET /api/agent/tasks/{task_execution_id}` 轮询获得合并后的 `final_response`，审批单状态经 `GET /api/approval/{id}` 轮询。
+
+> 改造前（并行）的对应行为：知识分支可能被审批中断**取消**，需 merge 检测到
+> 「意图含 knowledge_base 但 rag_answer 为空」后重跑知识分支补偿。串行后该补偿
+> 在默认模式下不再触发（§27.3.3），仅在 `agent_multi_intent_serial=False` 回滚路径保留。
 
 #### 5.8.3 汇总节点（merge）
 
-- **合并策略**：两条分支结果做最终 LLM 摘要（保证上下文连贯、去重、自然衔接），而非简单字符串拼接：
-  - 输入：`rag_answer` + `task_answer` + 原用户输入；
-  - 输出：`final_response`（结构化为「知识库结论 + 任务执行结果 + 综合建议」三段式，可视场景省略段）；
-  - 若某分支失败/无结果，则汇总节点对剩余分支结果直接润色输出（容错）；
+- **合并策略（§27.4 变更）**：默认走**免 LLM 拼接**（`_concat_answers`），而非 LLM 摘要：
+  - 输出结构：`【知识依据】{rag}` + `【执行结果】{task}`（两段皆在时；单段缺失则退化输出该段）；
+  - 关闭 LLM 合并的理由：注入改造后知识结论已进入任务分支上下文，两段**高度重叠**，
+    LLM 合并做的其实主要是「去重 + 加过渡词」，而它的一次调用输入含两段全文（链路最大），
+    且超时 60s × 重试 1 次 = **最坏 120s**，又位于 DAG 必经汇聚点；
+  - **回滚**：`agent_merge_llm_enabled=True` → 恢复原 LLM 摘要行为（输入 `rag_answer` + `task_answer` +
+    原用户输入，输出「知识库结论 + 任务执行结果 + 综合建议」三段式），用于灰度对比输出质量；
+  - 若某分支失败/无结果 → 直接透传剩余分支结果（容错，两模式一致）；
+- **推送去重（§27.6 修复）**：merge 每轮写入 `pushed_contents`（本轮各分支**实际推给用户**的内容）
+  与 `final_push_suppressed`（拼接模式为 True）。finalize 据此跳过补推，
+  避免「用户已经流式看完两段、又收到一遍拼好的全文」；
 - **可观测性**：`final_response` 连同各分支原始结果一并落库 `task_execution`（含 `rag_answer`、`task_answer` 快照），便于审计与回溯；
-- 汇总节点为普通 LLM 调用（非 Agent），无工具、无审批，天然适合作为 DAG 汇聚点。
+- 汇总节点为普通逻辑（拼接模式无 LLM 调用），无工具、无审批，天然适合作为 DAG 汇聚点。
 
 ***
 
@@ -444,18 +475,21 @@ flowchart TD
     C -->|仅 task| E[任务执行子图]
     C -->|仅 chat| F[普通聊天节点]
     C -->|task + knowledge_base| G[知识库问答子图]
-    C -->|task + knowledge_base| H[任务执行子图]
     C -->|异常/低置信度| F
     D --> I
     E --> I
     F --> I
-    G --> I
+    G --> H[任务执行子图<br/>带注入的知识依据 §27.5]
     H --> I
     I --> J[SSE 流式返回]
-    J --> K[消息落库 MySQL + 语义缓存写入<br/>并行结果快照落 task_execution]
+    J --> K[消息落库 MySQL + 语义缓存写入<br/>分支结果快照落 task_execution]
 ```
 
-> 说明：`G`（知识库）与 `H`（任务）在同一 superstep 并行执行；`merge` 节点有多条入边，LangGraph 自动在其所有前驱完成后才执行（barrier）。
+> 说明（**§27 变更**）：`G`（知识库）→ `H`（任务）为**串行接力** —— 知识分支产出
+> `rag_answer` / `context_text` 后，由 `route_after_knowledge` 路由进任务分支，
+> 任务分支复用该上下文而**不再重复检索**；`merge` 节点有多条入边，
+> LangGraph 在所有前驱完成后才执行（barrier，进入时机不变）。
+> 改造前的并行版本（`G`/`H` 同 superstep fan-out）可通过 `agent_multi_intent_serial=False` 回滚。
 > **§16 变更**：`A0` 与 `A6` 为新增的零 LLM 快通道，命中时**不进入** `B`（LLM 分类）；
 > `A1`~`A5`、`A7` 的判定结果直接等效于 `B` 的 `intents`，后续路由逻辑完全复用，无分支删改。
 
@@ -532,25 +566,30 @@ flowchart TD
     B -->|list_tables| D
 ```
 
-### 6.6 多意图并行路由与汇总流程图
+### 6.6 多意图串行接力与汇总流程图（§27 变更）
 
 ```mermaid
 flowchart TD
     A["用户输入"] --> B["意图识别<br/>多标签分类"]
     B --> C{"同时含 task 与 knowledge_base?"}
-    C -->|是| D["并行 fan-out 到两分支"]
+    C -->|是| D["串行：先知识分支<br/>route_by_intents → knowledge"]
     C -->|否| E["单意图路由<br/>knowledge / task / chat"]
-    D --> F["知识库分支<br/>检索+生成 产出 rag_answer"]
-    D --> G["任务分支<br/>create_agent+HITL 产出 task_answer"]
-    E --> H["单分支执行"]
-    F --> I["merge 汇总节点<br/>barrier 汇聚两分支"]
-    G --> I
+    D --> F["知识库分支<br/>检索+生成 产出 rag_answer / context_text"]
+    F --> G{"route_after_knowledge<br/>含 task 意图?"}
+    G -->|是（不看知识分支成败）| H["任务分支<br/>create_agent+HITL<br/>注入知识依据 §27.5"]
+    G -->|否| I["merge 汇总节点<br/>barrier 汇聚"]
+    E --> H2["单分支执行"]
     H --> I
-    I --> J["LLM 合并润色<br/>知识库结论 + 任务结果 + 综合建议"]
-    J --> K["final_response 落库 + SSE 返回"]
+    H2 --> I
+    I --> J["拼接 final_response<br/>【知识依据】+【执行结果】<br/>默认不调 LLM"]
+    J --> K["final_response 落库 + SSE 返回<br/>finalize 按 pushed_contents 去重"]
 ```
 
-### 6.7 多意图并行 + 审批中断时序图
+> 改造前（并行）版本：`D` 为 `并行 fan-out 到两分支`，`I` 之后为
+> `LLM 合并润色（知识库结论 + 任务结果 + 综合建议）`。
+> 回滚开关：`agent_multi_intent_serial=False` + `agent_merge_llm_enabled=True`。
+
+### 6.7 多意图串行 + 审批中断时序图（§27 变更）
 
 ```mermaid
 sequenceDiagram
@@ -562,18 +601,22 @@ sequenceDiagram
 
     U->>G: POST /api/agent/chat (SSE)
     G->>G: 意图识别 → [task, knowledge_base]
-    G->>K: 并行执行（同一 superstep）
-    G->>T: 并行执行（同一 superstep）
-    K-->>G: 返回 rag_answer（token 已流式下发）
+    G->>K: 串行第 1 步：执行知识分支
+    K-->>G: 返回 rag_answer / context_text（落检查点）
+    G-->>U: SSE 流式下发知识依据（用户先看到政策原文）
+    G->>T: 串行第 2 步：route_after_knowledge 接力，注入知识依据
     T->>T: 决策写库 → HITL interrupt
     G-->>U: SSE event=approval_required（渲染审批卡片）
     U->>G: POST /api/approval/{id}/decision（前台审批）
-    G->>T: Command(resume=approve) 恢复执行
+    G->>T: Command(resume=approve) 恢复执行（知识依据仍在 state）
     T-->>G: 返回 task_answer
     G->>M: barrier 汇聚两分支结果
-    M-->>G: 返回 final_response（合并润色）
-    G-->>U: SSE 推送最终回答
+    M-->>G: 返回 final_response（拼接，默认无 LLM 调用）
+    G-->>U: SSE 推送最终回答（finalize 判定 `final_push_suppressed` 后不重复推送）
 ```
+
+> 关键差异：改造前知识分支可能被审批中断**取消**（需 merge 补偿重跑）；
+> 串行下它在中断发生前已完整执行并落检查点，恢复轮直接可用。
 
 ***
 
@@ -641,21 +684,38 @@ class IntentRouter:
 ```
 
 ```python
-# agent/graph_builder.py —— 意图组合路由函数（多标签 → 节点列表，实现并行 fan-out）
+# agent/graph_builder.py —— 意图组合路由函数（§27.3 已由并行 fan-out 改为串行接力）
 def route_by_intents(state: AgentState) -> str | list[str]:
     """
     根据多意图返回路由目标。
-    - 返回节点名**列表**时，LangGraph 会在同一 superstep 并行执行多个节点；
+    - 多意图 {task, knowledge_base} → **串行**：返回 "knowledge"，
+      再由 route_after_knowledge 接力进 "task_agent"（§27.3.1）；
+    - 回滚开关 agent_multi_intent_serial=False 时返回节点名列表 → 并行 fan-out；
     - 返回单个节点名则走单分支。
     """
     intents = set(state.get("intents", ["chat"]))
     if intents == {"task", "knowledge_base"}:
-        return ["knowledge", "task_agent"]     # 并行 fan-out（关键）
+        if settings.agent_multi_intent_serial:
+            return "knowledge"                 # 串行第一步（关键）
+        return ["knowledge", "task_agent"]     # 回滚：并行 fan-out + LLM 汇总
     if "task" in intents:
         return "task_agent"
     if "knowledge_base" in intents:
         return "knowledge"
-    return "chat"                              # 兜底
+    return "chat"
+
+
+def route_after_knowledge(state: AgentState) -> str:
+    """
+    知识分支执行后的去向（§27.3.2）。
+
+    判据**只看意图与节点可用性，不看知识分支成败** —— 知识分支失败时仍必须进
+    任务分支（任务分支自带 search_knowledge，可自愈）；若因失败改道 merge，
+    会直接丢掉任务意图。
+    """
+    if "task" in set(state.get("intents") or []) and settings.agent_multi_intent_serial:
+        return "task_agent"
+    return "merge"
 ```
 
 ### 7.2 主图组装与审批中断/恢复
@@ -699,7 +759,7 @@ def build_task_agent(llm, tools, checkpointer):
     )
 
 def build_graph(checkpointer) -> StateGraph:
-    """构建主图：意图路由 + 知识库/聊天/任务分支 + 并行汇总"""
+    """构建主图：意图路由 + 知识库/聊天/任务分支 + 串行接力汇总（§27）"""
     g = StateGraph(AgentState)
     g.add_node("intent_router", intent_router_node)
     g.add_node("knowledge", knowledge_node)
@@ -712,12 +772,17 @@ def build_graph(checkpointer) -> StateGraph:
     g.add_edge(START, "intent_router")
     g.add_conditional_edges(
         "intent_router",
-        route_by_intents,                     # 多标签路由：可返回节点名列表 → 并行 fan-out
-        # 映射值可为单个节点名或节点名列表；列表中的节点在同一 superstep 并行执行
+        route_by_intents,                     # 单节点名（串行）或节点名列表（并行回滚）
         {"knowledge": "knowledge", "task_agent": "task_agent", "chat": "chat"},
     )
-    # 三条分支统一汇入 merge（barrier），单分支时 merge 仅透传润色
-    g.add_edge("knowledge", "merge")
+    # §27.3.2：知识分支的出边为**条件边** —— 多意图串行时接力进任务分支。
+    # ⚠️ 不能与固定边 `add_edge("knowledge", "merge")` 并存（LangGraph 视为重复边）。
+    g.add_conditional_edges(
+        "knowledge",
+        route_after_knowledge,
+        {"task_agent": "task_agent", "merge": "merge"},
+    )
+    # 其余分支汇入 merge（barrier），单分支时 merge 仅透传
     g.add_edge("chat", "merge")
     g.add_edge("task_agent", "merge")
     g.add_edge("merge", "finalize")
@@ -1110,7 +1175,7 @@ handler → with_tool_timeout(agent_tool_timeout_seconds)   # 超时保护：超
 | intent                    | varchar(64)    | 路由意图（task / knowledge\_base / task,knowledge\_base / chat） |
 | status                    | varchar(32)    | running / completed / rejected / failed / canceled         |
 | tool\_calls               | JSON           | 工具调用序列（名称、参数、结果摘要）                                         |
-| rag\_answer               | text           | 知识库分支产出（并行场景快照，供审计/回溯）                                     |
+| rag\_answer               | text           | 知识库分支产出（多意图场景快照，供审计/回溯）                                    |
 | task\_answer              | text           | 任务分支产出（含审批后结果快照）                                           |
 | result                    | text           | 最终回答（final\_response，含合并润色结果）                              |
 | error                     | text           | 错误信息                                                       |
@@ -1294,6 +1359,28 @@ CACHE_RETRIEVE_MAX_DOCS=8                # 单条目最多缓存文档数
 AGENT_TASK_THREAD_ISOLATE=true           # 任务 Agent（内层图）使用独立 thread_id
                                          # false → 回到「内层图读写主图检查点」旧行为（跨轮串味）
 
+# ---- 任务迭代预算与循环防护（§25，新增） ----
+AGENT_MODEL_CALL_LIMIT_ENABLED=true       # 任务 Agent LLM 调用预算总开关
+AGENT_MODEL_CALL_THREAD_LIMIT=20          # 同一任务（含审批恢复各轮）累计 LLM 调用上限（主闸门）
+AGENT_MODEL_CALL_RUN_LIMIT=12             # 单次 invoke 内 LLM 调用上限（辅助闸门，每次 invoke 重置）
+AGENT_TASK_APPROVAL_TIMEOUT_SECONDS=180   # 审批模式单次 invoke 墙钟上限（原为裸奔）
+AGENT_REPEAT_CALL_GUARD_ENABLED=true      # 同参重复调用守卫总开关
+AGENT_REPEAT_CALL_MAX=3                   # 同一 tool+args 累计出现 N 次即强制收尾
+AGENT_AGGREGATE_TOOL_ENABLED=true         # 是否注册 aggregate_data 聚合统计工具
+AGENT_TOOL_ERROR_AUDIT_ENABLED=true       # 被拒绝/非法的工具调用是否落审计与指标
+AGENT_CIRCUIT_COUNT_NON_SYSTEM_FAILURE=true  # 参数/业务类失败是否计入 total_calls/fail_calls
+AGENT_CIRCUIT_CLEAR_LAST_ERROR_ON_SUCCESS=true  # 成功调用是否清空 last_error
+AGENT_TASK_PROMPT_CAPABILITY_CLAUSE=true  # 任务提示词是否追加「工具能力边界」条款
+
+# ---- 连接池健壮性（§25.11） ----
+# ⚠️ 事故（2026-09-23）：aiomysql + pymysql>=2.2 下 pool_pre_ping=true 会让
+# 「复用连接」的请求全部 400（ping() missing 1 required positional argument: 'reconnect'）。
+# 默认关闭；确要开启必须同时开 DB_POOL_PRE_PING_SHIM=true，否则会被强制关闭。
+DB_POOL_PRE_PING=false                    # 取出连接前先探活（默认关闭，原因见 §25.11.1）
+DB_POOL_PRE_PING_SHIM=false               # 兼容补丁：覆盖方言 _send_false_to_ping=true
+DB_POOL_RECYCLE_SECONDS=1800              # 连接复用上限（不经过 ping 路径，无兼容性风险）
+DB_ECHO=true                              # 是否回显 SQL（生产建议关闭）
+
 # ---- 观测与加固（§15，阶段 4 新增） ----
 TRACE_ID_HEADER=X-Trace-Id                  # 响应头中的链路追踪 ID 字段名
 AGENT_METRICS_ENABLED=true                  # 进程内指标采集总开关（关闭后 /api/agent/metrics 返回 enabled=false）
@@ -1309,7 +1396,7 @@ AGENT_SSE_QUEUE_MAXSIZE=1000                # SSE 事件队列容量（0=无界�
 AGENT_SSE_PUT_TIMEOUT_SECONDS=2.0           # 队列满时投递最长等待（秒），超时丢弃并告警
 ```
 
-> **超时体系全景**（阶段 4 后共六层，从外到内）：单次请求 `180s` → Agent 循环墙钟 `120s`（非审批模式）→ 单步 LLM `60s` / 汇聚 LLM `60s` → 单次工具 `30s` → 语句级 `120s`；恢复链路独立 `300s`，递归步数上限 `100`。
+> **超时体系全景**（§25 后共七层，从外到内）：单次请求 `180s` → Agent 循环墙钟 `120s`（非审批模式）/ `180s`（审批模式单次 invoke，§25.4.2）→ LLM **调用次数**上限 `20/12`（§25.4.1，与墙钟互为补充）→ 单步 LLM `60s` / 汇聚 LLM `60s` → 单次工具 `30s` → 语句级 `120s`；恢复链路独立 `300s`，递归步数上限 `100`。
 > 注：日志格式化串不含 `%(trace_id)s` 占位声明——该字段由 `install_trace_logging()` 在过滤器装配成功后动态注入，保证观测初始化失败时日志不崩溃（§15.2）。
 
 > 变更记录：原 FEISHU_* 五项配置随飞书对接移除而废弃（`core/config.py` 中相应字段与 `agent/approval/feishu_client.py`、`callback.py` 一并清理）。
@@ -1427,15 +1514,15 @@ AGENT_SSE_PUT_TIMEOUT_SECONDS=2.0           # 队列满时投递最长等待（�
 ## 14. 风险与注意事项
 
 1. **依赖兼容**：已通过 PyPI 版本核对锁定版本组合（langchain 1.3.10 + langgraph 1.2.10 + langchain-core 1.6.1），langgraph 1.2.11 与 langchain 1.4.0 组合不可用（yanked），后续升级需重新验证；
-2. **LLM 意图误判**：采用结构化输出 + 低置信度降级 + 任务写操作双保险（意图识别 + 写工具 `user_intent_quote` 强校验，见 5.5.2）降低误判概率；上线初期可开启意图结果日志抽查。多意图并行场景下，若误判为 `task+knowledge_base` 会导致一次额外检索/任务开销，通过意图归一化与置信度阈值控制，且单分支结果缺失时 merge 节点可容错输出；
-   - **并行分支 + 审批中断（T3-9 已验证）**：LangGraph 中某节点触发 `GraphInterrupt` 会取消同超步中仍在执行的其他并行分支。`task+knowledge_base` 场景下任务分支先触发审批中断时，知识分支（检索 + LLM 生成较慢）会被取消，导致 `rag_answer` 缺失。实现上由 merge 节点在检测到「意图含 knowledge_base 但 rag_answer 为空」时重新执行知识分支以恢复结果（抑制流式、仅恢复文本），保证审批恢复后汇总完整。生产建议使用 Qdrant Server 模式（本地路径模式不允许多进程并发访问）。
+2. **LLM 意图误判**：采用结构化输出 + 低置信度降级 + 任务写操作双保险（意图识别 + 写工具 `user_intent_quote` 强校验，见 5.5.2）降低误判概率；上线初期可开启意图结果日志抽查。多意图场景（`task+knowledge_base`）下若误判，会多走一次知识分支的检索 + 生成（**§27 串行化后为串行执行，不再有并行分支被取消的问题**），通过意图归一化与置信度阈值控制，且单分支结果缺失时 merge 节点可容错输出；
+   - **多分支 + 审批中断（T3-9 已验证；§27 已改为串行，本节保留为回滚路径的历史记录）**：LangGraph 中某节点触发 `GraphInterrupt` 会取消同超步中仍在执行的其他**并行**分支。改造前 `task+knowledge_base` 并行场景下，任务分支先触发审批中断时，知识分支（检索 + LLM 生成较慢）会被取消，导致 `rag_answer` 缺失，由 merge 检测到「意图含 knowledge_base 但 rag_answer 为空」后重新执行知识分支以恢复结果（抑制流式、仅恢复文本）。**§27 串行化后知识分支在中断前已完整执行并落检查点，该补偿默认不再触发**（`agent_multi_intent_serial=False` 回滚时恢复）。生产建议使用 Qdrant Server 模式（本地路径模式不允许多进程并发访问）。
 3. **审批恢复依赖 MySQL 检查点**：`langgraph-checkpoint-mysql` 需独立的数据库表权限（自动建表）；生产环境建议与业务库隔离或单独 Schema；
 4. **SSE 长连接**：审批等待期间连接保持，通过心跳保活；若连接断开，前端可轮询 `/api/agent/tasks/{id}` 兜底；
 5. **前台审批语义**：审批人 = 发起人本人（JWT），决策接口做越权校验与原子抢占（幂等）；审批等待期 SSE 心跳保活，超时（`APPROVAL_WAIT_TIMEOUT`）后前端可轮询兜底；刷新页面后经会话审批列表接口重建卡片；单次中断含多个写操作（平行 tool calling）时合并为一张审批单（`actions` 字段），决策为**批次级**并保证 `decisions` 数量与挂起工具数一致，避免中间件数量校验抛错；
 6. **数据库写操作范围**：初期白名单表由配置控制，务必在生产环境收敛到最小集合；
 7. **API 生命周期监控**：`langgraph.prebuilt.create_react_agent` 已在 LangGraph v1 弃用，本项目统一使用 `langchain.agents.create_agent`；LangChain/LangGraph 迭代较快，开发与升级时应以官方文档为准持续跟进（`langchain.agents.middleware` 中 HITL 相关类的构造方式以实际版本 API 为准）；
 8. **存量数据稀疏向量为空（T 系列新增）**：改造前写入 Qdrant 的点仅含稠密向量，稀疏路（text-embedding-v4 关键词）对这些点召回为空。集合已增量补充 `sparse` 向量配置（`update_collection`），但存量点需**重新上传文档**（走 `process_file` 同 `doc_id` 先删后插）后才会生成稀疏向量；检索侧稀疏路为空时自动降级为仅稠密路，不影响服务可用性。
-9. **意图规则层误判（§16 新增）**：规则层虽只做保守判定，但关键词表仍可能被特定表达绕过（如「表」指表格文档而非数据库表）。缓解：① 规则层只收敛确定性，不确定一律回落 LLM；② `explicit_kb` 命中时可覆盖为并行分支；③ 通过 `agent.intent.gate.<kind>.<rule>` 指标定位误判规则，调整词表即可（无需发版）；
+9. **意图规则层误判（§16 新增）**：规则层虽只做保守判定，但关键词表仍可能被特定表达绕过（如「表」指表格文档而非数据库表）。缓解：① 规则层只收敛确定性，不确定一律回落 LLM；② `explicit_kb` 命中时可覆盖为知识分支（§27 串行化后为串行接力，知识分支先跑完再进任务分支）；③ 通过 `agent.intent.gate.<kind>.<rule>` 指标定位误判规则，调整词表即可（无需发版）；
 10. **进程内决策缓存多 worker 不一致（§16 新增）**：`--workers>1` 时各进程缓存独立，只影响命中率不影响正确性；如需全局一致可下沉到 Redis（本次未做）。
 
 ***
@@ -1557,14 +1644,14 @@ POST /api/agent/chat  → bind_trace_id() 绑定当前请求上下文
 
 离线冒烟脚本 `python scripts/smoke_observability.py`（不依赖 MySQL / Qdrant / LLM）覆盖 6 项，**全部通过**：
 
-| 验证项         | 断言内容                                      | 结果  |
-| ----------- | ----------------------------------------- | --- |
-| trace_id 贯穿 | 父上下文与 `asyncio.create_task` 子任务取值一致       | 通过  |
-| 进程内指标       | count / sum / min / max / avg 计算正确        | 通过  |
-| SSE 背压与丢帧   | 队列满（maxsize=2）时投递**限时返回**而非阻塞，排空后可恢复投递    | 通过  |
-| 节点追踪装饰器     | 记录耗时与异常，且**不吞异常**（不改变既有容错语义）              | 通过  |
-| 健康巡检探测      | 无外部依赖时返回结构化降级结果（down/degraded），不抛错        | 通过  |
-| 意图路由降级分支    | 空意图/单意图/并行意图组合路由结果符合设计，且 task 节点未注册时降级不报错 | 通过  |
+| 验证项         | 断言内容                                                   | 结果  |
+| ----------- | ------------------------------------------------------ | --- |
+| trace_id 贯穿 | 父上下文与 `asyncio.create_task` 子任务取值一致                    | 通过  |
+| 进程内指标       | count / sum / min / max / avg 计算正确                     | 通过  |
+| SSE 背压与丢帧   | 队列满（maxsize=2）时投递**限时返回**而非阻塞，排空后可恢复投递                 | 通过  |
+| 节点追踪装饰器     | 记录耗时与异常，且**不吞异常**（不改变既有容错语义）                           | 通过  |
+| 健康巡检探测      | 无外部依赖时返回结构化降级结果（down/degraded），不抛错                     | 通过  |
+| 意图路由降级分支    | 空意图/单意图/多意图（串行接力，含并行回滚开关）组合路由结果符合设计，且 task 节点未注册时降级不报错 | 通过  |
 
 补充验证：全部改动文件 `py_compile` 通过；`app.main` 可正常导入并注册 34 条路由（含新增 `/api/agent/metrics`、`/health`）；主图可离线编译且 `task_agent` 节点注册成功。
 
@@ -1805,7 +1892,7 @@ INTENT_EMBED_THRESHOLD=0.86              # 向量就近判定阈值（低于则�
 | --- | ------------------------------------- | --- |
 | 1   | 斜杠命令解析（含未知命令不吞、带参数、非命令文本）             | 7   |
 | 2   | 寒暄门控（6 正样本 + **3 个关键负样本**：含寒暄词但有实质内容） | 10  |
-| 3   | 强信号 → 确定性意图（task / kb / 并行三路）         | 5   |
+| 3   | 强信号 → 确定性意图（task / kb / 多意图三路）        | 5   |
 | 4   | 长尾输入必须回落 LLM（规则层不猜测）                  | 4   |
 | 5   | 短追问继承（含 3 个「不继承」负样本）                  | 5   |
 | 6   | 决策缓存（键归一、低置信不缓存、TTL）                  | 4   |
@@ -1856,15 +1943,15 @@ INTENT_EMBED_THRESHOLD=0.86              # 向量就近判定阈值（低于则�
 
 ### 16.9 风险与后续建议
 
-| #   | 风险                                                                                     | 缓解                                                                                                                               |
-| --- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **规则误判**（强信号关键词命中但用户真意是知识库问答，如「表」指表格文档）                                                | 规则层只做保守判定；`db_task_strong` 中「写动词 + 名词」是强组合而非单词命中；`explicit_kb` 命中时可覆盖为并行分支；出现线上误判只需把该规则名加进日志抽样，按 `agent.intent.gate.*` 指标定位后调整词表 |
-| 2   | **进程内缓存多 worker 不一致**：`--workers>1` 时各进程缓存独立                                           | 只影响命中率不影响正确性（缓存过期后重算）；后续可下沉到 Redis                                                                                               |
-| 3   | **原型语料覆盖不足**：Tier-2 只覆盖 19 条典型表达，覆盖率依赖线上流量                                             | 阈值设为 0.86（高门槛），未命中即回落 LLM；建议上线一个月后按 `agent.intent.source.llm` 样本补充原型                                                             |
-| 4   | **升级重判增加长尾成本**：5~10% 的请求多一次 qwen-plus 调用                                               | 可用 `INTENT_ESCALATION_MODEL=` 一键关闭；关闭后等价 v1 降级策略                                                                                 |
-| 5   | **`lingxi_intents` 元数据污染历史消息**                                                         | 只写入 `additional_kwargs`（不进 `content`），前端展示与既有序列化均不受影响                                                                            |
-| 6   | **L2 向量层实际不生效**：§16 设计时假定复用知识库分支预计算的 `query_embedding`，但意图节点在知识库节点**之前**执行，拿到的是 `None` | **已在 §18.5 修复**：入口节点预计算 query 双向量并经 `config["configurable"]` 传递给下游三层复用（L2 判定 / 混合检索 / 语义缓存）                                      |
-| 7   | **意图判定结果被语义「答案缓存」覆盖**：重复提问时答案缓存直接返回，本轮意图判定、分支执行与审计全部被跳过                                | **已在 §18.2 修复**：答案缓存改为受意图准入管辖（task / 并行场景一律禁用），两级缓存从「互相掩盖」变为「串行两级加速」                                                             |
+| #   | 风险                                                                                     | 缓解                                                                                                                                           |
+| --- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **规则误判**（强信号关键词命中但用户真意是知识库问答，如「表」指表格文档）                                                | 规则层只做保守判定；`db_task_strong` 中「写动词 + 名词」是强组合而非单词命中；`explicit_kb` 命中时可覆盖为知识分支（§27 后为串行接力）；出现线上误判只需把该规则名加进日志抽样，按 `agent.intent.gate.*` 指标定位后调整词表 |
+| 2   | **进程内缓存多 worker 不一致**：`--workers>1` 时各进程缓存独立                                           | 只影响命中率不影响正确性（缓存过期后重算）；后续可下沉到 Redis                                                                                                           |
+| 3   | **原型语料覆盖不足**：Tier-2 只覆盖 19 条典型表达，覆盖率依赖线上流量                                             | 阈值设为 0.86（高门槛），未命中即回落 LLM；建议上线一个月后按 `agent.intent.source.llm` 样本补充原型                                                                         |
+| 4   | **升级重判增加长尾成本**：5~10% 的请求多一次 qwen-plus 调用                                               | 可用 `INTENT_ESCALATION_MODEL=` 一键关闭；关闭后等价 v1 降级策略                                                                                             |
+| 5   | **`lingxi_intents` 元数据污染历史消息**                                                         | 只写入 `additional_kwargs`（不进 `content`），前端展示与既有序列化均不受影响                                                                                        |
+| 6   | **L2 向量层实际不生效**：§16 设计时假定复用知识库分支预计算的 `query_embedding`，但意图节点在知识库节点**之前**执行，拿到的是 `None` | **已在 §18.5 修复**：入口节点预计算 query 双向量并经 `config["configurable"]` 传递给下游三层复用（L2 判定 / 混合检索 / 语义缓存）                                                  |
+| 7   | **意图判定结果被语义「答案缓存」覆盖**：重复提问时答案缓存直接返回，本轮意图判定、分支执行与审计全部被跳过                                | **已在 §18.2 修复**：答案缓存改为受意图准入管辖（task / 并行场景一律禁用），两级缓存从「互相掩盖」变为「串行两级加速」                                                                         |
 
 **后续可选增强（本次未做）**：
 
@@ -1961,8 +2048,15 @@ embedder = DashScopeEmbedding()          # ← api_key 未传！
 
 - 本轮实际只执行了 `knowledge` 分支，但 `state` 里残留的 `task_result` 是**上一轮**的；
 - 但 `merge_node` 的判据是 `if rag and task:` —— 检查点里 `rag_answer` / `task_result`
-  都非空（上一轮留下的），于是**误判为双分支并行**，白白发起一次「双分支融合」LLM 调用；
+  都非空（上一轮留下的），于是**误判为本轮双分支都有产出**，白白发起一次「双分支融合」LLM 调用；
 - 更严重的是**正确性问题**：融合时把「上一轮无关内容」掺进了本轮回答，产生**串味幻觉**。
+
+> **§27 后的行为变化（重要）**：默认走拼接后，这次误判不再产生 LLM 成本
+> （从 ~17s 降为近乎零），但**串味风险丝毫未减** —— 拼接会把上一轮的旧内容直接
+> 拼进本轮回答，用户看到的反而更"实"。因此 `executed_branches` 守卫
+> （`agent_merge_cross_turn_guard`）在 §27 之后**仍然是必需的**，不可因"省了 LLM"
+> 而移除。这也是拼接模式在 `merge_node` 里必须复用同一套 `rag` / `task` 过滤结果
+> （而非各自重新读 state）的原因。
 
 #### 17.1.3 三根因定性
 
@@ -1997,7 +2091,8 @@ LangGraph 的 channel 语义是：**每个节点 return 的字段会覆盖对应
   merge_node:
       rag  = state["rag_answer"]   # ← N 轮的旧值，非空！
       task = state["task_result"]  # ← 本轮新值
-      if rag and task:  → 误判为双分支并行 → 发起融合 LLM（~17s）
+      if rag and task:  → 误判为本轮双分支都有产出 → 发起融合 LLM（~17s）
+                        # §27 后：默认拼接，不再付 LLM 成本，但串味风险不变 → 守卫仍必需
 ```
 
 **污染面比「问过退货」更广**：`chat_node` 也写 `rag_answer`
@@ -2034,7 +2129,7 @@ LangGraph 的 channel 语义是：**每个节点 return 的字段会覆盖对应
 
 ```python
 def _planned_branches(intents: list) -> list:
-    """把意图集合映射为「计划执行」的分支名（与条件边 fan-out 逻辑保持一致）。"""
+    """把意图集合映射为「计划执行」的分支名（与 route_by_intents / route_after_knowledge 的分支计划保持一致）。"""
     intents = set(intents or [])
     planned: list = []
     if "chat" in intents or "knowledge_base" in intents:
@@ -2082,12 +2177,17 @@ intent_router(executed=["task_agent"]) → task_agent → merge
 `merge` 中 `ran_kb=False` → 忽略旧 `rag_answer`；`ran_task=True` → 用本轮 `task`。
 走 passthrough 直出。✅ 符合预期（改动前会误走 LLM 融合）。
 
-**S2｜并行 + 审批中断（关键场景）**
+**S2｜多分支 + 审批中断（关键场景）**
+
+> **§27 变更**：默认串行后，本场景形态改变 —— 知识分支在任务分支之前**已完整执行完毕**，
+> 审批中断发生时 `rag_answer` / `context_text` 已在检查点里，恢复轮直接可用，
+> **不存在"被取消后需重跑"的问题**。下方并行版本保留为
+> `agent_multi_intent_serial=False` 回滚路径的说明。
 
 ```
 intent_router(executed=["knowledge","task_agent"])
       ├── knowledge ──→ 产出 rag_answer ─┐
-      └── task_agent → 写工具 → 中断 ⏸ ─┘（task 分支中断 + 取消并行 kb 分支）
+      └── task_agent → 写工具 → 中断 ⏸ ─┘（改造前为并行：task 分支中断 + 取消 kb 分支）
                                               ↓ Command(resume=...)
                                          task_agent 重放 → 产出 task_result
                                               ↓
@@ -2468,7 +2568,7 @@ total           : warn > 8s     , critical > 20s
 | R2  | **缓存键维度不足**              | 原 key 只有 `query 向量 + login_username`。缺 intent / 知识库版本 / 模型版本 / 提示词版本 / 实体一致性 → 正确性不可控                                                  |
 | R3  | **L2 向量原型层是死代码**（§16 遗留） | `query_embedding` 由 `knowledge_node`（下游）写入 state，而 `intent_router` 更早执行 → `classify(query_embedding=state.get(...))` 恒为 `None`，L2 从未生效 |
 
-最危险的具体场景：**并行意图 `["task","knowledge_base"]`** —— task 分支真的删改了数据，
+最危险的具体场景：**多意图 `["task","knowledge_base"]`** —— task 分支真的删改了数据，
 kb 分支却可能命中缓存返回**写操作之前**的答案，merge 再把「新执行结果」和「旧知识答案」
 拼在一起。
 
@@ -2488,7 +2588,7 @@ kb 分支却可能命中缓存返回**写操作之前**的答案，merge 再把�
 ```python
 def cache_policy_for(intents) -> tuple[str, int]:
     s = set(intents or [])
-    if "task" in s:                return CACHE_DENY, 0      # 含并行场景的 kb 分支
+    if "task" in s:                return CACHE_DENY, 0      # 多意图场景的 kb 分支
     if s == {"knowledge_base"}:    return CACHE_ALLOW, ttl_knowledge
     if s == {"chat"}:              return CACHE_SHORT, ttl_short
     return CACHE_DENY, 0
@@ -2605,7 +2705,7 @@ result = await router.classify(user_input, query_embedding=query_embedding, ...)
 | `cache.get.reject.threshold`      | counter | 相似度低于答案阈值              |
 | `cache.get.reject.expired`        | counter | 条目过期                   |
 | `cache.get.reject.entity`         | counter | 实体校验未通过（**错误命中的核心防线**） |
-| `cache.skip.intent_deny`          | counter | 被意图准入禁用（task / 并行场景）   |
+| `cache.skip.intent_deny`          | counter | 被意图准入禁用（task / 多意图场景）  |
 | `cache.retrieve.hit`              | counter | **检索缓存命中**（省掉检索，仍走生成）  |
 | `cache.retrieve.miss`             | counter | 检索缓存未命中                |
 | `cache.retrieve.reject.threshold` | counter | 相似度低于检索阈值              |
@@ -2650,7 +2750,7 @@ put→get 往返一致、七类拒绝路径、与意图准入解耦、接线与�
 
 **全量回归（§18 落地当时）**：`65 + 103 + 62 + 27 + 17 + 17 + 14 + 14 + 6 = 325`
 项断言全通过；`compileall` 全通过；图编译节点集不变。
-（此后 §19 又新增 38 项，当前仓库全量回归为 **363** 项。）
+（此后 §19 又新增 38 项、§25 再新增 93 项，当前仓库全量回归为 **456** 项。）
 
 ### 18.12 后续（本次未做）
 
@@ -4270,3 +4370,608 @@ reject_stale=not is_resume_round
   源码注释已同步修正（标注 §24 修正），MEMORY.md 的 A6 条目同步更新。
   正确表述：冗余中断留在内层**在本轮无害**，但**跨轮有害**（若 running 残留），
   必须配 §24 的入口拒收才算完整。
+
+***
+
+## §25 生产复现（trace=0e7fc2dd93554f24）：任务空转 24 次 LLM 调用
+
+### 25.1 现象
+
+用户问「**统计一下用户 dada 有多少条消息会话**」，一次请求内：
+
+- 调用了 **24 次 LLM**，耗时 **136 秒**；
+- 审计里只留痕 **4 次**工具调用，其余 20 次在日志里**完全看不到**；
+- 最终既没给出统计结果，也没有调用 `ask_user` 追问 —— 模型把「请提供筛选条件」
+  这类话写进了**回答正文**，用户视角是「答了，但没解决问题」。
+
+### 25.2 四条根因（按贡献度排序）
+
+| #   | 根因                   | 说明                                                                                                                   |
+| --- | -------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| R1  | **工具能力先天不可达**（根因）    | `query_data` 只能拉明细（等值过滤 + LIMIT 50），没有 COUNT/GROUP BY；且 `conversation_message` **没有 user_id 关联列**。这个需求在当时**结构上就无解**。 |
+| R2  | **没有迭代预算**           | 只有 `recursion_limit=100`（计超步，24 次调用约 48 步，根本没到）；审批模式下连墙钟超时都没有 —— 裸奔。                                                 |
+| R3  | **失败不可见 + 错误文案喂养空转** | 被拒绝的调用不落审计、不进指标、也没有 SQL 可查；`tool_error_content` 对所有错误统一回「请修正参数后重试」，模型照做就是空转。                                         |
+| R4  | **提示词没定义「能力边界」**     | 提示词只说「缺信息就追问」，从未说「工具做不到时也该追问」，更没说「禁止同参重试」。                                                                           |
+
+### 25.3 `recursion_limit` 与 `ModelCallLimitMiddleware` 的区别（源码级核对）
+
+两者常被当成同一件事，实际完全不同（langchain 1.3.10 / langgraph 1.2.10）：
+
+| 维度       | `recursion_limit`                                                               | `ModelCallLimitMiddleware`                                                           |
+| -------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| 计数对象     | 图的**超步**（superstep：model=1 步、tools=1 步）                                         | **仅模型节点调用次数**，严格等于 LLM 调用数                                                           |
+| 与工具数关系   | 有关（工具越多步数涨得越快）                                                                  | 无关                                                                                   |
+| 跨 invoke | **每次 invoke 重新发放一整份预算**（`pregel/_loop.py:1700` 用 checkpoint 的 `step` 重算 `stop`） | `thread_limit` 落在检查点里跨 invoke **累积**；`run_limit` 是 `UntrackedValue`，每次 invoke **重置** |
+| 超限行为     | 抛 `GraphRecursionError`                                                         | `exit_behavior="end"` 注入 AIMessage 并跳 END；`"error"` 抛 `ModelCallLimitExceededError`  |
+
+**结论（本项目落地要点）**：
+
+1. `recursion_limit` **不是**任务生命周期上限，只能当最后一道兜底；
+2. 真正的成本闸门是 `thread_limit`（跨轮累积），`run_limit` 只能当辅助；
+3. **必须用 `exit_behavior="error"`**：`"end"` 会注入一条**英文** AIMessage
+   （`Model call limits exceeded: thread limit (20/20)`），而 `_extract_answer`
+   取的是 `messages[-1].content` —— 那句话会原样出现在中文界面上。
+
+### 25.4 P0 止血
+
+#### 25.4.1 预算中间件（含一处关键形态修正）
+
+`_build_task_middleware(approval_mode)`（`agent/nodes/task_node.py`）：
+
+```
+1. ModelCallLimitMiddleware  —— before_model 计数（成本闸门，thread_limit 主 + run_limit 辅）
+2. HumanInTheLoopMiddleware  —— after_model 抛中断（仅审批模式）
+3. RepeatToolCallGuardMiddleware —— after_model 判同参空转
+```
+
+> **形态修正**：原实现把 `kwargs["middleware"] = [...]` 写在 `if approval_mode:`
+> 分支里，等于「**非审批模式完全没有 LLM 调用预算**」—— 而那正是绝大多数任务的
+> 运行模式（审批只在写操作场景开启）。预算是成本与安全约束，不是审批的附属品。
+> 中间件链现已提到分支外，并抽成独立函数以便冒烟脚本直接断言生产实现。
+
+顺序也是有意为之：**守卫排在 HITL 之后** —— 若模型重复发起的是一个写操作，
+应当先走审批（用户有权批准），而不是被守卫当成空转掐掉。
+
+`ModelCallLimitExceededError` 与 `RepeatedToolCallError` 都被加入
+`_run_task_agent` 的**不回落白名单**：预算类终止不是环境故障，计数写在检查点里，
+回落 `ainvoke` 重跑只会在同一个闸门上再撞一次。
+
+#### 25.4.2 审批模式也要有墙钟上限
+
+原实现 `use_timeout=not approval_mode` 让审批模式**完全裸奔**。旧注释的理由
+（「等待用户审批可能很久」）是错的：`interrupt()` 立刻抛出、协程随即返回，
+**人类等待发生在两次 invoke 之间，不占这份预算**。真正被放掉的是模型与工具的
+实际执行时间。现改为 `timeout_seconds=180`（审批）/ `120`（非审批），
+参数化后语义也更清楚。
+
+#### 25.4.3 同参重复调用守卫
+
+`ToolCallLimitMiddleware` **只计次数、不比较参数**，而空转的特征恰恰是
+「参数相同或几乎相同地反复调用」—— 计次治不住它。故自研
+`RepeatToolCallGuardMiddleware`（`agent/task_guards.py`）：
+
+- 在 `after_model` 对 `(tool_name, args)` 做指纹计数（参数按 key 排序后序列化，
+  避免键顺序不同导致漏判）；
+- 统计**累计**出现次数而非「连续」—— 空转往往夹杂别的小动作，只看连续会漏判；
+- 达到阈值（默认 3）在工具真正执行**之前**抛 `RepeatedToolCallError`；
+- 用**抛异常**而非 `jump_to="end"`：后者会注入英文 AIMessage（同 25.3 第 3 点）；
+- 守卫自身任何异常都降级为「不守卫」（守卫是保护，不能成为新故障源）。
+
+### 25.5 P1 工具能力补全：`aggregate_data`
+
+R1 是根因：工具能力缺失，光加约束只会让任务更快失败。新增只读聚合工具：
+
+- 支持 `count / sum / avg / min / max`，可 `group_by` 分组，可等值 `filters`；
+- 安全口径与 `query_data` 完全一致：表名走白名单归一、列名走 `_assert_column_name`、
+  **函数名只能取模块常量 `AGGREGATE_FUNCS`**、过滤值一律参数化；**不接受任何原始 SQL**；
+- 不支持 JOIN / 子查询 / 任意表达式 —— 开了等于把 SQL 能力交给模型，白名单与审计口径都会被绕过；
+- 工具描述里**点名**「凡是需要统计/计数/求和…必须调用 `aggregate_data`」，
+  并写明「不要用 `query_data` 拉明细自己数（最多 50 行，数出来是错的）」——
+  模型只看到工具名时仍会走老路，描述必须写成强指令。
+
+### 25.6 P2 可观测性与既有缺陷
+
+#### 25.6.1 被拒调用也要落审计
+
+`_record_call` 原本只在**成功路径**调用，于是「表不在白名单 / 列名非法 /
+缺 `user_intent_quote`」这类被拒调用**既不落审计、也不进指标、还没有 SQL 可查**
+—— 这正是 24 次调用里 20 次「查不到痕迹」的原因。新增 `@_audited` 装饰器统一
+包裹 6 个工具方法，任何异常都会留一条 `ok=False` 的记录（带 `error_type`，
+用于区分参数类与系统类），字段名与成功记录保持一致（`tool` / `params_summary` /
+`result_summary`）。审计失败一律静默降级，绝不改变工具行为。
+
+#### 25.6.2 错误回灌文案要区分「可重试 / 禁止重试」
+
+`tool_error_content` 原先对**所有**错误统一回「请修正参数后重试」，而确定性拒绝
+重试多少次结果都一样 —— 旧文案**直接喂养了空转**。现在：
+
+- 系统级故障（`DbToolSystemError` / 超时）→ 允许换方式再试一次；
+- 确定性拒绝 → 明确「**不要用相同或几乎相同的参数再次调用**」+ 给出替代动作
+  （换工具 / 换口径 / 调 `ask_user` / 如实告知）。
+
+#### 25.6.3 审计快照不写跨轮残留 `rag_answer`
+
+`_persist_final_snapshot` 读的是**未经 merge 清洗的原始 state**，于是把上一轮
+知识库分支的答案写进了本轮 `task_execution.rag_answer`（审计里出现
+「本轮任务是删除用户，rag_answer 却是退货流程」的串味记录）。现按
+`executed_branches` 判定，与 `merge_node`（§17.2）**同一判据**；标记缺失时保守放行。
+
+#### 25.6.4 熔断器统计口径（两个独立缺陷）
+
+| 缺陷                  | 现象                                                          | 修法                                                                            |
+| ------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| 成功后 `last_error` 不清 | 连续 3 次成功后看板仍显示「表 'users' 不在授权白名单内」                          | 成功时清空 `last_error`                                                            |
+| 被拒调用完全不计数           | `total_calls=23, success_calls=23, fail_calls=0`，成功率永远 100% | 任何失败都计入 `total_calls`/`fail_calls`；但**只有系统级故障**才计入 `consecutive_failures` 与窗口 |
+
+> 关键：**统计口径与熔断口径必须分开**。全部计入会导致模型犯一次参数错误就
+> 误熔断；全部不计入会让问题完全隐形。
+
+#### 25.6.5 提示词补「工具能力边界」条款
+
+明确列出「现在能做的 / 现在做不到的（JOIN、子查询、LIKE、时间范围、TopN、全量导出）」，
+并规定判定为「做不到」后的**动作顺序**：禁止同参重试 → 换现有工具可表达的等价问法 →
+调 `ask_user` 说明边界并给可选项。**严禁把追问埋在回答正文里就算完事。**
+
+### 25.7 改动清单
+
+| 文件                                      | 改动                                                                                   |
+| --------------------------------------- | ------------------------------------------------------------------------------------ |
+| `core/config.py`                        | 新增 11 项配置（每项独立开关，可逐字节回滚）                                                             |
+| `agent/task_guards.py`（新）               | `RepeatedToolCallError` + `RepeatToolCallGuardMiddleware` + 指纹函数                     |
+| `agent/nodes/task_node.py`              | 新增 `_build_task_middleware`；`_run_task_agent` 参数改 `timeout_seconds` 并扩白名单；新增两个中文异常出口 |
+| `agent/tools/agent_tool.py`             | 新增 `aggregate_data`；新增 `_record_error_call` + `@_audited`；注册新工具                      |
+| `agent/tools/manager.py`                | `tool_error_content` 区分可重试 / 禁止重试                                                    |
+| `agent/tools/circuit_breaker.py`        | 成功清 `last_error`；统计口径与熔断口径分离                                                         |
+| `agent/graph_builder.py`                | `_persist_final_snapshot` 按 `executed_branches` 拦跨轮 `rag_answer`                     |
+| `prompt/prompt_storage.py`              | 追加「工具能力边界」条款（可开关）                                                                    |
+| `scripts/smoke_task_budget_guard.py`（新） | 79 项断言，覆盖全部改动                                                                        |
+
+### 25.8 验收结果
+
+`scripts/smoke_task_budget_guard.py`：**79 项断言全通过**（12 个分组）。
+关键断言不是「某行源码长什么样」，而是**行为**：
+
+- 用一个 `LoopModel`（永远发起同一个工具调用的假模型）真实跑 `create_agent`，
+  断言预算耗尽与守卫命中**真的会抛**，且产物是中文；
+- 用 `FakeAgent` 断言预算/守卫异常**不回落** `ainvoke`、而环境类异常**仍回落**
+  （证明白名单没有误伤兜底路径）；
+- 每个开关都有一条「关闭后回到旧行为」的断言。
+
+### 25.9 回滚开关一览
+
+| 开关                                          | 关闭后行为                     |
+| ------------------------------------------- | ------------------------- |
+| `AGENT_MODEL_CALL_LIMIT_ENABLED`            | 无 LLM 调用预算（改动前）           |
+| `AGENT_REPEAT_CALL_GUARD_ENABLED`           | 无同参守卫（改动前）                |
+| `AGENT_AGGREGATE_TOOL_ENABLED`              | 不注册 `aggregate_data`（改动前） |
+| `AGENT_TOOL_ERROR_AUDIT_ENABLED`            | 只有成功调用留痕（改动前）             |
+| `AGENT_CIRCUIT_COUNT_NON_SYSTEM_FAILURE`    | total/fail 不同步的旧行为        |
+| `AGENT_CIRCUIT_CLEAR_LAST_ERROR_ON_SUCCESS` | 成功后仍残留旧错误                 |
+| `AGENT_TASK_PROMPT_CAPABILITY_CLAUSE`       | 回到改动前的提示词                 |
+
+审批模式墙钟：`AGENT_TASK_APPROVAL_TIMEOUT_SECONDS` 设为极大值即等价裸奔。
+
+### 25.10 后续建议
+
+1. **`conversation_message` 缺少 `user_id` 关联列**是 R1 的结构性缺口 ——
+   聚合工具只能统计「整表有多少条」，仍回答不了「某个用户有多少条」。
+   应推动补列，或在知识库里维护表结构文档让模型知道关联关系。
+2. **跨表 JOIN** 是下一阶段最大的能力缺口（本期刻意不开，避免把 SQL 能力交给模型）。
+   若要开，建议走「预定义视图白名单」而非自由 JOIN。
+3. **`agent.task.model_call_limit_exceeded` / `agent.task.repeat_call_terminated`**
+   应接入告警：这两个指标持续非零，说明存在系统性的能力缺口，而不是偶发抖动。
+4. 预算阈值（20/12）是**经验值**，需按真实流量分布校准 —— 若正常任务普遍用到
+   8 次以上，应考虑先优化工具（减少往返）而不是直接放宽预算。
+
+### 25.11 P2-5：`AsyncAdaptedQueuePool`「未归还连接」告警（已缓解，未根治）
+
+**现象**：日志里出现
+`The garbage collector is trying to clean up non-checked-in connection ...`。
+
+**定位**：本系统在**多个层级**用 `asyncio.wait_for` 取消**在途**的数据库操作 ——
+
+| 层级  | 位置                                     | 超时来源                         |
+| --- | -------------------------------------- | ---------------------------- |
+| 工具级 | `manager.with_tool_timeout`            | `agent_tool_timeout_seconds` |
+| 语句级 | `DbToolExecutor._run`                  | `agent_task_timeout_seconds` |
+| 任务级 | `_run_task_agent` → `asyncio.wait_for` | 墙钟上限（§25.4.2）                |
+
+`asyncio.wait_for` 的实现是**取消协程**，而不是「让数据库自己停」。取消发生时连接
+正处于 checked-out 状态，SQLAlchemy 来不及走正常的 checkin 流程；该连接最终被
+GC 回收时才触发这条告警。
+
+**为什么只做缓解**：根治要求把超时**下沉到服务端**（MySQL `MAX_EXECUTION_TIME`
+hint / `SET SESSION wait_timeout`），让服务端自己终止查询，客户端无需取消协程。
+这属于独立的改造项，与 P0~P2 的止血目标无关，本期不做。
+
+**已做的缓解**（`core/database.py`，均可回滚）：
+
+- `pool_recycle=1800`：连接复用上限，低于 MySQL 默认 `wait_timeout`，
+  避免服务端单方面断连后客户端仍在用。**本项不经过 ping 路径，无兼容性风险。**
+
+> 注：`echo=True` 保留默认值（不擅自改变日志行为），但已提为配置项
+> `DB_ECHO` —— trace=0e7fc2dd93554f24 的日志里绝大部分是 SQL 回显，
+> 排查时被严重淹没，生产建议关闭。
+
+#### ⚠️ 25.11.1 由本节引入的**生产事故**（2026-09-23）：`pool_pre_ping=True` 打挂全部会话接口
+
+本节初版把 `pool_pre_ping` 改成了 `True`，上线后直接造成故障：
+
+```
+rag.conversation_service - ERROR - 获取会话列表失败:
+    AsyncAdapt_aiomysql_connection.ping() missing 1 required positional argument: 'reconnect'
+POST /api/conversations          → 400
+DELETE /api/conversations/{id}   → 400
+GET    /api/conversations        → 400
+```
+
+**根因链**（已核对到 SQLAlchemy 2.0.41 / aiomysql 0.2.0 / pymysql 2.2.8 源码）：
+
+1. `MySQLDialect_pymysql._send_false_to_ping` 用 **pymysql** 的
+   `Connection.ping` 签名做探测（`dialects/mysql/pymysql.py`）；
+2. pymysql ≥ 2.2 把签名改成 `ping(self, reconnect=False)` → 探测逻辑判定
+   「默认值是 False」→ 返回 **False**；
+3. 于是 `do_ping` 走 `dbapi_connection.ping()` —— **不传参**；
+4. 但 aiomysql 下该对象是 SQLAlchemy 自己的
+   `AsyncAdapt_aiomysql_connection.ping(self, reconnect)` —— **没有默认值**
+   → `TypeError`；
+5. **只有复用连接才做 pre_ping**（新建连接不探测），因此表现为
+   「第一条请求正常，之后全部失败」（登录 200、会话接口全 400）。
+
+一句话：**SQLAlchemy 用 pymysql 的签名去决定怎么调 aiomysql 的适配器** ——
+探测对象与实际调用对象不一致（上游缺陷）。
+
+**处置（fail-safe 优先）**：
+
+| 配置                                                      | 行为                                            |
+| ------------------------------------------------------- | --------------------------------------------- |
+| `DB_POOL_PRE_PING=false`（**默认**）                        | 不探活，与事故前一致                                    |
+| `DB_POOL_PRE_PING=true` + `DB_POOL_PRE_PING_SHIM=false` | 打 ERROR 日志并**强制关闭**（宁可不探活，也不能让 API 大面积 400）   |
+| `DB_POOL_PRE_PING=true` + `DB_POOL_PRE_PING_SHIM=true`  | 覆盖方言 `_send_false_to_ping=True`，pre_ping 真正可用 |
+
+**教训**：连接池这类**基础设施参数**不能只看「语义上更稳」就开 ——
+`pre_ping` 会改变**每一次连接取出**的代码路径，属于高频路径，
+必须先在目标依赖组合下验证，而不是照搬通用最佳实践。
+
+复现与回归：`scripts/smoke_db_pool_pre_ping.py`（12 项断言，离线复现 TypeError
+并验证三种配置组合的处置）。
+
+**后续（根治）**：把工具/语句超时改为服务端超时；或改用「超时后不取消、只标记
+并在归还时丢弃连接」的模式。`pool_pre_ping` 若要长期开启，建议同时把
+`pymysql` 锁到 `<2.2`（其 `ping(self, reconnect=True)` 会让探测返回 True），
+待上游修复后再解锁。
+
+---
+
+## §26 生产复现（trace=ad5ee2d1a2714dc6）：审批通过后写操作**根本没执行** —— 跨图 config 污染
+
+### 26.1 现象与时序
+
+用户输入：「给我删除用户 baba 的用户信息，逻辑删除」
+
+| 时刻                  | 事件                                                                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 16:46:44            | 收到请求                                                                                                                                                                           |
+| 16:46:48            | 意图分类 `intents=['task']`，新建 `task_execution_id=7c22f84e-…`                                                                                                                      |
+| 16:46:48–16:47:21   | `list_tables` → `query_data(user, limit 3)` → `query_data(user, limit 50)`                                                                                                     |
+| 16:47:28            | **首次中断** `id=ddffd8beab4bc3a3b58452df6cf79a56`，载荷 `update_data(filters='{"id": 65, "username": "baba"}')`；审批单 `3e0dea2b-…` 置 `pending`；`[观测] 节点 task_agent 异常: GraphInterrupt` |
+| 16:56:06            | 前台**批准**（`decision=approved`）→ 恢复                                                                                                                                              |
+| 16:56:06            | `内层单个悬挂中断且与载荷配对，使用裸 resume 值: id=ddffd8be… kind=hitl`                                                                                                                          |
+| 16:56:08 / 16:56:14 | **两次 LLM 调用**                                                                                                                                                                  |
+| 16:56:19            | **再次中断** `id=17be203367f4c8cac19be6eede92c015`，载荷 `update_data(filters='{"username": "baba"}')` ← **参数变了**                                                                     |
+| 16:56:19            | `[Approval] 恢复后再次中断，本次决策未生效` → `task_execution.status='failed'`                                                                                                                |
+
+**最终用户可见结果**：审批通过了，但 `user` 表**没有任何变化**。
+
+### 26.2 三条关键证据
+
+1. **写操作确实没执行**：16:56:06–16:56:19 全程没有
+   `SELECT tool_registry WHERE name='update_data'`、没有 ``UPDATE `user` ``、
+   没有 `[DbTool-update]`（对照：`query_data` 每次都会打 `[DbTool-query]`）。
+   ⇒ `resume_graph` 判 `failed` 是**正确**判定，**不是**静默假成功。
+2. **第二次中断的参数由 `{"id":65,"username":"baba"}` 变为 `{"username":"baba"}`**
+   ⇒ 恢复轮是模型**重新规划**出的新 tool_call，**不是**「原地重发」。
+3. **日志缺一条本该出现的 WARNING**（`恢复轮再次中断且本轮无写操作成功，不消化`）
+   ⇒ `_absorb_reissued_interrupt`（§20 F3.5b）**根本没有被执行**。
+
+### 26.3 根因：`_build_subgraph_config` 照抄了 LangGraph 运行时内部键
+
+```python
+# 修复前
+cfg = dict(config or {})
+configurable = dict(cfg.get("configurable") or {})   # ← 把内部键一并复制
+configurable["thread_id"] = thread_id
+```
+
+外层图节点拿到的 `config["configurable"]` 里含 LangGraph 注入的**运行时内部键**，
+实测共 11 个：
+
+```
+__pregel_scratchpad / __pregel_send / __pregel_call / __pregel_task_id /
+__pregel_read / __pregel_replay_state / __pregel_runtime /
+__pregel_checkpointer / checkpoint_id / checkpoint_map / checkpoint_ns
+```
+
+这些键描述的是**外层图当前这一次执行**的上下文，透传给内层图后造成三连锁后果：
+
+1. **中断形态被改变**：内层 `interrupt()` 读到的是**外层图的 scratchpad**
+   ⇒ 内层 PregelLoop 无法接管 ⇒ `GraphInterrupt` 以**异常**形式穿透，
+   而不是像正常那样转成 `__interrupt__` 作为**返回值**。
+   （日志中 `[观测] 节点 task_agent 异常: GraphInterrupt` 即此形态。）
+2. **恢复落点错位**：resume 值投递错位 ⇒ 内层从 **`model` 节点**恢复
+   （**重跑 LLM**，模型重新规划出参数不同的新 tool_call），而不是从
+   `HumanInTheLoopMiddleware.after_model` 节点恢复、去执行**已批准**的那个
+   tool_call ⇒ **写操作从未执行**。
+3. **消化逻辑失效**：`_absorb_reissued_interrupt` 运行在 `result` 赋值**之后**，
+   而中断是**异常**抛出的 ⇒ 该函数在生产路径下**永不执行**。
+
+#### 关键结构事实（本次新查明）
+
+`HumanInTheLoopMiddleware.after_model` 是 `create_agent` 生成的**独立图节点**
+（`langchain/agents/factory.py:1543` → `graph.add_node(f"{m.name}.after_model", …)`），
+且 `model` 节点与它由普通边相连（同文件 `graph.add_edge("model", f"{…}.after_model")`）。
+
+推论：**正常情况下恢复轮不会重跑 `model` 节点**，而是从 `after_model` 节点恢复、
+直接执行 checkpoint 里那个**已批准**的 tool_call。
+
+⇒ 因此「**恢复后 tool_call 参数变了**」本身就是 **config 污染的信号**；
+它同时也解释了为什么最小复现（干净 config）里写操作能正常执行。
+
+### 26.4 修复（`agent/nodes/task_node.py`）
+
+只收窄 `configurable` 一层，剔除内部键；顶层 `callbacks` / `metadata` / `tags` /
+`recursion_limit` 保持不变。
+
+```python
+_INTERNAL_CONFIG_KEY_PREFIXES: tuple = ("__", "checkpoint_")
+
+def _is_internal_config_key(key: Any) -> bool:
+    return isinstance(key, str) and key.startswith(_INTERNAL_CONFIG_KEY_PREFIXES)
+
+def _build_subgraph_config(config, thread_id, recursion_limit) -> dict:
+    cfg = dict(config or {})
+    configurable = {
+        k: v
+        for k, v in (cfg.get("configurable") or {}).items()
+        if not _is_internal_config_key(k)
+    }
+    configurable["thread_id"] = thread_id
+    cfg["configurable"] = configurable
+    cfg["recursion_limit"] = recursion_limit
+    return cfg
+```
+
+判据取 `__` 前缀（LangGraph 内部协议键）与 `checkpoint_` 前缀（检查点定位键）。
+本项目全部业务键（`db` / `sse_queue` / `trace_id` / `thread_id` /
+`approval_resume` / `clarify_resume` / `user_id` / `username` …）均不落在这两个
+前缀内，故为**安全收窄**；且是**黑名单**式改写（保留未知业务键），
+比白名单更不容易误删。
+
+### 26.5 影响范围与回归风险
+
+**影响范围**：审批模式（`get_checkpointer() is not None`）下**所有**写操作
+（`update_data` / `delete_data` / `insert_data`）都会「批准后不执行」，
+属生产事故级；且表现为**静默**（无异常日志、无失败信号），极难从表象反推。
+
+**回归风险**：改动触及 HITL 核心链路，需完整回归：
+
+- 单写操作审批 / 多写操作批次审批 / 审批拒绝 / 审批取消
+- 追问（`ask_user`）中断与恢复（同样依赖内层 `interrupt`）
+- 非审批模式（不挂 HITL 中间件，但同样走 `_build_subgraph_config`）
+- 流式（`astream`）与非流式（`ainvoke`）两条执行路径
+- LangSmith trace 树（`metadata` / `tags` 必须仍在）
+
+### 26.6 验收
+
+| 脚本                                           | 断言数 | 覆盖                                                                                                            |
+| -------------------------------------------- | --- | ------------------------------------------------------------------------------------------------------------- |
+| `scripts/smoke_subgraph_config_isolation.py` | 13  | A 组纯函数不变量（内部键剔除、业务键保留、无副作用、判据边界）+ B 组端到端（真实外层图节点内调用真实内层 Agent，断言**批准后已批准的写操作真的执行了**、中断始终以 `__interrupt__` 返回） |
+| `scripts/diag_approval_model_replan.py`      | —   | 恢复轮语义：不重跑 LLM、先执行 checkpoint 里的旧 tool_call                                                                    |
+| `scripts/diag_nested_interrupt_form.py`      | —   | **双向对照**：同样嵌套调用下，「照抄 config」→ 写操作**未执行**；「剔除内部键」→ 写操作**执行**。二者只差这一步，是根因的**铁证**                                |
+| `scripts/diag_interrupt_stream_form.py`      | —   | 顶层 `astream` 下中断为「返回值」形态（排除流式本身的问题）                                                                           |
+
+**教训（应写进长期记忆）**：**跨图传递 config 必须过滤运行时内部键**。
+LangGraph 会往 `config["configurable"]` 注入执行上下文（scratchpad / send /
+task_id / checkpoint 定位），`dict(config)` 这种「照抄」写法等于把外层图的
+执行上下文泄露给内层图。其表现**不是显式报错**，而是
+「中断语义错乱（异常 vs 返回值）+ 恢复落点错位」——表象与根因距离极远。
+凡涉及「主图节点内调用另一张图」的编排，都应显式白名单或黑名单过滤 config。
+
+***
+
+## §27 多意图串行化 × merge 拼接 × 上游上下文注入（2026-09-29）
+
+> 方案文档（含逐条实施细节与 12 条验收断言）：`docs/multi_intent_serial_and_context_injection_plan.md`
+> 本节为**主设计文档口径的定稿记录**；§5.8 / §6.6 / §6.7 的并行描述已同步更新。
+
+### 27.1 起因：并行编排的三重代价
+
+改造前 `intents == {"task","knowledge_base"}` 时并行 fan-out（§5.8），实测暴露：
+
+| #   | 代价                                        | 量化                                                                    |
+| --- | ----------------------------------------- | --------------------------------------------------------------------- |
+| 1   | 任务分支看不到知识分支产出，只能自行 `search_knowledge` 再检索 | 1 次「决定调工具」的 LLM + 1 次 embedding + 1 次向量检索 + 1 次回灌后的 LLM               |
+| 2   | 两段结果必须靠额外 LLM 合并                          | 输入含 rag + task 两段全文（链路最大）；超时 60s × 重试 1 次 = **最坏 120s**，且位于 DAG 必经汇聚点 |
+| 3   | 并行审批中断会取消知识分支                             | 恢复后需 `_recover_knowledge_branch` 补偿重跑（§14.2 / §17.2.4）                |
+
+对照量级：`agent_task_timeout_seconds`（干完整件活）也是 120s —— 一个「润色」步骤的最坏耗时等于整个任务分支的预算。
+
+**关键澄清（避免误判收益）**：检索链路本身**已被三层缓存覆盖**，不是本次的靶心：
+
+| 层            | 实现                                         | 覆盖调用点                                                                     | 查询成本               |
+| ------------ | ------------------------------------------ | ------------------------------------------------------------------------- | ------------------ |
+| 向量预取（§18.5）  | `_prefetch_query_vectors`                  | 仅 `knowledge_node`                                                        | run 内复用            |
+| 检索缓存（§18.13） | `rag/retrieval_cache.py`（阈值 0.90）          | `knowledge_node` **与** `search_knowledge`（同走 `KnowledgeService.retrieve`） | **必须先有 embedding** |
+| 答案缓存（§18.3）  | `rag/semantic_cache.py`（阈值 0.95，intent 维度） | 仅 `knowledge_node`                                                        | 同上                 |
+
+因此「省一次向量检索」不能算作本改造收益 —— 它已被缓存吃掉。真正的剩余浪费在
+**LLM**（缓存碰不到）与**跨分支上下文不传递**。
+
+### 27.2 改造总览
+
+| #   | 改造              | 触及文件                                                  | 开关                             | 默认      |
+| --- | --------------- | ----------------------------------------------------- | ------------------------------ | ------- |
+| ①   | 多意图串行化          | `agent/graph_builder.py`                              | `agent_multi_intent_serial`    | `True`  |
+| ②   | merge 拼接（省 LLM） | `agent/graph_builder.py`                              | `agent_merge_llm_enabled`      | `False` |
+| ③   | 上游 context 注入   | `agent/nodes/task_node.py`、`prompt/prompt_storage.py` | `agent_task_kb_context_inject` | `True`  |
+| ④   | 推送去重修复（前置）      | `agent/state.py`、`agent/graph_builder.py`             | 无（缺陷修复）                        | —       |
+
+实施顺序 **④ → ③ → ① → ②**：④ 必须最先（否则 ② 上线即重复推送）；② 最后（注入完成后两段高度重叠，LLM 合并退化为「费力去重」）。
+
+### 27.3 改造一：多意图串行化
+
+- `route_by_intents`：`{task, knowledge_base}` 返回**单个** `"knowledge"`；
+- 新增 `route_after_knowledge`：知识分支执行后决定去向；
+- `build_graph`：`knowledge` 出边由 `add_edge` 改 `add_conditional_edges`
+  （**不能与固定边并存**，LangGraph 视为重复边）；
+- `merge_node`：`_recover_knowledge_branch` 补跑加 `not agent_multi_intent_serial` 条件。
+
+**关键判据（易错）**：`route_after_knowledge` **只看意图与节点可用性，不看知识分支成败**。
+知识分支失败（`rag_answer=None`）时仍必须进任务分支 —— 任务分支自带
+`search_knowledge` 可以自愈；若因失败改道 merge，会**直接丢掉任务意图**（用户明确
+要求的数据操作不会被执行）。冒烟脚本对此有专门断言。
+
+**附带收益**：知识分支在审批中断前已完整执行并落检查点，恢复轮直接可用，
+不再需要「被取消后重跑」的补偿路径。
+
+### 27.4 改造二：merge 拼接（省 LLM）
+
+`merge_node` 的 `if rag and task:` 分支新增开关判断，默认走 `_concat_answers`：
+
+```
+【知识依据】
+{rag}
+
+【执行结果】
+{task}
+```
+
+- 单段缺失时退化为该段输出（不产生空标题）；
+- LLM 合并路径**完整保留**（含超时与重试），`agent_merge_llm_enabled=True` 时行为与改动前逐字节一致，用于灰度对比与即时回滚；
+- LLM 合并**失败降级**路径也改为 `_concat_answers` + 抑制补推（原为裸拼接且会重复推送）。
+
+**为什么默认关掉**：注入改造后知识结论已进入任务分支上下文，两段高度重叠，
+LLM 合并实际做的只是「去重 + 加过渡词」，而代价是一次输入含两段全文的调用
+（最坏 120s）。代价与收益严重倒挂。
+
+### 27.5 改造三：上游 context 注入任务分支
+
+**源码级前提（本次验证，方案成立的基础）**：`create_agent` 的 `system_prompt`
+转为 `SystemMessage` 后是**闭包变量**，每次 model 节点执行时才
+`messages = [request.system_message, *messages]` **临时前置**
+（`langchain/agents/factory.py:951 / 1390-1391 / 1412`），**不写入 state**。因此：
+
+- 不会污染内层 Agent 自己的 checkpoint（同 thread 后续轮次不会被历史依据串味）；
+- 审批恢复轮重建 Agent 时传入新 `kb_context` 不与旧 SystemMessage 冲突；
+- 恢复轮从 state 重新生成注入段（`context_text` 进检查点）→ 与首轮一致。
+
+**实现**：
+
+| 函数                                               | 职责                                    |
+| ------------------------------------------------ | ------------------------------------- |
+| `_build_kb_context_section(context_text, limit)` | 限长构造注入段（含固定头尾文案）                      |
+| `_resolve_kb_context(state)`                     | 读开关 + 读 `state["context_text"]` + 调上限 |
+| `_compose_system_prompt(base, kb_context)`       | 纯函数拼装（抽出来是为了**可测**）                   |
+| `_build_task_agent(..., kb_context="")`          | 调 `_compose_system_prompt`            |
+
+**必须限长**：`format_context_public` **没有总长度上限**（不同于工具侧的
+`_build_truncated_context` 截断到 800/4000），直接注入会与 `_load_task_history`
+（最多 10 条）叠加撑大 prompt。默认 `agent_task_kb_context_max_chars=3000`，
+截断时附「已截断」提示（提示词据此允许补充检索）。
+
+**提示词必须同步改（否则注入等于白做）**：`TASK_AGENT_SYSTEM_PROMPT` 原第 3 条
+明写「**先调用 search_knowledge 检索知识库**」——只注入不改提示词，模型照样会去调。
+现改为「优先复用【已检索的知识依据】，**不要调用 search_knowledge 重复检索**，
+仅在确实缺少或标注「已截断」时补充」，并在提示末尾新增一节解释该段的语义与边界
+（依据 §25 E11 的教训：**提示词不定义动作边界，模型就会执行默认动作**）。
+
+### 27.6 改造四：推送去重（修复三重失效）
+
+`finalize_node` 会补推 `final_response`（`agent_push_final_response=True`），
+其「与已推内容重复则不推」的承诺**从未生效**，原因是三重失效叠加：
+
+| #   | 失效点                                      | 后果                                                                              |
+| --- | ---------------------------------------- | ------------------------------------------------------------------------------- |
+| 1   | `pushed_contents` **未在 `AgentState` 声明** | LangGraph 只认识 schema 声明的 channel，未声明字段的写入**被静默丢弃且不报错**（实测确认）→ `task_node` 写了也没用 |
+| 2   | `_already_pushed_branches` **全仓无调用点**    | 即使有数据也无判定入口（死代码）                                                                |
+| 3   | `knowledge_node` / `chat_node` **不写**该字段 | 即使前两项修好，去重集合也只认任务分支                                                             |
+
+**修法**：
+
+- `AgentState` 声明 `pushed_contents: list` 与 `final_push_suppressed: bool`；
+- 由 **`merge_node` 单点覆盖写入**（而非三个分支各写）—— 因为多意图场景下三个节点
+  可能在同一 superstep 并行执行，同时写同一 channel 需要 reducer 才不会冲突；
+  而 merge 是 barrier，单点写入既无冲突、又天然按「本轮实际产出」判定、且每轮覆盖不留残留；
+- `finalize_node` 读 `final_push_suppressed` 跳过补推，`_push_final_response` 真正使用去重集合；
+- **兜底文案不受抑制标记影响**（无 `final_response` 的 error 分支是用户唯一能看到失败原因的机会）。
+
+**为什么这一项是 ② 的前置**：现状下 `final_response` 是 LLM **新产出**的文本，重复不明显；
+改成拼接后 `final_response` 就是用户刚逐字看过的两段，**必然重复推送**。
+
+### 27.7 收益
+
+| 维度          | 数值                                                                                |
+| ----------- | --------------------------------------------------------------------------------- |
+| 省 merge LLM | 均值 2~4s；**P99 最坏 120s**（60s × 2 次尝试），且位于 DAG 必经汇聚点                                |
+| 任务分支少两轮     | 1 次决策 LLM + 1 次 embedding + 1 次检索 + 1 次回灌 LLM；按 §25 实测（24 次 LLM / 136s）估算约 10s 量级 |
+| 退出主路径的代码    | `_recover_knowledge_branch` 默认不触发；merge 的 LLM 重试循环不在主路径                           |
+| 激活的死代码      | `_already_pushed_branches`                                                        |
+| 正确性         | 审批恢复轮知识上下文不再丢失；消除双口径上下文（`format_context_public` vs `_build_truncated_context`）    |
+| 体验          | SSE 由「两分支交错」变为「先依据、后执行」；审批卡片出现在知识内容之后                                             |
+
+### 27.8 风险与缓解
+
+| #   | 风险                                | 等级         | 缓解                                                           |
+| --- | --------------------------------- | ---------- | ------------------------------------------------------------ |
+| R1  | 延迟由 `max(kb, task)` 变 `kb + task` | 中          | 省掉 merge LLM 后与现状基本持平；若不可接受，KB 走限长/精简模式                      |
+| R2  | 拼接使输出质量下降（无「综合建议」段）               | 中          | 保留 `agent_merge_llm_enabled` 开关；分段小标题                        |
+| R3  | 注入段撑大 prompt                      | 低-中        | `agent_task_kb_context_max_chars` + 截断计数指标                   |
+| R4  | 只注入不改提示词 → 模型照样检索                 | **高（确定性）** | §27.5 提示词同步改造；冒烟断言系统提示含新约束                                   |
+| R5  | 知识分支失败断路，任务意图被丢                   | 低          | `route_after_knowledge` 判据不看成败；冒烟覆盖                          |
+| R6  | 动态 `system_prompt` 污染内层检查点        | **已排除**    | §27.5 源码验证                                                   |
+| R7  | `final_push_suppressed` 跨轮残留      | 中          | 由 merge **每轮覆盖写入**（含单分支路径显式写 `False`）                        |
+| R8  | 跨轮残留串味（§17.2 场景）                  | 中          | `executed_branches` 守卫**必须保留** —— 拼接不付 LLM 成本，但串味风险不变，甚至更"实" |
+
+### 27.9 验收
+
+`scripts/smoke_multi_intent_serial.py` —— **39 项断言全通过**，覆盖：
+
+| 组   | 断言要点                                                               |
+| --- | ------------------------------------------------------------------ |
+| 1-2 | 串行开关开/关的路由结果（`"knowledge"` 单节点 vs `["knowledge","task_agent"]` 列表） |
+| 3-4 | `route_after_knowledge` 在知识分支成功/失败/带 error 时**均**进任务分支；非多意图进 merge |
+| 5-6 | 拼接模式**零 LLM 构造**（探针证明）；分段标题；单段缺失退化                                 |
+| 7-9 | 注入段进入系统提示；超长截断 + 「已截断」提示；无依据时系统提示**逐字节**不变                         |
+| 10  | 串行模式不触发补跑；并行回滚路径仍触发                                                |
+| 11  | 抑制标记生效；内容重复被去重；新内容正常补推且带 `branch=final`                            |
+| 12  | `AgentState` 已声明两个新字段                                              |
+| 13  | 系统提示含「不要重复检索」「已截断」等约束（防 R4 回归）                                     |
+| 14  | top_k 仍为 4；`_planned_branches` 映射与路由一致                             |
+
+**既有断言同步更新**：`scripts/smoke_cross_turn_isolation.py` 原断言
+「并行双分支触发 LLM 合并」是**改造前行为**，已按新契约改为不变量断言
+（「本轮 rag 与 task 产出**都被保留**」+ 默认不调 LLM + 回滚路径仍调 LLM），
+20 项通过。这类"断言旧行为"的脚本在改造后必须重新审视，否则会以回归失败的形式
+提示（本次即如此），但更危险的是**静默通过**的假绿。
+
+### 27.10 回滚矩阵
+
+| 步骤    | 开关                                   | 回滚效果                                          |
+| ----- | ------------------------------------ | --------------------------------------------- |
+| ① 串行化 | `agent_multi_intent_serial=False`    | 恢复并行 fan-out + `_recover_knowledge_branch` 补偿 |
+| ② 拼接  | `agent_merge_llm_enabled=True`       | 恢复 LLM 合并（三段式）                                |
+| ③ 注入  | `agent_task_kb_context_inject=False` | 任务分支系统提示回到改动前                                 |
+| ③ 限长  | `agent_task_kb_context_max_chars=0`  | 等价于不注入                                        |
+| ④ 去重  | `agent_push_final_response=False`    | 完全不补推                                         |
+
+### 27.11 明确不在本方案范围内
+
+以下问题**与本改造无关**，需独立立项（避免误判投入产出）：
+
+- **工具能力缺口**：`query_data` 无 COUNT / SUM / GROUP BY / JOIN，上限 50 行
+  —— 这是 trace=0e7fc2dd93554f24「136s 未解决」的**根因**（§25）；
+- **提示词能力边界**（§25.7 E11）：模型不知道「做不到什么」；
+- **错误回灌文案**（§25 E8）：对确定性拒绝也回「请修正参数后重试」＝喂养空转；
+- **连接池 non-checked-in 告警**（§25.11 E10）：未根治，需把超时下沉到服务端；
+- **`search_knowledge` 的 `k` 归一化**（建议项）：`k` 由模型自由传（1~10），
+  而 `top_k` 是检索缓存的**强过滤维度** → 参数漂移即 miss，建议钳制到固定档位。
